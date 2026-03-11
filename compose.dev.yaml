@@ -2,6 +2,7 @@ services:
   web:
     volumes:
       - ./apps/web:/usr/src/app
+      - web-node-modules:/usr/src/app/node_modules
     command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
     environment:
       - NODE_ENV=development
@@ -10,9 +11,15 @@ services:
     volumes:
       - ./apps/api:/usr/src/app
     command: ["sh", "run-dev.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       - APP_ENV=development
 
   db:
     ports:
       - "5433:5432"  # 如果本机已有 5432，避免冲突；没有的话可以改回 5432:5432
+
+volumes:
+  web-node-modules:
