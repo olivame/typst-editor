@@ -42,7 +42,11 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
     db.add(main_file)
     db.commit()
 
-    return {"id": db_project.id, "name": db_project.name}
+    return {
+        "id": db_project.id,
+        "name": db_project.name,
+        "created_at": db_project.created_at,
+    }
 
 @app.get("/projects")
 def list_projects(db: Session = Depends(get_db)):
