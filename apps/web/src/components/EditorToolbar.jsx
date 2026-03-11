@@ -3,8 +3,8 @@ const MENU_ITEMS = ['Typst', 'File', 'Edit', 'View', 'Help']
 export default function EditorToolbar({
   compileResult,
   currentPath,
-  downloadUrl,
   onBack,
+  onDownload,
   onSavePreview,
 }) {
   return (
@@ -27,11 +27,9 @@ export default function EditorToolbar({
         <button onClick={onSavePreview} style={styles.iconButton} title="Save and preview">
           💾
         </button>
-        {downloadUrl ? (
-          <a href={downloadUrl} style={styles.iconButton} title="Download PDF">
-            ⬇
-          </a>
-        ) : null}
+        <button onClick={onDownload} style={styles.iconButton} title="Download PDF">
+          ⬇
+        </button>
       </div>
     </div>
   )

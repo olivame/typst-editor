@@ -586,7 +586,24 @@ def get_pdf(project_id: int):
 
 
 @app.get('/projects/{project_id}/pdf/download')
-def download_pdf(project_id: int):
+def download_pdf(project_id: int, db: Session = Depends(get_db)):
+    get_project_or_404(db, project_id)
+    entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    sync_project_workspace(project_id, entries)
+
+    try:
+        response = requests.post(
+            COMPILER_URL,
+            json={'project_id': project_id},
+            timeout=COMPILER_TIMEOUT_SECONDS,
+        )
+        payload = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if payload.get('status') != 'success':
+        raise HTTPException(status_code=400, detail=payload.get('message') or 'Failed to export PDF')
+
     pdf_path = get_project_dir(project_id) / 'main.pdf'
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail='PDF not found')

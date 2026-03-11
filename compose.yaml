@@ -5,10 +5,12 @@ services:
       dockerfile: Dockerfile
     depends_on:
       - api
+      - preview
     ports:
       - "3000:3000"
     environment:
       - VITE_API_URL=${VITE_API_URL:-}
+      - VITE_PREVIEW_URL=${VITE_PREVIEW_URL:-}
     networks:
       - app-net
 
@@ -20,6 +22,8 @@ services:
       db:
         condition: service_healthy
       compiler:
+        condition: service_started
+      preview:
         condition: service_started
     environment:
       - DB_HOST=db
@@ -62,6 +66,22 @@ services:
       dockerfile: Dockerfile
       args:
         - TYPST_VERSION=${TYPST_VERSION:-0.14.2}
+    volumes:
+      - ./storage/projects:/workspace/projects
+    networks:
+      - app-net
+
+  preview:
+    build:
+      context: ./services/preview
+      dockerfile: Dockerfile
+      args:
+        - TINYMIST_VERSION=${TINYMIST_VERSION:-0.14.8}
+    environment:
+      - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
+      - SESSION_IDLE_SECONDS=${SESSION_IDLE_SECONDS:-1800}
+    ports:
+      - "8002:8002"
     volumes:
       - ./storage/projects:/workspace/projects
     networks:

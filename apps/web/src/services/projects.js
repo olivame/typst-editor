@@ -1,4 +1,5 @@
 import { API_URL } from '../config/api'
+import { PREVIEW_URL } from '../config/preview'
 
 async function parseJsonResponse(response) {
   if (!response.ok) {
@@ -126,10 +127,29 @@ export async function compileProject(projectId) {
   return parseJsonResponse(response)
 }
 
-export function getProjectPdfPreviewUrl(projectId, version) {
-  return `${API_URL}/projects/${projectId}/pdf?t=${version}`
+export function getProjectPreviewUrl(projectId) {
+  return `${PREVIEW_URL}/sessions/${projectId}/data`
 }
 
-export function getProjectPdfDownloadUrl(projectId, version) {
-  return `${API_URL}/projects/${projectId}/pdf/download?t=${version}`
+export async function downloadProjectPdf(projectId) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/pdf/download`)
+  if (!response.ok) {
+    const message = await response.text()
+    try {
+      const payload = JSON.parse(message)
+      throw new Error(payload.detail || 'Failed to export PDF')
+    } catch {
+      throw new Error(message || 'Failed to export PDF')
+    }
+  }
+
+  const blob = await response.blob()
+  const objectUrl = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = 'main.pdf'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.URL.revokeObjectURL(objectUrl)
 }
