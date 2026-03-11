@@ -446,6 +446,9 @@ def make_bridge_script(project_id: int) -> str:
   ];
   let eventSocket = null;
   let zoomSyncTimer = null;
+  let activeRevealToken = 0;
+  let cursorCleanupObserver = null;
+  let cursorCleanupFrame = 0;
 
   function notifyParent(message) {{
     window.parent.postMessage(message, parentOrigin);
@@ -606,7 +609,64 @@ def make_bridge_script(project_id: int) -> str:
     document.head.appendChild(style);
   }}
 
+  function pruneCursorMarkers() {{
+    const cursors = Array.from(document.querySelectorAll(".typst-svg-cursor"));
+    if (cursors.length === 0) {{
+      return null;
+    }}
+
+    const latestCursor = cursors.at(-1) || null;
+    cursors.forEach((cursor) => {{
+      if (cursor !== latestCursor) {{
+        cursor.remove();
+      }}
+    }});
+
+    return latestCursor;
+  }}
+
+  function scheduleCursorCleanup() {{
+    if (cursorCleanupFrame) {{
+      cancelAnimationFrame(cursorCleanupFrame);
+    }}
+
+    cursorCleanupFrame = requestAnimationFrame(() => {{
+      cursorCleanupFrame = 0;
+      pruneCursorMarkers();
+    }});
+  }}
+
+  function installCursorCleanupObserver() {{
+    if (cursorCleanupObserver) {{
+      return;
+    }}
+
+    cursorCleanupObserver = new MutationObserver((mutations) => {{
+      for (const mutation of mutations) {{
+        if (mutation.type !== "childList") {{
+          continue;
+        }}
+
+        const touchedCursor = [...mutation.addedNodes, ...mutation.removedNodes].some((node) => {{
+          return node instanceof Element && (
+            node.classList?.contains("typst-svg-cursor") ||
+            node.querySelector?.(".typst-svg-cursor")
+          );
+        }});
+
+        if (touchedCursor) {{
+          scheduleCursorCleanup();
+          break;
+        }}
+      }}
+    }});
+
+    cursorCleanupObserver.observe(document.body, {{ childList: true, subtree: true }});
+    scheduleCursorCleanup();
+  }}
+
   async function revealCursor(payload) {{
+    const revealToken = ++activeRevealToken;
     const response = await fetch(`/sessions/{project_id}/cursor`, {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
@@ -625,8 +685,12 @@ def make_bridge_script(project_id: int) -> str:
     notifyParent({{ type: "previewStatus", payload: {{ message: "" }} }});
     const startedAt = performance.now();
     while (performance.now() - startedAt < 1600) {{
+      if (revealToken !== activeRevealToken) {{
+        return;
+      }}
+
       const scrollNode = document.getElementById("typst-container-main");
-      const cursor = document.querySelector(".typst-svg-cursor");
+      const cursor = pruneCursorMarkers();
       if (scrollNode && cursor) {{
         ensureFlashStyle();
         cursor.classList.remove("olivame-preview-flash");
@@ -717,6 +781,7 @@ def make_bridge_script(project_id: int) -> str:
   }});
 
   ensureFlashStyle();
+  installCursorCleanupObserver();
   connectEventSocket();
   installZoomSyncBridge();
 }})();
