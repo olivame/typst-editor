@@ -397,7 +397,7 @@ const styles = {
     padding: '0 12px',
     borderRadius: '8px',
     border: 'none',
-    background: '#1f7a53',
+    background: '#4f97dd',
     color: '#ffffff',
     cursor: 'pointer',
     fontSize: '12px',
@@ -443,9 +443,9 @@ const styles = {
     borderLeft: '2px solid transparent',
   },
   treeItemActive: {
-    background: '#1f7a53',
+    background: '#4f97dd',
     color: '#f8fffb',
-    borderLeftColor: '#96d5b5',
+    borderLeftColor: '#b7dbfb',
   },
   expandButton: {
     width: '18px',

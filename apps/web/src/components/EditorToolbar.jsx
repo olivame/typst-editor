@@ -5,8 +5,7 @@ export default function EditorToolbar({
   currentPath,
   downloadUrl,
   onBack,
-  onCompile,
-  onSave,
+  onSavePreview,
 }) {
   return (
     <div style={styles.shell}>
@@ -25,11 +24,12 @@ export default function EditorToolbar({
 
       <div style={styles.right}>
         {compileResult ? <span style={styles.statusPill}>{compileResult}</span> : null}
-        <button onClick={onSave} style={styles.secondaryButton}>Save</button>
-        <button onClick={onCompile} style={styles.primaryButton}>Compile</button>
+        <button onClick={onSavePreview} style={styles.iconButton} title="Save and preview">
+          💾
+        </button>
         {downloadUrl ? (
-          <a href={downloadUrl} style={styles.secondaryButton}>
-            Download
+          <a href={downloadUrl} style={styles.iconButton} title="Download PDF">
+            ⬇
           </a>
         ) : null}
       </div>
@@ -116,29 +116,19 @@ const styles = {
     fontSize: '12px',
     fontWeight: '600',
   },
-  primaryButton: {
+  iconButton: {
     height: '34px',
-    padding: '0 14px',
-    borderRadius: '9px',
-    border: 'none',
-    background: '#176a4b',
-    color: '#ffffff',
-    cursor: 'pointer',
-    fontSize: '13px',
-    fontWeight: '700',
-  },
-  secondaryButton: {
-    height: '34px',
-    padding: '0 14px',
+    width: '34px',
     borderRadius: '9px',
     border: '1px solid #c9cad2',
     background: '#ffffff',
     color: '#353844',
     cursor: 'pointer',
-    fontSize: '13px',
+    fontSize: '15px',
     fontWeight: '600',
     textDecoration: 'none',
     display: 'inline-flex',
     alignItems: 'center',
+    justifyContent: 'center',
   },
 }

@@ -38,7 +38,7 @@ export default function Editor({ projectId, onBack }) {
   const textareaRef = useRef(null)
   const statusTimerRef = useRef(null)
   const pendingCursorJumpRef = useRef(null)
-  const previewFrameRef = useRef(null)
+  const dragStateRef = useRef(null)
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [currentFile, setCurrentFile] = useState(null)
@@ -47,6 +47,9 @@ export default function Editor({ projectId, onBack }) {
   const [pdfVersion, setPdfVersion] = useState(null)
   const [sidebarMode, setSidebarMode] = useState('files')
   const [previewZoom, setPreviewZoom] = useState(1)
+  const [isPreviewDetached, setIsPreviewDetached] = useState(false)
+  const [previewWheelElement, setPreviewWheelElement] = useState(null)
+  const [floatingPreviewPosition, setFloatingPreviewPosition] = useState({ top: 88, right: 28 })
 
   function showStatus(message, duration = 0) {
     if (statusTimerRef.current) {
@@ -150,16 +153,29 @@ export default function Editor({ projectId, onBack }) {
     }
   }, [projectId])
 
-  async function saveFile() {
+  async function saveAndPreview() {
     if (!currentFile) return
+    try {
+      await updateFileContent(currentFile.id, content)
+      setCurrentFile((current) => (current ? { ...current, content } : current))
 
-    await updateFileContent(currentFile.id, content)
-    setCurrentFile((current) => (current ? { ...current, content } : current))
-    showStatus('Saved', 2000)
+      showStatus('Saving...')
+      const data = await compileProject(projectId)
+
+      if (data.status === 'success') {
+        setPdfVersion(Date.now())
+        showStatus('Saved and preview updated', 3000)
+        return
+      }
+
+      showStatus(data.message || data.status)
+    } catch (error) {
+      showStatus(error.message || 'Failed to compile')
+    }
   }
 
   const handleSaveShortcut = useEffectEvent(() => {
-    void saveFile()
+    void saveAndPreview()
   })
 
   useEffect(() => {
@@ -173,28 +189,6 @@ export default function Editor({ projectId, onBack }) {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [])
-
-  async function compile() {
-    try {
-      if (currentFile) {
-        await updateFileContent(currentFile.id, content)
-        setCurrentFile((current) => (current ? { ...current, content } : current))
-      }
-
-      showStatus('Compiling...')
-      const data = await compileProject(projectId)
-
-      if (data.status === 'success') {
-        setPdfVersion(Date.now())
-        showStatus(data.message || data.status, 3000)
-        return
-      }
-
-      showStatus(data.message || data.status)
-    } catch (error) {
-      showStatus(error.message || 'Failed to compile')
-    }
-  }
 
   async function handleCreateFile(path) {
     const entry = await createProjectFile(projectId, path)
@@ -277,18 +271,46 @@ export default function Editor({ projectId, onBack }) {
   })
 
   useEffect(() => {
-    const previewFrame = previewFrameRef.current
-    if (!previewFrame) return undefined
+    if (!previewWheelElement) return undefined
 
     const handleNativeWheel = (event) => {
       handlePreviewWheel(event)
     }
 
-    previewFrame.addEventListener('wheel', handleNativeWheel, { passive: false })
+    previewWheelElement.addEventListener('wheel', handleNativeWheel, { passive: false })
     return () => {
-      previewFrame.removeEventListener('wheel', handleNativeWheel)
+      previewWheelElement.removeEventListener('wheel', handleNativeWheel)
     }
-  }, [])
+  }, [previewWheelElement])
+
+  useEffect(() => {
+    if (!isPreviewDetached) {
+      dragStateRef.current = null
+      return undefined
+    }
+
+    const handleMouseMove = (event) => {
+      const dragState = dragStateRef.current
+      if (!dragState) return
+
+      setFloatingPreviewPosition({
+        top: Math.max(event.clientY - dragState.offsetY, 64),
+        right: Math.max(window.innerWidth - event.clientX - dragState.offsetRight, 20),
+      })
+    }
+
+    const handleMouseUp = () => {
+      dragStateRef.current = null
+    }
+
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isPreviewDetached])
 
   const lineCount = useMemo(
     () => Math.max(content.split('\n').length, 1),
@@ -304,6 +326,47 @@ export default function Editor({ projectId, onBack }) {
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
+
+  const togglePreviewDetach = () => {
+    setIsPreviewDetached((current) => !current)
+  }
+
+  const startFloatingPreviewDrag = (event) => {
+    dragStateRef.current = {
+      offsetY: event.clientY - floatingPreviewPosition.top,
+      offsetRight: window.innerWidth - event.clientX - floatingPreviewPosition.right,
+    }
+  }
+
+  const renderPreviewTools = () => (
+    <div style={styles.panelTools}>
+      <button onClick={resetPreviewZoom} style={styles.previewChip}>⟲</button>
+      <button onClick={() => changePreviewZoom(-PREVIEW_ZOOM_STEP)} style={styles.previewChip}>−</button>
+      <button style={styles.previewChipLabel}>{previewZoomLabel}</button>
+      <button onClick={() => changePreviewZoom(PREVIEW_ZOOM_STEP)} style={styles.previewChip}>+</button>
+      <button
+        onClick={togglePreviewDetach}
+        style={styles.previewChip}
+        title={isPreviewDetached ? 'Dock preview' : 'Open floating preview'}
+      >
+        {isPreviewDetached ? '⇲' : '⧉'}
+      </button>
+    </div>
+  )
+
+  const renderPreviewViewport = () => (
+    <div ref={setPreviewWheelElement} style={styles.previewFrame}>
+      {previewUrl ? (
+        <PdfPreview
+          key={`${previewUrl}-${previewZoomLabel}-${isPreviewDetached ? 'floating' : 'embedded'}`}
+          src={previewUrl}
+          zoom={previewZoom}
+        />
+      ) : (
+        <div style={styles.previewPlaceholder}>Save to preview PDF</div>
+      )}
+    </div>
+  )
 
   const handleRailClick = (itemId) => {
     if (itemId === 'files') {
@@ -377,12 +440,11 @@ export default function Editor({ projectId, onBack }) {
             currentPath={currentPathLabel}
             downloadUrl={downloadUrl}
             onBack={onBack}
-            onCompile={compile}
-            onSave={saveFile}
+            onSavePreview={saveAndPreview}
           />
 
           <div style={styles.contentRow}>
-            <section style={styles.editorColumn}>
+            <section style={{ ...styles.editorColumn, ...(isPreviewDetached ? styles.editorColumnExpanded : null) }}>
               <div style={styles.panelToolbar}>
                 <div style={styles.panelTools}>
                   {EDITOR_TOOL_ITEMS.map((item) => (
@@ -427,28 +489,41 @@ export default function Editor({ projectId, onBack }) {
               </div>
             </section>
 
-            <section style={styles.previewColumn}>
-              <div style={styles.panelToolbar}>
-                <div style={styles.panelTools}>
-                  <button onClick={resetPreviewZoom} style={styles.previewChip}>⟲</button>
-                  <button onClick={() => changePreviewZoom(-PREVIEW_ZOOM_STEP)} style={styles.previewChip}>−</button>
-                  <button style={styles.previewChipLabel}>{previewZoomLabel}</button>
-                  <button onClick={() => changePreviewZoom(PREVIEW_ZOOM_STEP)} style={styles.previewChip}>+</button>
-                  <button onClick={resetPreviewZoom} style={styles.previewChip}>□</button>
+            {!isPreviewDetached ? (
+              <section style={styles.previewColumn}>
+                <div style={styles.panelToolbar}>
+                  {renderPreviewTools()}
+                  <div style={styles.panelMeta}>Preview</div>
                 </div>
-                <div style={styles.panelMeta}>Preview</div>
-              </div>
 
-              <div ref={previewFrameRef} style={styles.previewFrame}>
-                {previewUrl ? (
-                  <PdfPreview key={`${previewUrl}-${previewZoomLabel}`} src={previewUrl} zoom={previewZoom} />
-                ) : (
-                  <div style={styles.previewPlaceholder}>Compile to preview PDF</div>
-                )}
-              </div>
-            </section>
+                {renderPreviewViewport()}
+              </section>
+            ) : null}
           </div>
         </div>
+
+        {isPreviewDetached ? (
+          <div
+            style={{
+              ...styles.floatingPreviewWindow,
+              top: `${floatingPreviewPosition.top}px`,
+              right: `${floatingPreviewPosition.right}px`,
+            }}
+          >
+            <div
+              onMouseDown={startFloatingPreviewDrag}
+              style={{ ...styles.panelToolbar, ...styles.floatingPreviewHeader }}
+            >
+              {renderPreviewTools()}
+              <div style={styles.floatingPreviewMeta}>
+                <span style={styles.floatingDragHandle}>⋮⋮</span>
+                Preview
+              </div>
+            </div>
+
+            {renderPreviewViewport()}
+          </div>
+        ) : null}
       </div>
     </div>
   )
@@ -488,8 +563,8 @@ const styles = {
     width: '32px',
     height: '32px',
     borderRadius: '10px',
-    background: '#d8f0e3',
-    color: '#107351',
+    background: '#dcebfb',
+    color: '#3f87ce',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -551,6 +626,9 @@ const styles = {
     overflow: 'hidden',
     border: '1px solid #d3d5da',
     background: '#f7f7f9',
+  },
+  editorColumnExpanded: {
+    gridColumn: '1 / -1',
   },
   previewColumn: {
     minWidth: 0,
@@ -691,5 +769,36 @@ const styles = {
     color: '#666a73',
     fontSize: '14px',
     letterSpacing: '0.02em',
+  },
+  floatingPreviewWindow: {
+    position: 'fixed',
+    width: 'min(560px, calc(100vw - 96px))',
+    height: 'calc(100vh - 128px)',
+    minHeight: '420px',
+    borderRadius: '16px',
+    overflow: 'hidden',
+    border: '1px solid #cfd4dd',
+    background: '#f7f7f9',
+    boxShadow: '0 24px 60px rgba(15, 23, 42, 0.24)',
+    zIndex: 40,
+  },
+  floatingPreviewHeader: {
+    cursor: 'move',
+    userSelect: 'none',
+  },
+  floatingPreviewMeta: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#646b78',
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+  },
+  floatingDragHandle: {
+    color: '#94a3b8',
+    fontSize: '14px',
+    letterSpacing: '-0.1em',
   },
 }

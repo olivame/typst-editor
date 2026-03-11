@@ -605,7 +605,7 @@ const styles = {
     width: '100%',
     border: 'none',
     borderRadius: '999px',
-    background: '#138a42',
+    background: '#4f97dd',
     color: '#fff',
     fontSize: '15px',
     fontWeight: '700',
@@ -667,7 +667,7 @@ const styles = {
     cursor: 'pointer',
   },
   navItemActive: {
-    background: '#dfe9e3',
+    background: '#deecfb',
     color: '#1e293b',
     fontWeight: '600',
   },
@@ -914,8 +914,8 @@ const styles = {
     display: 'inline-flex',
     alignSelf: 'flex-start',
     padding: '8px 12px',
-    background: '#eff6f1',
-    color: '#166534',
+    background: '#e7f1fc',
+    color: '#2f6fae',
     borderRadius: '999px',
     fontSize: '13px',
     fontWeight: '700',
@@ -957,7 +957,7 @@ const styles = {
     cursor: 'pointer',
   },
   modalPrimaryButtonEnabled: {
-    background: '#138a42',
+    background: '#4f97dd',
     color: '#ffffff',
   },
   modalPrimaryButtonDisabled: {
@@ -996,7 +996,7 @@ const styles = {
     fontSize: '15px',
     fontWeight: '700',
     cursor: 'pointer',
-    background: '#138a42',
+    background: '#4f97dd',
     color: '#ffffff',
   },
   confirmationPrimaryDanger: {
