@@ -4,7 +4,7 @@ import pdfWorker from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker
 
-export default function PdfPreview({ src }) {
+export default function PdfPreview({ src, zoom = 1 }) {
   const containerRef = useRef(null)
   const [previewState, setPreviewState] = useState('idle')
   const [previewError, setPreviewError] = useState('')
@@ -55,7 +55,7 @@ export default function PdfPreview({ src }) {
           if (cancelled) return
 
           const baseViewport = page.getViewport({ scale: 1 })
-          const scale = availableWidth / baseViewport.width
+          const scale = (availableWidth / baseViewport.width) * zoom
           const viewport = page.getViewport({ scale })
 
           const pageShell = document.createElement('div')
@@ -106,7 +106,7 @@ export default function PdfPreview({ src }) {
       loadingTask?.destroy()
       pdfDocument?.destroy()
     }
-  }, [src])
+  }, [src, zoom])
 
   return (
     <div style={styles.previewViewport}>

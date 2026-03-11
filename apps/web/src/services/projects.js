@@ -55,6 +55,54 @@ export async function listProjectFiles(projectId) {
   return parseJsonResponse(response)
 }
 
+export async function searchProjectFiles(projectId, query) {
+  const response = await fetch(
+    `${API_URL}/projects/${projectId}/search?q=${encodeURIComponent(query)}`,
+  )
+  return parseJsonResponse(response)
+}
+
+export async function createProjectFile(projectId, path) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/files`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function createProjectFolder(projectId, path) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/folders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function uploadProjectFiles(projectId, files, options = {}) {
+  const formData = new FormData()
+  const relativePaths = options.relativePaths || []
+
+  files.forEach((file) => {
+    formData.append('files', file, file.name)
+  })
+
+  formData.append('parent_path', options.parentPath || '')
+  if (relativePaths.length > 0) {
+    formData.append('relative_paths', JSON.stringify(relativePaths))
+  }
+
+  const response = await fetch(`${API_URL}/projects/${projectId}/uploads`, {
+    method: 'POST',
+    body: formData,
+  })
+
+  return parseJsonResponse(response)
+}
+
 export async function getFileContent(fileId) {
   const response = await fetch(`${API_URL}/files/${fileId}/content`)
   return parseJsonResponse(response)
