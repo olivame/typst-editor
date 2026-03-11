@@ -850,7 +850,9 @@ const styles = {
     color: '#2c3b4c',
   },
   previewFrame: {
+    display: 'flex',
     flex: 1,
+    minWidth: 0,
     minHeight: 0,
     background: '#d7d7dc',
     overflow: 'hidden',
@@ -866,6 +868,9 @@ const styles = {
   },
   floatingPreviewWindow: {
     position: 'fixed',
+    display: 'flex',
+    flexDirection: 'column',
+    minWidth: 0,
     width: 'min(560px, calc(100vw - 96px))',
     height: 'calc(100vh - 128px)',
     minHeight: '420px',
@@ -877,6 +882,7 @@ const styles = {
     zIndex: 40,
   },
   floatingPreviewHeader: {
+    flexShrink: 0,
     cursor: 'move',
     userSelect: 'none',
   },

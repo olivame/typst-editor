@@ -91,12 +91,20 @@ export default TinymistPreview
 const styles = {
   previewViewport: {
     position: 'relative',
+    display: 'flex',
+    flex: 1,
+    minWidth: 0,
+    minHeight: 0,
     width: '100%',
     height: '100%',
     overflow: 'hidden',
     background: '#d1d5db',
   },
   iframe: {
+    display: 'block',
+    flex: 1,
+    minWidth: 0,
+    minHeight: 0,
     width: '100%',
     height: '100%',
     border: 'none',
