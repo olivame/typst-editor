@@ -1,0 +1,65 @@
+services:
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=${VITE_API_URL:-}
+    networks:
+      - app-net
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    depends_on:
+      - db
+      - compiler
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - COMPILER_URL=${COMPILER_URL:-http://compiler:8001}
+      - COMPILER_TIMEOUT_SECONDS=${COMPILER_TIMEOUT_SECONDS:-10}
+      - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage/projects:/workspace/projects
+    networks:
+      - app-net
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - app-net
+
+  compiler:
+    build:
+      context: ./services/compiler
+      dockerfile: Dockerfile
+    volumes:
+      - ./storage/projects:/workspace/projects
+    networks:
+      - app-net
+
+networks:
+  app-net:
+
+volumes:
+  db-data:

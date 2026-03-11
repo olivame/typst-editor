@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+
+apps/web/node_modules/
+apps/web/dist/
+
+storage/projects/**
+!storage/projects/
+!storage/projects/.gitkeep
+
+.DS_Store
+.idea/
+.vscode/
