@@ -1,7 +1,9 @@
 FROM python:3.11-slim
 
+ARG TYPST_VERSION=0.14.2
+
 RUN apt-get update && apt-get install -y wget xz-utils && \
-    wget -q https://github.com/typst/typst/releases/download/v0.11.0/typst-x86_64-unknown-linux-musl.tar.xz && \
+    wget -q https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz && \
     tar -xf typst-x86_64-unknown-linux-musl.tar.xz && \
     mv typst-x86_64-unknown-linux-musl/typst /usr/local/bin/ && \
     rm -rf typst-x86_64-unknown-linux-musl* && \

@@ -60,6 +60,8 @@ services:
     build:
       context: ./services/compiler
       dockerfile: Dockerfile
+      args:
+        - TYPST_VERSION=${TYPST_VERSION:-0.14.2}
     volumes:
       - ./storage/projects:/workspace/projects
     networks:

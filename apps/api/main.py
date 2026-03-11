@@ -1,14 +1,24 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import models
 from database import engine, get_db
 import requests
+import shutil
 from settings import COMPILER_TIMEOUT_SECONDS, COMPILER_URL, CORS_ALLOW_ORIGINS, WORKSPACE_DIR
 
 models.Base.metadata.create_all(bind=engine)
+
+with engine.begin() as connection:
+    inspector = inspect(connection)
+    project_columns = {column["name"] for column in inspector.get_columns("projects")}
+    if "status" not in project_columns:
+        connection.execute(
+            text("ALTER TABLE projects ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active'")
+        )
 
 app = FastAPI()
 
@@ -27,13 +37,44 @@ class ProjectCreate(BaseModel):
 class FileUpdate(BaseModel):
     content: str
 
+
+class ProjectStatusUpdate(BaseModel):
+    status: str
+
+
+def serialize_project(project: models.Project):
+    return {
+        "id": project.id,
+        "name": project.name,
+        "status": project.status,
+        "created_at": project.created_at,
+    }
+
+
+def make_unique_project_name(db: Session, base_name: str):
+    normalized_name = base_name.strip() or "Untitled Project"
+    existing_names = {
+        project_name
+        for project_name, in db.query(models.Project.name).all()
+    }
+
+    if normalized_name not in existing_names:
+        return normalized_name
+
+    suffix = 2
+    while True:
+        candidate = f"{normalized_name} ({suffix})"
+        if candidate not in existing_names:
+            return candidate
+        suffix += 1
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/projects")
 def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
-    db_project = models.Project(name=project.name)
+    db_project = models.Project(name=project.name.strip(), status="active")
     db.add(db_project)
     db.commit()
     db.refresh(db_project)
@@ -42,16 +83,81 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
     db.add(main_file)
     db.commit()
 
-    return {
-        "id": db_project.id,
-        "name": db_project.name,
-        "created_at": db_project.created_at,
-    }
+    return serialize_project(db_project)
 
 @app.get("/projects")
 def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(models.Project).all()
-    return [{"id": p.id, "name": p.name, "created_at": p.created_at} for p in projects]
+    projects = db.query(models.Project).order_by(models.Project.created_at.desc()).all()
+    return [serialize_project(project) for project in projects]
+
+
+@app.post("/projects/{project_id}/copy")
+def copy_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    copied_project = models.Project(
+        name=make_unique_project_name(db, f"{project.name} Copy"),
+        status="active",
+    )
+    db.add(copied_project)
+    db.commit()
+    db.refresh(copied_project)
+
+    source_files = db.query(models.File).filter(models.File.project_id == project_id).all()
+    for source_file in source_files:
+        db.add(
+            models.File(
+                project_id=copied_project.id,
+                name=source_file.name,
+                content=source_file.content,
+            )
+        )
+    db.commit()
+
+    source_dir = WORKSPACE_DIR / str(project_id)
+    copied_dir = WORKSPACE_DIR / str(copied_project.id)
+    copied_dir.mkdir(parents=True, exist_ok=True)
+
+    if source_dir.exists():
+        for source_path in source_dir.iterdir():
+            if source_path.is_file():
+                shutil.copy2(source_path, copied_dir / source_path.name)
+
+    return serialize_project(copied_project)
+
+
+@app.patch("/projects/{project_id}/status")
+def update_project_status(project_id: int, status_update: ProjectStatusUpdate, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if status_update.status not in {"active", "archived", "trashed"}:
+        raise HTTPException(status_code=400, detail="Invalid project status")
+
+    project.status = status_update.status
+    db.commit()
+    db.refresh(project)
+
+    return serialize_project(project)
+
+
+@app.delete("/projects/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    db.delete(project)
+    db.commit()
+
+    project_dir = WORKSPACE_DIR / str(project_id)
+    if project_dir.exists():
+        shutil.rmtree(project_dir)
+
+    return {"status": "success", "id": project_id}
 
 @app.get("/projects/{project_id}/files")
 def list_files(project_id: int, db: Session = Depends(get_db)):

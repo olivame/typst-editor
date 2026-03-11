@@ -49,6 +49,7 @@ docker compose -f compose.yaml -f compose.dev.yaml up --build
 
 `.env.example` 里已经提供了这些入口：
 
+- `TYPST_VERSION`: compiler 容器使用的 Typst 版本
 - `VITE_API_URL`: 前端显式 API 地址
 - `CORS_ALLOW_ORIGINS`: API 允许的来源
 - `COMPILER_URL`: API 调用编译服务的地址

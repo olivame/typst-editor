@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   createProject as createProjectRequest,
+  copyProject as copyProjectRequest,
+  deleteProject as deleteProjectRequest,
   listProjectFiles,
   listProjects,
+  updateProjectStatus as updateProjectStatusRequest,
   updateFileContent,
 } from './services/projects'
 
@@ -54,11 +57,11 @@ This is an example Typst project.
 ]
 
 const SIDEBAR_ITEMS = [
-  'All projects',
-  'Your projects',
-  'Shared with you',
-  'Archived projects',
-  'Trashed projects',
+  { id: 'all', label: 'All projects' },
+  { id: 'your', label: 'Your projects' },
+  { id: 'shared', label: 'Shared with you' },
+  { id: 'archived', label: 'Archived projects' },
+  { id: 'trashed', label: 'Trashed projects' },
 ]
 
 function formatProjectDate(value) {
@@ -74,22 +77,20 @@ function formatProjectDate(value) {
   return `${diffDays} days ago`
 }
 
-function ActionButton({ label, onClick }) {
-  return (
-    <button type="button" onClick={onClick} style={styles.actionButton}>
-      {label}
-    </button>
-  )
-}
-
 export default function ProjectList({ onOpenProject }) {
+  const actionMenuTriggerRefs = useRef({})
   const [projects, setProjects] = useState([])
+  const [selectedView, setSelectedView] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
+  const [activeProjectAction, setActiveProjectAction] = useState('')
+  const [openActionMenuProjectId, setOpenActionMenuProjectId] = useState(null)
+  const [actionMenuPosition, setActionMenuPosition] = useState(null)
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false)
   const [selectedTemplate, setSelectedTemplate] = useState(null)
   const [newProjectName, setNewProjectName] = useState('')
   const [isCreatingProject, setIsCreatingProject] = useState(false)
+  const [confirmationModal, setConfirmationModal] = useState(null)
 
   useEffect(() => {
     listProjects()
@@ -97,14 +98,47 @@ export default function ProjectList({ onOpenProject }) {
       .catch((error) => setErrorMessage(error.message || 'Failed to load projects'))
   }, [])
 
+  useEffect(() => {
+    const handleWindowClick = () => setOpenActionMenuProjectId(null)
+    window.addEventListener('click', handleWindowClick)
+    return () => window.removeEventListener('click', handleWindowClick)
+  }, [])
+
+  useEffect(() => {
+    if (!openActionMenuProjectId) {
+      setActionMenuPosition(null)
+      return
+    }
+
+    const trigger = actionMenuTriggerRefs.current[openActionMenuProjectId]
+    if (!trigger) return
+
+    const rect = trigger.getBoundingClientRect()
+    setActionMenuPosition({
+      top: rect.bottom + 8,
+      left: rect.right - 150,
+    })
+  }, [openActionMenuProjectId])
+
   const filteredProjects = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase()
-    if (!normalizedQuery) return projects
+    const visibleProjects = projects.filter((project) => {
+      if (selectedView === 'archived') return project.status === 'archived'
+      if (selectedView === 'trashed') return project.status === 'trashed'
+      return project.status !== 'trashed' && project.status !== 'archived'
+    })
 
-    return projects.filter((project) =>
+    if (!normalizedQuery) return visibleProjects
+
+    return visibleProjects.filter((project) =>
       project.name.toLowerCase().includes(normalizedQuery),
     )
-  }, [projects, searchQuery])
+  }, [projects, searchQuery, selectedView])
+
+  const viewTitle = useMemo(() => {
+    const currentItem = SIDEBAR_ITEMS.find((item) => item.id === selectedView)
+    return currentItem?.label || 'All projects'
+  }, [selectedView])
 
   const openTemplateModal = (template) => {
     if (!template.enabled) return
@@ -147,6 +181,132 @@ export default function ProjectList({ onOpenProject }) {
     }
   }
 
+  const copyProject = async (project) => {
+    if (activeProjectAction) return
+
+    setOpenActionMenuProjectId(null)
+    setActiveProjectAction(`copy-${project.id}`)
+    try {
+      const copiedProject = await copyProjectRequest(project.id)
+      setProjects((currentProjects) => [copiedProject, ...currentProjects])
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to copy project')
+    } finally {
+      setActiveProjectAction('')
+      setOpenActionMenuProjectId(null)
+    }
+  }
+
+  const updateProjectStatus = async (project, nextStatus) => {
+    if (activeProjectAction) return
+
+    setOpenActionMenuProjectId(null)
+    setActiveProjectAction(`${nextStatus}-${project.id}`)
+    try {
+      const updatedProject = await updateProjectStatusRequest(project.id, nextStatus)
+      setProjects((currentProjects) =>
+        currentProjects.map((currentProject) =>
+          currentProject.id === updatedProject.id ? updatedProject : currentProject,
+        ),
+      )
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to update project')
+    } finally {
+      setActiveProjectAction('')
+      setConfirmationModal(null)
+      setOpenActionMenuProjectId(null)
+    }
+  }
+
+  const trashProject = async (project) => {
+    setConfirmationModal({
+      title: 'Move project to trash?',
+      description: `“${project.name}” will be moved to Trashed projects. You can restore it later.`,
+      confirmLabel: 'Move to trash',
+      tone: 'danger',
+      onConfirm: () => updateProjectStatus(project, 'trashed'),
+    })
+  }
+
+  const archiveProject = async (project) => {
+    await updateProjectStatus(project, 'archived')
+  }
+
+  const restoreProject = async (project) => {
+    await updateProjectStatus(project, 'active')
+  }
+
+  const permanentlyDeleteProject = async (project) => {
+    setConfirmationModal({
+      title: 'Delete project permanently?',
+      description: `“${project.name}” will be deleted permanently together with its files. This cannot be undone.`,
+      confirmLabel: 'Delete permanently',
+      tone: 'danger',
+      onConfirm: async () => {
+        if (activeProjectAction) return
+
+        setActiveProjectAction(`delete-${project.id}`)
+        setOpenActionMenuProjectId(null)
+        try {
+          await deleteProjectRequest(project.id)
+          setProjects((currentProjects) =>
+            currentProjects.filter((currentProject) => currentProject.id !== project.id),
+          )
+          setErrorMessage('')
+        } catch (error) {
+          setErrorMessage(error.message || 'Failed to delete project')
+        } finally {
+          setActiveProjectAction('')
+          setConfirmationModal(null)
+        }
+      },
+    })
+  }
+
+  const renderProjectActions = (project) => {
+    if (selectedView === 'trashed') {
+      return (
+        <>
+          <button type="button" style={styles.actionMenuItem} onClick={() => restoreProject(project)}>
+            Restore
+          </button>
+          <button type="button" style={styles.actionMenuItemDanger} onClick={() => permanentlyDeleteProject(project)}>
+            {activeProjectAction === `delete-${project.id}` ? 'Deleting...' : 'Delete'}
+          </button>
+        </>
+      )
+    }
+
+    if (selectedView === 'archived') {
+      return (
+        <>
+          <button type="button" style={styles.actionMenuItem} onClick={() => restoreProject(project)}>
+            Restore
+          </button>
+          <button type="button" style={styles.actionMenuItemDanger} onClick={() => trashProject(project)}>
+            Trash
+          </button>
+        </>
+      )
+    }
+
+    return (
+      <>
+        <button type="button" style={styles.actionMenuItem} onClick={() => copyProject(project)}>
+          {activeProjectAction === `copy-${project.id}` ? 'Copying...' : 'Copy'}
+        </button>
+        <button type="button" style={styles.actionMenuItem} onClick={() => archiveProject(project)}>
+          {activeProjectAction === `archived-${project.id}` ? 'Archiving...' : 'Archive'}
+        </button>
+        <button type="button" style={styles.actionMenuItemDanger} onClick={() => trashProject(project)}>
+          {activeProjectAction === `trashed-${project.id}` ? 'Trashing...' : 'Trash'}
+        </button>
+      </>
+    )
+  }
+
   return (
     <div style={styles.page}>
       <aside style={styles.sidebar}>
@@ -185,16 +345,17 @@ export default function ProjectList({ onOpenProject }) {
         </div>
 
         <nav style={styles.nav}>
-          {SIDEBAR_ITEMS.map((item, index) => (
+          {SIDEBAR_ITEMS.map((item) => (
             <button
-              key={item}
+              key={item.id}
               type="button"
+              onClick={() => setSelectedView(item.id)}
               style={{
                 ...styles.navItem,
-                ...(index === 0 ? styles.navItemActive : null),
+                ...(selectedView === item.id ? styles.navItemActive : null),
               }}
             >
-              {item}
+              {item.label}
             </button>
           ))}
         </nav>
@@ -207,7 +368,7 @@ export default function ProjectList({ onOpenProject }) {
 
       <main style={styles.main}>
         <div style={styles.topbar}>
-          <div style={styles.pageTitle}>All projects</div>
+          <div style={styles.pageTitle}>{viewTitle}</div>
           <button type="button" style={styles.accountButton}>Admin ▾</button>
         </div>
 
@@ -250,9 +411,23 @@ export default function ProjectList({ onOpenProject }) {
                   {formatProjectDate(project.created_at)} by You
                 </div>
                 <div style={{ ...styles.tableCell, ...styles.actionsCell }}>
-                  <ActionButton label="Open" onClick={() => onOpenProject(project.id)} />
-                  <ActionButton label="Copy" onClick={() => {}} />
-                  <ActionButton label="Trash" onClick={() => {}} />
+                  <div style={styles.actionMenuWrap}>
+                    <button
+                      type="button"
+                      ref={(element) => {
+                        actionMenuTriggerRefs.current[project.id] = element
+                      }}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setOpenActionMenuProjectId((currentId) =>
+                          currentId === project.id ? null : project.id,
+                        )
+                      }}
+                      style={styles.actionMenuTrigger}
+                    >
+                      ⋯
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
@@ -310,6 +485,49 @@ export default function ProjectList({ onOpenProject }) {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {confirmationModal && (
+        <div style={styles.modalOverlay} onClick={() => setConfirmationModal(null)}>
+          <div style={styles.confirmationModal} onClick={(event) => event.stopPropagation()}>
+            <div style={styles.confirmationTitle}>{confirmationModal.title}</div>
+            <div style={styles.confirmationText}>{confirmationModal.description}</div>
+            <div style={styles.confirmationActions}>
+              <button
+                type="button"
+                style={styles.modalSecondaryButton}
+                onClick={() => setConfirmationModal(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                style={{
+                  ...styles.confirmationPrimaryButton,
+                  ...(confirmationModal.tone === 'danger' ? styles.confirmationPrimaryDanger : null),
+                }}
+                onClick={() => confirmationModal.onConfirm()}
+              >
+                {confirmationModal.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {openActionMenuProjectId && actionMenuPosition && (
+        <div
+          style={{
+            ...styles.actionMenuPortal,
+            top: actionMenuPosition.top,
+            left: actionMenuPosition.left,
+          }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {renderProjectActions(
+            projects.find((project) => project.id === openActionMenuProjectId),
+          )}
         </div>
       )}
     </div>
@@ -562,13 +780,53 @@ const styles = {
     alignItems: 'center',
     gap: '8px',
   },
-  actionButton: {
+  actionMenuWrap: {
+    position: 'relative',
+    display: 'flex',
+    justifyContent: 'flex-end',
+  },
+  actionMenuTrigger: {
+    width: '36px',
+    height: '36px',
+    borderRadius: '10px',
     border: '1px solid #d6dde5',
     background: '#fff',
     color: '#475569',
+    fontSize: '24px',
+    lineHeight: 1,
+    cursor: 'pointer',
+  },
+  actionMenuPortal: {
+    position: 'fixed',
+    minWidth: '150px',
+    background: '#fff',
+    border: '1px solid #d9e0e5',
+    borderRadius: '12px',
+    boxShadow: '0 18px 40px rgba(15, 23, 42, 0.14)',
+    padding: '8px',
+    zIndex: 20,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+  },
+  actionMenuItem: {
+    border: 'none',
+    background: '#fff',
+    color: '#334155',
     borderRadius: '8px',
-    fontSize: '13px',
-    padding: '7px 10px',
+    fontSize: '14px',
+    padding: '10px 12px',
+    textAlign: 'left',
+    cursor: 'pointer',
+  },
+  actionMenuItemDanger: {
+    border: 'none',
+    background: '#fff',
+    color: '#b42318',
+    borderRadius: '8px',
+    fontSize: '14px',
+    padding: '10px 12px',
+    textAlign: 'left',
     cursor: 'pointer',
   },
   tableFooter: {
@@ -679,5 +937,43 @@ const styles = {
   modalPrimaryButtonDisabled: {
     opacity: 0.6,
     cursor: 'not-allowed',
+  },
+  confirmationModal: {
+    width: '100%',
+    maxWidth: '520px',
+    background: '#ffffff',
+    borderRadius: '18px',
+    padding: '28px',
+    boxShadow: '0 30px 80px rgba(15, 23, 42, 0.28)',
+  },
+  confirmationTitle: {
+    fontSize: '22px',
+    fontWeight: '700',
+    color: '#0f172a',
+    marginBottom: '10px',
+  },
+  confirmationText: {
+    fontSize: '15px',
+    lineHeight: '1.6',
+    color: '#475569',
+    marginBottom: '24px',
+  },
+  confirmationActions: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '12px',
+  },
+  confirmationPrimaryButton: {
+    border: 'none',
+    borderRadius: '999px',
+    padding: '11px 18px',
+    fontSize: '15px',
+    fontWeight: '700',
+    cursor: 'pointer',
+    background: '#138a42',
+    color: '#ffffff',
+  },
+  confirmationPrimaryDanger: {
+    background: '#b42318',
   },
 }

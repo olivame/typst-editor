@@ -7,7 +7,7 @@
 - **前端**: React (Vite)
 - **后端**: FastAPI + SQLAlchemy
 - **数据库**: PostgreSQL 16
-- **编译服务**: Typst 0.11.0 + Python HTTP Server
+- **编译服务**: Typst 0.14.2 + Python HTTP Server
 - **容器化**: Docker Compose
 
 ## 已完成功能
@@ -46,9 +46,10 @@
 ## 版本兼容性
 
 ### Typst 版本选择
-- **当前版本**: v0.11.0
-- **原因**: tiaoma:0.3.0 包与 v0.14.2 不兼容
-- **降级决策**: 优先保证现有包的兼容性
+- **当前版本**: v0.14.2
+- **原因**: 与本地开发环境保持一致，减少本地/容器编译差异
+- **决策**: 优先保证容器与开发机的 Typst 行为一致
+- **配置入口**: `.env` / `compose.yaml` 中的 `TYPST_VERSION`
 
 ## 架构设计
 

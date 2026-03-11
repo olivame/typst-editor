@@ -24,6 +24,32 @@ export async function createProject(name) {
   return parseJsonResponse(response)
 }
 
+export async function copyProject(projectId) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/copy`, {
+    method: 'POST',
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function deleteProject(projectId) {
+  const response = await fetch(`${API_URL}/projects/${projectId}`, {
+    method: 'DELETE',
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function updateProjectStatus(projectId, status) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  })
+
+  return parseJsonResponse(response)
+}
+
 export async function listProjectFiles(projectId) {
   const response = await fetch(`${API_URL}/projects/${projectId}/files`)
   return parseJsonResponse(response)
