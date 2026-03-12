@@ -83,6 +83,24 @@ class ProjectStatusUpdate(BaseModel):
     status: str
 
 
+def get_available_fonts_from_compiler():
+    try:
+        response = requests.get(
+            f'{COMPILER_URL}/fonts',
+            timeout=COMPILER_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    payload = response.json()
+    fonts = payload.get('fonts')
+    if not isinstance(fonts, list):
+        raise HTTPException(status_code=502, detail='Compiler returned an invalid font list')
+
+    return [str(font).strip() for font in fonts if str(font).strip()]
+
+
 def serialize_project(project: models.Project):
     return {
         'id': project.id,
@@ -575,6 +593,11 @@ def compile_project(project_id: int, db: Session = Depends(get_db)):
         return response.json()
     except Exception as exc:
         return {'status': 'error', 'message': str(exc)}
+
+
+@app.get('/fonts')
+def list_available_fonts():
+    return {'fonts': get_available_fonts_from_compiler()}
 
 
 @app.get('/projects/{project_id}/pdf')

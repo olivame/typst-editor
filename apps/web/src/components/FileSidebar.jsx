@@ -237,7 +237,6 @@ export default function FileSidebar({
             </button>
           </div>
         </div>
-        <div style={styles.targetText}>target: {targetDirectory || 'root'}</div>
       </div>
 
       {createMode ? (
@@ -354,14 +353,6 @@ const styles = {
     fontSize: '13px',
     lineHeight: 1,
     outline: 'none',
-  },
-  targetText: {
-    marginTop: '8px',
-    paddingLeft: '30px',
-    fontSize: '11px',
-    color: '#64748b',
-    letterSpacing: '0.04em',
-    textTransform: 'uppercase',
   },
   createPanel: {
     margin: '10px',

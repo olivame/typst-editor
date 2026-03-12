@@ -127,6 +127,11 @@ export async function compileProject(projectId) {
   return parseJsonResponse(response)
 }
 
+export async function listAvailableFonts() {
+  const response = await fetch(`${API_URL}/fonts`)
+  return parseJsonResponse(response)
+}
+
 export function getProjectPreviewUrl(projectId) {
   return `${PREVIEW_URL}/sessions/${projectId}/data`
 }

@@ -9,6 +9,7 @@ import {
   downloadProjectPdf,
   getFileContent,
   getProjectPreviewUrl,
+  listAvailableFonts,
   listProjectFiles,
   searchProjectFiles,
   updateFileContent,
@@ -23,7 +24,42 @@ const RAIL_ITEMS = [
   { id: 'settings', label: '⚙', title: 'Settings' },
 ]
 
-const EDITOR_TOOL_ITEMS = ['T', 'B', 'I', 'U', 'H', '≣', 'Σ', '@']
+const FALLBACK_ENGLISH_FONT_OPTIONS = [
+  'Liberation Sans',
+  'Liberation Serif',
+  'Liberation Mono',
+]
+
+const FALLBACK_CHINESE_FONT_OPTIONS = [
+  'Noto Sans CJK SC',
+  'Noto Serif CJK SC',
+  'Noto Sans Mono CJK SC',
+  'Noto Sans CJK TC',
+  'Noto Serif CJK TC',
+  'Noto Sans Mono CJK TC',
+  'Noto Sans CJK HK',
+  'Noto Serif CJK HK',
+  'Noto Sans Mono CJK HK',
+  'Noto Sans CJK JP',
+  'Noto Serif CJK JP',
+  'Noto Sans Mono CJK JP',
+  'Noto Sans CJK KR',
+  'Noto Serif CJK KR',
+  'Noto Sans Mono CJK KR',
+]
+
+const CJK_FONT_PATTERN = /(cjk|han|yahei|hei|song|kai|fang|ming|mincho|gothic|simsun|simhei|kaiti|fangsong|mingliu|pmingliu|batang|gulim|malgun)/i
+
+const EDITOR_TOOL_ITEMS = [
+  { id: 'font', label: 'T', title: 'Set fonts' },
+  { id: 'bold', label: 'B', title: 'Bold' },
+  { id: 'italic', label: 'I', title: 'Italic' },
+  { id: 'underline', label: 'U', title: 'Underline' },
+  { id: 'heading', label: 'H', title: 'Heading' },
+  { id: 'align', label: '≣', title: 'Alignment' },
+  { id: 'math', label: 'Σ', title: 'Math' },
+  { id: 'reference', label: '@', title: 'Reference' },
+]
 const PREVIEW_ZOOM_FACTORS = [
   0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1,
   1.1, 1.3, 1.5, 1.7, 1.9, 2.1, 2.4, 2.7,
@@ -68,6 +104,326 @@ function normalizePreviewFilePath(filepath, projectId) {
   return filepath.split('/').filter(Boolean).slice(-1)[0] || filepath
 }
 
+function sortFontNames(fontNames) {
+  return [...fontNames].sort((left, right) => left.localeCompare(right))
+}
+
+function isCjkFontName(fontName) {
+  return CJK_FONT_PATTERN.test(fontName)
+}
+
+function buildFontOptions(fontNames) {
+  const normalizedFonts = Array.from(new Set(
+    (Array.isArray(fontNames) ? fontNames : [])
+      .map((fontName) => `${fontName}`.trim())
+      .filter(Boolean),
+  ))
+  const chineseFonts = sortFontNames(normalizedFonts.filter((fontName) => isCjkFontName(fontName)))
+  const englishFonts = sortFontNames(normalizedFonts.filter((fontName) => !isCjkFontName(fontName)))
+
+  return {
+    englishFonts: englishFonts.length > 0 ? englishFonts : FALLBACK_ENGLISH_FONT_OPTIONS,
+    chineseFonts: chineseFonts.length > 0 ? chineseFonts : FALLBACK_CHINESE_FONT_OPTIONS,
+  }
+}
+
+function findTextDirectiveRange(source) {
+  const match = source.match(/^#set\s+text\s*\(/m)
+  if (!match || match.index == null) return null
+
+  const start = match.index
+  const openParenIndex = source.indexOf('(', start)
+  if (openParenIndex === -1) return null
+
+  let depth = 0
+  let inString = false
+  let isEscaped = false
+
+  for (let index = openParenIndex; index < source.length; index += 1) {
+    const char = source[index]
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false
+        continue
+      }
+      if (char === '\\') {
+        isEscaped = true
+        continue
+      }
+      if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+
+    if (char === '(') {
+      depth += 1
+      continue
+    }
+
+    if (char === ')') {
+      depth -= 1
+      if (depth === 0) {
+        return {
+          start,
+          end: index,
+          paramsStart: openParenIndex + 1,
+          paramsEnd: index,
+        }
+      }
+    }
+  }
+
+  return null
+}
+
+function splitTopLevelSegments(source, delimiter = ',') {
+  const segments = []
+  let depth = 0
+  let inString = false
+  let isEscaped = false
+  let segmentStart = 0
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index]
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false
+        continue
+      }
+      if (char === '\\') {
+        isEscaped = true
+        continue
+      }
+      if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+
+    if (char === '(') {
+      depth += 1
+      continue
+    }
+
+    if (char === ')') {
+      depth = Math.max(depth - 1, 0)
+      continue
+    }
+
+    if (char === delimiter && depth === 0) {
+      segments.push(source.slice(segmentStart, index))
+      segmentStart = index + 1
+    }
+  }
+
+  segments.push(source.slice(segmentStart))
+  return segments
+}
+
+function buildTypstFontValue(englishFont, chineseFont) {
+  const families = [englishFont, chineseFont].filter(Boolean)
+
+  if (families.length === 0) return ''
+  if (families.length === 1) return `"${families[0]}"`
+
+  return `(${families.map((family) => `"${family}"`).join(', ')})`
+}
+
+function updateTextFontDirective(source, fontValue) {
+  const directiveRange = findTextDirectiveRange(source)
+
+  if (!directiveRange) {
+    if (!fontValue) return source
+    return source
+      ? `#set text(font: ${fontValue})\n\n${source}`
+      : `#set text(font: ${fontValue})`
+  }
+
+  const params = source.slice(directiveRange.paramsStart, directiveRange.paramsEnd)
+  const segments = splitTopLevelSegments(params)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+
+  const nextSegments = []
+  let hasFontParam = false
+
+  segments.forEach((segment) => {
+    if (/^font\s*:/.test(segment)) {
+      hasFontParam = true
+      if (fontValue) {
+        nextSegments.push(`font: ${fontValue}`)
+      }
+      return
+    }
+
+    nextSegments.push(segment)
+  })
+
+  if (!hasFontParam && fontValue) {
+    nextSegments.push(`font: ${fontValue}`)
+  }
+
+  const nextDirective = nextSegments.length > 0
+    ? `#set text(${nextSegments.join(', ')})`
+    : ''
+
+  const before = source.slice(0, directiveRange.start)
+  const after = source.slice(directiveRange.end + 1)
+
+  if (nextDirective) {
+    return `${before}${nextDirective}${after}`
+  }
+
+  const trimmedBefore = before.endsWith('\n') ? before.slice(0, -1) : before
+  const trimmedAfter = after.startsWith('\n') ? after.slice(1) : after
+  return `${trimmedBefore}${trimmedAfter}`
+}
+
+function extractQuotedStrings(source) {
+  const values = []
+  const pattern = /"((?:[^"\\]|\\.)*)"/g
+  let match = pattern.exec(source)
+
+  while (match) {
+    values.push(match[1].replace(/\\"/g, '"'))
+    match = pattern.exec(source)
+  }
+
+  return values
+}
+
+function parseFontSelection(source, fontOptions) {
+  const directiveRange = findTextDirectiveRange(source)
+  if (!directiveRange) {
+    return { englishFont: '', chineseFont: '' }
+  }
+
+  const params = source.slice(directiveRange.paramsStart, directiveRange.paramsEnd)
+  const fontSegment = splitTopLevelSegments(params)
+    .map((segment) => segment.trim())
+    .find((segment) => /^font\s*:/.test(segment))
+
+  if (!fontSegment) {
+    return { englishFont: '', chineseFont: '' }
+  }
+
+  const fontNames = extractQuotedStrings(fontSegment.replace(/^font\s*:\s*/, ''))
+  const englishFontSet = new Set(fontOptions.englishFonts)
+  const chineseFontSet = new Set(fontOptions.chineseFonts)
+  const chineseFont = fontNames.find((fontName) => chineseFontSet.has(fontName)) || (fontNames[1] || '')
+  const englishFont = fontNames.find((fontName) => englishFontSet.has(fontName)) || (fontNames[0] || '')
+
+  return {
+    englishFont,
+    chineseFont,
+  }
+}
+
+function FontPicker({
+  isEditableDocument,
+  isOpen,
+  label,
+  onMouseDown,
+  onSelect,
+  onToggle,
+  options,
+  selectedFont,
+}) {
+  return (
+    <div style={styles.fontPicker}>
+      <div style={styles.fontMenuLabel}>{label}</div>
+      <div
+        onClick={() => {
+          if (!isEditableDocument) return
+          onToggle()
+        }}
+        onMouseDown={onMouseDown}
+        onKeyDown={(event) => {
+          if (!isEditableDocument) return
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onToggle()
+          }
+        }}
+        role="button"
+        style={{
+          ...styles.fontPickerTrigger,
+          ...(!isEditableDocument ? styles.fontPickerTriggerDisabled : null),
+        }}
+        tabIndex={isEditableDocument ? 0 : -1}
+      >
+        <span
+          style={{
+            ...styles.fontPickerValue,
+            ...(selectedFont ? { fontFamily: `"${selectedFont}", "Noto Sans CJK SC", "Liberation Sans", sans-serif` } : null),
+          }}
+        >
+          {selectedFont || 'System default'}
+        </span>
+        <span style={styles.fontPickerChevron}>{isOpen ? '▴' : '▾'}</span>
+      </div>
+      {isOpen ? (
+        <div style={styles.fontOptionList}>
+          <div
+            onClick={() => onSelect('')}
+            onMouseDown={onMouseDown}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                onSelect('')
+              }
+            }}
+            role="button"
+            style={{
+              ...styles.fontOptionItem,
+              ...(!selectedFont ? styles.fontOptionItemActive : null),
+            }}
+            tabIndex={0}
+          >
+            System default
+          </div>
+          {options.map((fontName) => (
+            <div
+              key={fontName}
+              onClick={() => onSelect(fontName)}
+              onMouseDown={onMouseDown}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  onSelect(fontName)
+                }
+              }}
+              role="button"
+              style={{
+                ...styles.fontOptionItem,
+                ...(selectedFont === fontName ? styles.fontOptionItemActive : null),
+                fontFamily: `"${fontName}", "Noto Sans CJK SC", "Liberation Sans", sans-serif`,
+              }}
+              tabIndex={0}
+              title={fontName}
+            >
+              {fontName}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 export default function Editor({ projectId, onBack }) {
   const gutterRef = useRef(null)
   const textareaRef = useRef(null)
@@ -75,6 +431,8 @@ export default function Editor({ projectId, onBack }) {
   const pendingCursorJumpRef = useRef(null)
   const dragStateRef = useRef(null)
   const previewApiRef = useRef(null)
+  const fontButtonRef = useRef(null)
+  const fontMenuRef = useRef(null)
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [currentFile, setCurrentFile] = useState(null)
@@ -86,6 +444,10 @@ export default function Editor({ projectId, onBack }) {
   const [previewWheelElement, setPreviewWheelElement] = useState(null)
   const [floatingPreviewPosition, setFloatingPreviewPosition] = useState({ top: 88, right: 28 })
   const [jumpNonce, setJumpNonce] = useState(0)
+  const [isFontMenuOpen, setIsFontMenuOpen] = useState(false)
+  const [fontMenuPosition, setFontMenuPosition] = useState({ top: 0, left: 0 })
+  const [availableFonts, setAvailableFonts] = useState([])
+  const [openFontPicker, setOpenFontPicker] = useState('')
 
   function showStatus(message, duration = 0) {
     if (statusTimerRef.current) {
@@ -188,6 +550,27 @@ export default function Editor({ projectId, onBack }) {
       }
     }
   }, [projectId])
+
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadAvailableFonts() {
+      try {
+        const payload = await listAvailableFonts()
+        if (isCancelled) return
+        setAvailableFonts(Array.isArray(payload.fonts) ? payload.fonts : [])
+      } catch {
+        if (isCancelled) return
+        setAvailableFonts([])
+      }
+    }
+
+    void loadAvailableFonts()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [])
 
   async function saveAndPreview() {
     if (!currentFile) return
@@ -407,9 +790,46 @@ export default function Editor({ projectId, onBack }) {
     }
   }, [isPreviewDetached])
 
+  useEffect(() => {
+    if (!isFontMenuOpen) return undefined
+
+    const updateFontMenuPosition = () => {
+      const buttonRect = fontButtonRef.current?.getBoundingClientRect()
+      if (!buttonRect) return
+
+      setFontMenuPosition({
+        top: buttonRect.bottom + 8,
+        left: buttonRect.left,
+      })
+    }
+
+    updateFontMenuPosition()
+
+    const handlePointerDown = (event) => {
+      if (fontMenuRef.current?.contains(event.target) || fontButtonRef.current?.contains(event.target)) return
+      setIsFontMenuOpen(false)
+      setOpenFontPicker('')
+    }
+
+    window.addEventListener('resize', updateFontMenuPosition)
+    window.addEventListener('scroll', updateFontMenuPosition, true)
+    window.addEventListener('mousedown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('resize', updateFontMenuPosition)
+      window.removeEventListener('scroll', updateFontMenuPosition, true)
+      window.removeEventListener('mousedown', handlePointerDown)
+    }
+  }, [isFontMenuOpen])
+
   const lineCount = useMemo(
     () => Math.max(content.split('\n').length, 1),
     [content],
+  )
+  const fontOptions = useMemo(() => buildFontOptions(availableFonts), [availableFonts])
+  const fontSelection = useMemo(
+    () => parseFontSelection(content, fontOptions),
+    [content, fontOptions],
   )
   const lineNumbers = useMemo(
     () => Array.from({ length: lineCount }, (_, index) => index + 1),
@@ -420,6 +840,7 @@ export default function Editor({ projectId, onBack }) {
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
+  const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
 
   const togglePreviewDetach = () => {
     setIsPreviewDetached((current) => !current)
@@ -430,6 +851,25 @@ export default function Editor({ projectId, onBack }) {
       offsetY: event.clientY - floatingPreviewPosition.top,
       offsetRight: window.innerWidth - event.clientX - floatingPreviewPosition.right,
     }
+  }
+
+  const applyFontSelection = (nextEnglishFont, nextChineseFont) => {
+    if (!isEditableDocument) return
+
+    const nextFontValue = buildTypstFontValue(nextEnglishFont, nextChineseFont)
+
+    setContent((current) => updateTextFontDirective(current, nextFontValue))
+    showStatus(nextFontValue ? 'Updated text font directive' : 'Cleared text font directive', 2000)
+  }
+
+  const handleEnglishFontSelect = (fontName) => {
+    applyFontSelection(fontName, fontSelection.chineseFont)
+    setOpenFontPicker('')
+  }
+
+  const handleChineseFontSelect = (fontName) => {
+    applyFontSelection(fontSelection.englishFont, fontName)
+    setOpenFontPicker('')
   }
 
   const renderPreviewTools = () => (
@@ -471,6 +911,24 @@ export default function Editor({ projectId, onBack }) {
       setSidebarMode((current) => (current === 'search' ? '' : 'search'))
       return
     }
+  }
+
+  const toggleFontMenu = () => {
+    setIsFontMenuOpen((current) => {
+      const nextValue = !current
+      if (!nextValue) {
+        setOpenFontPicker('')
+      }
+      return nextValue
+    })
+  }
+
+  const handleFontMenuMouseDown = (event) => {
+    event.preventDefault()
+  }
+
+  const toggleFontPicker = (pickerId) => {
+    setOpenFontPicker((current) => (current === pickerId ? '' : pickerId))
   }
 
   return (
@@ -540,8 +998,67 @@ export default function Editor({ projectId, onBack }) {
             <section style={{ ...styles.editorColumn, ...(isPreviewDetached ? styles.editorColumnExpanded : null) }}>
               <div style={styles.panelToolbar}>
                 <div style={styles.panelTools}>
-                  {EDITOR_TOOL_ITEMS.map((item) => (
-                    <button key={item} style={styles.toolChip}>{item}</button>
+                  <div ref={fontMenuRef} style={styles.fontMenuShell}>
+                    <div
+                      ref={fontButtonRef}
+                      onClick={toggleFontMenu}
+                      onMouseDown={handleFontMenuMouseDown}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault()
+                          toggleFontMenu()
+                        }
+                      }}
+                      role="button"
+                      style={{
+                        ...styles.toolbarRailButton,
+                        ...(isFontMenuOpen ? styles.toolbarRailButtonActive : null),
+                      }}
+                      tabIndex={0}
+                      title={isEditableDocument ? 'Set fonts' : 'Open font menu'}
+                    >
+                      T
+                    </div>
+                    {isFontMenuOpen ? (
+                      <div
+                        style={{
+                          ...styles.fontMenuPanel,
+                          top: `${fontMenuPosition.top}px`,
+                          left: `${fontMenuPosition.left}px`,
+                        }}
+                      >
+                        {!isEditableDocument ? (
+                          <div style={styles.fontMenuNotice}>
+                            请选择一个可编辑的 `.typ` 文件后再设置字体。
+                          </div>
+                        ) : null}
+                        <FontPicker
+                          isEditableDocument={isEditableDocument}
+                          isOpen={openFontPicker === 'english'}
+                          label="English"
+                          onMouseDown={handleFontMenuMouseDown}
+                          onSelect={handleEnglishFontSelect}
+                          onToggle={() => toggleFontPicker('english')}
+                          options={fontOptions.englishFonts}
+                          selectedFont={fontSelection.englishFont}
+                        />
+                        <FontPicker
+                          isEditableDocument={isEditableDocument}
+                          isOpen={openFontPicker === 'chinese'}
+                          label="Chinese"
+                          onMouseDown={handleFontMenuMouseDown}
+                          onSelect={handleChineseFontSelect}
+                          onToggle={() => toggleFontPicker('chinese')}
+                          options={fontOptions.chineseFonts}
+                          selectedFont={fontSelection.chineseFont}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                  {EDITOR_TOOL_ITEMS.filter((item) => item.id !== 'font').map((item) => (
+                    <button key={item.id} style={styles.toolChip} title={item.title}>
+                      {item.label}
+                    </button>
                   ))}
                 </div>
                 <div style={styles.panelMeta}>{currentEntryName}</div>
@@ -749,6 +1266,7 @@ const styles = {
     alignItems: 'center',
     gap: '8px',
     flexWrap: 'wrap',
+    overflow: 'visible',
   },
   toolChip: {
     minWidth: '30px',
@@ -762,6 +1280,125 @@ const styles = {
     fontSize: '13px',
     fontWeight: '700',
     outline: 'none',
+    boxShadow: 'none',
+    userSelect: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    WebkitTapHighlightColor: 'transparent',
+  },
+  toolbarRailButton: {
+    width: '34px',
+    height: '34px',
+    borderRadius: '10px',
+    border: '1px solid #cbced6',
+    background: '#ffffff',
+    color: '#404552',
+    cursor: 'pointer',
+    fontSize: '13px',
+    fontWeight: '700',
+    outline: 'none',
+    boxShadow: 'none',
+    userSelect: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    WebkitTapHighlightColor: 'transparent',
+  },
+  toolbarRailButtonActive: {
+    background: '#ffffff',
+    color: '#22262f',
+    boxShadow: '0 6px 14px rgba(71, 85, 105, 0.08), inset 0 0 0 1px #ced2d9',
+  },
+  fontMenuShell: {
+    position: 'relative',
+  },
+  fontMenuPanel: {
+    position: 'fixed',
+    width: '260px',
+    display: 'grid',
+    gap: '10px',
+    padding: '12px',
+    borderRadius: '12px',
+    border: '1px solid #d4d7de',
+    background: '#ffffff',
+    boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
+    zIndex: 200,
+  },
+  fontMenuLabel: {
+    color: '#4b5563',
+    fontSize: '12px',
+    fontWeight: '700',
+  },
+  fontPicker: {
+    display: 'grid',
+    gap: '6px',
+  },
+  fontPickerTrigger: {
+    width: '100%',
+    height: '34px',
+    padding: '0 10px',
+    borderRadius: '8px',
+    border: '1px solid #cfd4dd',
+    background: '#fbfbfc',
+    color: '#2b2f37',
+    fontSize: '13px',
+    outline: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    cursor: 'pointer',
+    userSelect: 'none',
+  },
+  fontPickerTriggerDisabled: {
+    cursor: 'not-allowed',
+    opacity: 0.7,
+  },
+  fontPickerValue: {
+    overflow: 'hidden',
+    whiteSpace: 'nowrap',
+    textOverflow: 'ellipsis',
+    paddingRight: '8px',
+  },
+  fontPickerChevron: {
+    color: '#6b7280',
+    fontSize: '11px',
+    flexShrink: 0,
+  },
+  fontOptionList: {
+    maxHeight: '180px',
+    overflowY: 'auto',
+    display: 'grid',
+    gap: '4px',
+    padding: '6px',
+    borderRadius: '10px',
+    border: '1px solid #d8dde6',
+    background: '#f8fafc',
+  },
+  fontOptionItem: {
+    minHeight: '34px',
+    padding: '7px 10px',
+    borderRadius: '8px',
+    color: '#1f2937',
+    fontSize: '14px',
+    lineHeight: '1.4',
+    cursor: 'pointer',
+    outline: 'none',
+    userSelect: 'none',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  fontOptionItemActive: {
+    background: '#ffffff',
+    boxShadow: 'inset 0 0 0 1px #cbd5e1',
+  },
+  fontMenuNotice: {
+    padding: '8px 10px',
+    borderRadius: '8px',
+    background: '#f4f4f5',
+    color: '#52525b',
+    fontSize: '12px',
+    lineHeight: '1.5',
   },
   previewChip: {
     minWidth: '30px',

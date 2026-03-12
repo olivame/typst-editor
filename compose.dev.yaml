@@ -22,6 +22,10 @@ services:
       - ./services/preview:/usr/src/app
     command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
 
+  compiler:
+    volumes:
+      - ./services/compiler/server.py:/workspace/server.py
+
   db:
     ports:
       - "5433:5432"  # 如果本机已有 5432，避免冲突；没有的话可以改回 5432:5432
