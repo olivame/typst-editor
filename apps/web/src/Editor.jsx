@@ -1,6 +1,8 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
+import DiagnosticsSidebar from './components/DiagnosticsSidebar'
 import EditorToolbar from './components/EditorToolbar'
 import FileSidebar from './components/FileSidebar'
+import OutlineSidebar from './components/OutlineSidebar'
 import SearchSidebar from './components/SearchSidebar'
 import TinymistPreview from './components/TinymistPreview'
 import {
@@ -8,6 +10,7 @@ import {
   createProjectFolder,
   downloadProjectPdf,
   getFileContent,
+  getProjectPreviewStatus,
   getProjectPreviewUrl,
   listAvailableFonts,
   listProjectFiles,
@@ -58,6 +61,7 @@ const EDITOR_TOOL_ITEMS = [
   { id: 'heading', label: 'H', title: 'Heading' },
   { id: 'align', label: '≣', title: 'Alignment' },
   { id: 'math', label: 'Σ', title: 'Math' },
+  { id: 'code', label: '<>', title: 'Code block' },
   { id: 'reference', label: '@', title: 'Reference' },
 ]
 const PREVIEW_ZOOM_FACTORS = [
@@ -102,6 +106,176 @@ function normalizePreviewFilePath(filepath, projectId) {
   }
 
   return filepath.split('/').filter(Boolean).slice(-1)[0] || filepath
+}
+
+function extractTextValue(value) {
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number') return `${value}`
+  if (Array.isArray(value)) {
+    return value.map((item) => extractTextValue(item)).filter(Boolean).join('\n').trim()
+  }
+
+  if (value && typeof value === 'object') {
+    const candidates = [
+      value.message,
+      value.text,
+      value.value,
+      value.body,
+      value.label,
+      value.title,
+      value.reason,
+      value.plainText,
+    ]
+
+    for (const candidate of candidates) {
+      const normalized = extractTextValue(candidate)
+      if (normalized) return normalized
+    }
+  }
+
+  return ''
+}
+
+function normalizePosition(position) {
+  if (Array.isArray(position)) {
+    return [
+      Math.max(Number(position[0]) || 0, 0),
+      Math.max(Number(position[1]) || 0, 0),
+    ]
+  }
+
+  if (position && typeof position === 'object') {
+    return [
+      Math.max(Number(position.line ?? position.row) || 0, 0),
+      Math.max(Number(position.character ?? position.column) || 0, 0),
+    ]
+  }
+
+  return null
+}
+
+function extractLocation(candidate) {
+  if (!candidate || typeof candidate !== 'object') return null
+
+  const directPath = candidate.filepath || candidate.path || candidate.file || candidate.uri
+  const rangeSource = candidate.range || candidate.span || candidate.location || candidate
+  const start = normalizePosition(candidate.start ?? rangeSource?.start ?? rangeSource?.from)
+  const end = normalizePosition(candidate.end ?? rangeSource?.end ?? rangeSource?.to ?? start)
+  const nestedPath = rangeSource?.filepath || rangeSource?.path || rangeSource?.file || rangeSource?.uri
+  const path = typeof (directPath || nestedPath) === 'string' ? (directPath || nestedPath) : ''
+
+  if (!path && !start && !end) return null
+
+  return {
+    path,
+    start,
+    end: end || start,
+  }
+}
+
+function looksLikeDiagnostic(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false
+
+  return Boolean(
+    extractTextValue(candidate.message || candidate.reason || candidate.error || candidate.description)
+      || candidate.severity
+      || candidate.level
+      || candidate.range
+      || candidate.span
+      || candidate.filepath
+      || candidate.path,
+  )
+}
+
+function collectDiagnosticCandidates(node, results, visited = new Set(), depth = 0) {
+  if (!node || typeof node !== 'object' || visited.has(node) || depth > 4) return
+
+  visited.add(node)
+
+  if (Array.isArray(node)) {
+    node.forEach((item) => collectDiagnosticCandidates(item, results, visited, depth + 1))
+    return
+  }
+
+  if (looksLikeDiagnostic(node)) {
+    results.push(node)
+  }
+
+  Object.entries(node).forEach(([key, value]) => {
+    if (
+      depth === 0
+      || ['diagnostics', 'errors', 'warnings', 'messages', 'items', 'causes', 'notes', 'status'].includes(key)
+    ) {
+      collectDiagnosticCandidates(value, results, visited, depth + 1)
+    }
+  })
+}
+
+function normalizePreviewLocation(location, projectId) {
+  if (!location?.path || !location?.start) return null
+
+  const normalizedPath = normalizePreviewFilePath(location.path, projectId)
+  const [startLine, startCharacter] = location.start
+  const [endLine, endCharacter] = location.end || location.start
+
+  return {
+    path: normalizedPath,
+    start: [startLine, startCharacter],
+    end: [endLine, endCharacter],
+    startLine,
+    startCharacter,
+    endLine,
+    endCharacter,
+    lineNumber: startLine + 1,
+  }
+}
+
+function normalizeDiagnostics(status, projectId) {
+  const candidates = []
+  collectDiagnosticCandidates(status, candidates)
+
+  const fallbackMessage = extractTextValue(status?.message || status?.reason || status?.error)
+  if (candidates.length === 0 && fallbackMessage) {
+    candidates.push(status)
+  }
+
+  const deduped = new Map()
+
+  candidates.forEach((candidate, index) => {
+    const message = extractTextValue(
+      candidate.message || candidate.reason || candidate.error || candidate.description || candidate.title,
+    )
+    if (!message) return
+
+    const location = normalizePreviewLocation(extractLocation(candidate), projectId)
+    const severity = `${candidate.severity || candidate.level || candidate.kind || candidate.type || 'error'}`
+      .toLowerCase()
+    const path = location?.path || ''
+    const locationLabel = location
+      ? `${location.path}:${location.lineNumber}:${(location.startCharacter ?? 0) + 1}`
+      : ''
+    const key = `${severity}::${path}::${location?.lineNumber || ''}::${message}`
+
+    if (deduped.has(key)) return
+
+    deduped.set(key, {
+      id: `${key}-${index}`,
+      severity,
+      message,
+      path,
+      location,
+      locationLabel,
+    })
+  })
+
+  return Array.from(deduped.values())
+}
+
+function normalizeOutlineItems(items, projectId) {
+  return (Array.isArray(items) ? items : []).map((item) => ({
+    ...item,
+    location: normalizePreviewLocation(extractLocation(item), projectId),
+  }))
 }
 
 function sortFontNames(fontNames) {
@@ -332,6 +506,104 @@ function parseFontSelection(source, fontOptions) {
   }
 }
 
+function replaceSelectionRange(source, selectionStart, selectionEnd, replacement) {
+  return `${source.slice(0, selectionStart)}${replacement}${source.slice(selectionEnd)}`
+}
+
+function wrapSelection(source, selectionStart, selectionEnd, prefix, suffix, placeholder = '') {
+  const hasSelection = selectionStart !== selectionEnd
+  const body = hasSelection ? source.slice(selectionStart, selectionEnd) : placeholder
+  const replacement = `${prefix}${body}${suffix}`
+
+  return {
+    content: replaceSelectionRange(source, selectionStart, selectionEnd, replacement),
+    selectionStart: selectionStart + prefix.length,
+    selectionEnd: selectionStart + prefix.length + body.length,
+  }
+}
+
+function insertPairedMarkers(source, selectionStart, selectionEnd, marker) {
+  if (selectionStart !== selectionEnd) {
+    return wrapSelection(source, selectionStart, selectionEnd, marker, marker)
+  }
+
+  return {
+    content: replaceSelectionRange(source, selectionStart, selectionEnd, marker + marker),
+    selectionStart: selectionStart + marker.length,
+    selectionEnd: selectionStart + marker.length,
+  }
+}
+
+function insertTemplate(source, selectionStart, selectionEnd, template, cursorOffset = template.length) {
+  return {
+    content: replaceSelectionRange(source, selectionStart, selectionEnd, template),
+    selectionStart: selectionStart + cursorOffset,
+    selectionEnd: selectionStart + cursorOffset,
+  }
+}
+
+function getSelectedLineRange(source, selectionStart, selectionEnd) {
+  const lineStart = source.lastIndexOf('\n', Math.max(selectionStart - 1, 0)) + 1
+  const anchor = selectionEnd > selectionStart ? selectionEnd : selectionStart
+  const lineEndIndex = source.indexOf('\n', anchor)
+
+  return {
+    lineStart,
+    lineEnd: lineEndIndex === -1 ? source.length : lineEndIndex,
+  }
+}
+
+function transformList(source, selectionStart, selectionEnd, prefix, emptyTemplate) {
+  const { lineStart, lineEnd } = getSelectedLineRange(source, selectionStart, selectionEnd)
+  const block = source.slice(lineStart, lineEnd)
+
+  if (!block.trim()) {
+    return insertTemplate(source, lineStart, lineEnd, emptyTemplate, prefix.length)
+  }
+
+  const replacement = block
+    .split('\n')
+    .map((line) => (line.trim() ? `${prefix}${line.replace(/^[-+]\s*/, '')}` : line))
+    .join('\n')
+
+  return {
+    content: replaceSelectionRange(source, lineStart, lineEnd, replacement),
+    selectionStart: lineStart,
+    selectionEnd: lineStart + replacement.length,
+  }
+}
+
+function transformHeading(source, selectionStart, selectionEnd) {
+  const { lineStart, lineEnd } = getSelectedLineRange(source, selectionStart, selectionEnd)
+  const block = source.slice(lineStart, lineEnd)
+
+  if (!block.trim()) {
+    return insertTemplate(source, lineStart, lineEnd, '= ', 2)
+  }
+
+  const replacement = block
+    .split('\n')
+    .map((line) => {
+      if (!line.trim()) return line
+
+      const match = line.match(/^(\s*)(=+)\s*(.*)$/)
+      if (match) {
+        const [, indent, markers, text] = match
+        return `${indent}${markers}=${text ? ` ${text}` : ' '}`
+      }
+
+      const leadingWhitespace = line.match(/^\s*/)?.[0] || ''
+      return `${leadingWhitespace}= ${line.trimStart()}`
+    })
+    .join('\n')
+
+  return {
+    content: replaceSelectionRange(source, lineStart, lineEnd, replacement),
+    selectionStart: lineStart,
+    selectionEnd: lineStart + replacement.length,
+  }
+}
+
 function FontPicker({
   isEditableDocument,
   isOpen,
@@ -429,6 +701,7 @@ export default function Editor({ projectId, onBack }) {
   const textareaRef = useRef(null)
   const statusTimerRef = useRef(null)
   const pendingCursorJumpRef = useRef(null)
+  const pendingEditorSelectionRef = useRef(null)
   const dragStateRef = useRef(null)
   const previewApiRef = useRef(null)
   const fontButtonRef = useRef(null)
@@ -448,6 +721,8 @@ export default function Editor({ projectId, onBack }) {
   const [fontMenuPosition, setFontMenuPosition] = useState({ top: 0, left: 0 })
   const [availableFonts, setAvailableFonts] = useState([])
   const [openFontPicker, setOpenFontPicker] = useState('')
+  const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
+  const [previewOutline, setPreviewOutline] = useState([])
 
   function showStatus(message, duration = 0) {
     if (statusTimerRef.current) {
@@ -572,6 +847,35 @@ export default function Editor({ projectId, onBack }) {
     }
   }, [])
 
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadPreviewStatus() {
+      try {
+        const payload = await getProjectPreviewStatus(projectId)
+        if (isCancelled) return
+
+        setPreviewStatus(payload?.status && typeof payload.status === 'object' ? payload.status : { kind: 'Idle' })
+        setPreviewOutline(Array.isArray(payload?.outline) ? payload.outline : [])
+      } catch {
+        if (isCancelled) return
+
+        setPreviewStatus({ kind: 'Unavailable' })
+        setPreviewOutline([])
+      }
+    }
+
+    void loadPreviewStatus()
+    const intervalId = window.setInterval(() => {
+      void loadPreviewStatus()
+    }, 1200)
+
+    return () => {
+      isCancelled = true
+      window.clearInterval(intervalId)
+    }
+  }, [projectId])
+
   async function saveAndPreview() {
     if (!currentFile) return
     try {
@@ -661,6 +965,26 @@ export default function Editor({ projectId, onBack }) {
     await selectEntry(matchingEntry)
   }
 
+  async function handleSidebarLocationJump(location) {
+    if (!location?.path || !Array.isArray(location?.start)) return
+
+    const matchingEntry = files.find((entry) => entry.path === location.path)
+    if (!matchingEntry || matchingEntry.kind !== 'file' || matchingEntry.is_binary) return
+
+    pendingCursorJumpRef.current = {
+      path: location.path,
+      startLine: location.start[0],
+      startCharacter: location.start[1],
+      endLine: location.end?.[0] ?? location.start[0],
+      endCharacter: location.end?.[1] ?? location.start[1],
+    }
+    setJumpNonce((current) => current + 1)
+
+    if (currentFile?.path === location.path) return
+
+    await selectEntry(matchingEntry)
+  }
+
   function handleEditorDoubleClick() {
     const textarea = textareaRef.current
     if (!textarea || !currentFile) return
@@ -678,45 +1002,60 @@ export default function Editor({ projectId, onBack }) {
 
   useEffect(() => {
     const pendingCursorJump = pendingCursorJumpRef.current
-    if (!pendingCursorJump || !currentFile || !textareaRef.current) {
+    const pendingEditorSelection = pendingEditorSelectionRef.current
+    if ((!pendingCursorJump && !pendingEditorSelection) || !currentFile || !textareaRef.current) {
       return
     }
 
-    const matchesSearchJump =
-      pendingCursorJump.fileId != null && currentFile.id === pendingCursorJump.fileId
-    const matchesPreviewJump =
-      pendingCursorJump.path != null && currentFile.path === pendingCursorJump.path
-
-    if (!matchesSearchJump && !matchesPreviewJump) {
-      return
-    }
-
-    const selectionStart = matchesPreviewJump
-      ? getSelectionOffset(content, pendingCursorJump.startLine, pendingCursorJump.startCharacter)
-      : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.start)
-    const selectionEnd = matchesPreviewJump
-      ? getSelectionOffset(content, pendingCursorJump.endLine, pendingCursorJump.endCharacter)
-      : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.end)
     const textarea = textareaRef.current
 
-    textarea.focus()
-    textarea.setSelectionRange(selectionStart, selectionEnd)
+    if (pendingCursorJump) {
+      const matchesSearchJump =
+        pendingCursorJump.fileId != null && currentFile.id === pendingCursorJump.fileId
+      const matchesPreviewJump =
+        pendingCursorJump.path != null && currentFile.path === pendingCursorJump.path
 
-    const lineHeight = 24
-    const lineNumber = matchesPreviewJump ? pendingCursorJump.startLine + 1 : pendingCursorJump.lineNumber
-    const scrollTop = Math.max((lineNumber - 3) * lineHeight, 0)
-    textarea.scrollTop = scrollTop
-    if (gutterRef.current) {
-      gutterRef.current.scrollTop = scrollTop
+      if (!matchesSearchJump && !matchesPreviewJump) {
+        return
+      }
+
+      const selectionStart = matchesPreviewJump
+        ? getSelectionOffset(content, pendingCursorJump.startLine, pendingCursorJump.startCharacter)
+        : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.start)
+      const selectionEnd = matchesPreviewJump
+        ? getSelectionOffset(content, pendingCursorJump.endLine, pendingCursorJump.endCharacter)
+        : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.end)
+
+      textarea.focus()
+      textarea.setSelectionRange(selectionStart, selectionEnd)
+
+      const lineHeight = 24
+      const lineNumber = matchesPreviewJump ? pendingCursorJump.startLine + 1 : pendingCursorJump.lineNumber
+      const scrollTop = Math.max((lineNumber - 3) * lineHeight, 0)
+      textarea.scrollTop = scrollTop
+      if (gutterRef.current) {
+        gutterRef.current.scrollTop = scrollTop
+      }
+
+      previewApiRef.current?.revealCursor({
+        path: currentFile.path,
+        line: matchesPreviewJump ? pendingCursorJump.startLine : Math.max(pendingCursorJump.lineNumber - 1, 0),
+        character: matchesPreviewJump ? pendingCursorJump.startCharacter : pendingCursorJump.start,
+      })
+
+      pendingCursorJumpRef.current = null
+      return
     }
 
-    previewApiRef.current?.revealCursor({
-      path: currentFile.path,
-      line: matchesPreviewJump ? pendingCursorJump.startLine : Math.max(pendingCursorJump.lineNumber - 1, 0),
-      character: matchesPreviewJump ? pendingCursorJump.startCharacter : pendingCursorJump.start,
-    })
-
-    pendingCursorJumpRef.current = null
+    textarea.focus()
+    textarea.setSelectionRange(pendingEditorSelection.start, pendingEditorSelection.end)
+    if (typeof pendingEditorSelection.scrollTop === 'number') {
+      textarea.scrollTop = pendingEditorSelection.scrollTop
+      if (gutterRef.current) {
+        gutterRef.current.scrollTop = pendingEditorSelection.scrollTop
+      }
+    }
+    pendingEditorSelectionRef.current = null
   }, [content, currentFile, jumpNonce])
 
   async function handleDownload() {
@@ -841,6 +1180,14 @@ export default function Editor({ projectId, onBack }) {
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
+  const diagnostics = useMemo(
+    () => normalizeDiagnostics(previewStatus, projectId),
+    [previewStatus, projectId],
+  )
+  const outlineItems = useMemo(
+    () => normalizeOutlineItems(previewOutline, projectId),
+    [previewOutline, projectId],
+  )
 
   const togglePreviewDetach = () => {
     setIsPreviewDetached((current) => !current)
@@ -870,6 +1217,78 @@ export default function Editor({ projectId, onBack }) {
   const handleChineseFontSelect = (fontName) => {
     applyFontSelection(fontSelection.englishFont, fontName)
     setOpenFontPicker('')
+  }
+
+  const applyEditorTransformation = (transformer, statusText) => {
+    if (!isEditableDocument || !textareaRef.current) return
+
+    const textarea = textareaRef.current
+    const selectionStart = textarea.selectionStart
+    const selectionEnd = textarea.selectionEnd
+    const nextState = transformer(content, selectionStart, selectionEnd)
+    if (!nextState) return
+
+    pendingEditorSelectionRef.current = {
+      start: nextState.selectionStart,
+      end: nextState.selectionEnd,
+      scrollTop: textarea.scrollTop,
+    }
+    setContent(nextState.content)
+    if (statusText) {
+      showStatus(statusText, 1500)
+    }
+  }
+
+  const handleEditorToolClick = (toolId) => {
+    switch (toolId) {
+      case 'bold':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => insertPairedMarkers(source, selectionStart, selectionEnd, '*'),
+          'Inserted bold markers',
+        )
+        return
+      case 'italic':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => insertPairedMarkers(source, selectionStart, selectionEnd, '_'),
+          'Inserted italic markers',
+        )
+        return
+      case 'underline':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => wrapSelection(source, selectionStart, selectionEnd, '#underline[', ']', ''),
+          'Inserted underline',
+        )
+        return
+      case 'heading':
+        applyEditorTransformation(transformHeading, 'Updated heading')
+        return
+      case 'align':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => transformList(source, selectionStart, selectionEnd, '+ ', '+ \n+ '),
+          'Inserted numbered list',
+        )
+        return
+      case 'math':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => wrapSelection(source, selectionStart, selectionEnd, '$$', '$$'),
+          'Inserted formula markers',
+        )
+        return
+      case 'code':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => insertTemplate(source, selectionStart, selectionEnd, '``', 1),
+          'Inserted code markers',
+        )
+        return
+      case 'reference':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => insertTemplate(source, selectionStart, selectionEnd, '@', 1),
+          'Inserted reference marker',
+        )
+        return
+      default:
+        return
+    }
   }
 
   const renderPreviewTools = () => (
@@ -902,15 +1321,9 @@ export default function Editor({ projectId, onBack }) {
   )
 
   const handleRailClick = (itemId) => {
-    if (itemId === 'files') {
-      setSidebarMode((current) => (current === 'files' ? '' : 'files'))
-      return
-    }
+    if (!['files', 'search', 'outline', 'errors'].includes(itemId)) return
 
-    if (itemId === 'search') {
-      setSidebarMode((current) => (current === 'search' ? '' : 'search'))
-      return
-    }
+    setSidebarMode((current) => (current === itemId ? '' : itemId))
   }
 
   const toggleFontMenu = () => {
@@ -952,13 +1365,15 @@ export default function Editor({ projectId, onBack }) {
                 role="button"
                 style={{
                   ...styles.railButton,
-                  ...((item.id === 'files' && sidebarMode === 'files') ? styles.railButtonActive : null),
-                  ...((item.id === 'search' && sidebarMode === 'search') ? styles.railButtonActive : null),
+                  ...(item.id === sidebarMode ? styles.railButtonActive : null),
                 }}
                 tabIndex={0}
                 title={item.title}
               >
                 {item.label}
+                {item.id === 'errors' && diagnostics.length > 0 ? (
+                  <span style={styles.railBadge}>{diagnostics.length > 9 ? '9+' : diagnostics.length}</span>
+                ) : null}
               </div>
             ))}
           </div>
@@ -982,6 +1397,23 @@ export default function Editor({ projectId, onBack }) {
             onClose={() => setSidebarMode('')}
             onOpenResult={handleOpenSearchResult}
             onSearch={handleSearch}
+          />
+        ) : null}
+
+        {sidebarMode === 'outline' ? (
+          <OutlineSidebar
+            items={outlineItems}
+            onClose={() => setSidebarMode('')}
+            onSelectItem={(item) => void handleSidebarLocationJump(item.location)}
+          />
+        ) : null}
+
+        {sidebarMode === 'errors' ? (
+          <DiagnosticsSidebar
+            diagnostics={diagnostics}
+            onClose={() => setSidebarMode('')}
+            onSelectDiagnostic={(diagnostic) => void handleSidebarLocationJump(diagnostic.location)}
+            statusKind={previewStatus?.kind}
           />
         ) : null}
 
@@ -1056,7 +1488,14 @@ export default function Editor({ projectId, onBack }) {
                     ) : null}
                   </div>
                   {EDITOR_TOOL_ITEMS.filter((item) => item.id !== 'font').map((item) => (
-                    <button key={item.id} style={styles.toolChip} title={item.title}>
+                    <button
+                      key={item.id}
+                      onClick={() => handleEditorToolClick(item.id)}
+                      onMouseDown={handleFontMenuMouseDown}
+                      style={styles.toolChip}
+                      title={item.title}
+                      type="button"
+                    >
                       {item.label}
                     </button>
                   ))}
@@ -1184,6 +1623,7 @@ const styles = {
     marginBottom: '8px',
   },
   railButton: {
+    position: 'relative',
     width: '34px',
     height: '34px',
     borderRadius: '10px',
@@ -1199,6 +1639,22 @@ const styles = {
     alignItems: 'center',
     justifyContent: 'center',
     userSelect: 'none',
+  },
+  railBadge: {
+    position: 'absolute',
+    top: '-4px',
+    right: '-5px',
+    minWidth: '16px',
+    height: '16px',
+    padding: '0 4px',
+    borderRadius: '999px',
+    background: '#ef4444',
+    color: '#ffffff',
+    fontSize: '10px',
+    fontWeight: '800',
+    lineHeight: '16px',
+    textAlign: 'center',
+    boxShadow: '0 0 0 2px #f2f2f4',
   },
   railButtonActive: {
     background: '#ffffff',

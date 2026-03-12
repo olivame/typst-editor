@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import socket
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import httpx
 import websockets
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
@@ -20,8 +22,15 @@ SESSION_SWEEP_SECONDS = int(os.getenv("SESSION_SWEEP_SECONDS", "60"))
 PROXY_TIMEOUT_SECONDS = float(os.getenv("PROXY_TIMEOUT_SECONDS", "30"))
 
 HTML_WS_SNIPPET = 'let urlObject = new URL("/", window.location.href);'
+DIAGNOSTIC_HEADER_PATTERN = re.compile(r"^(error|warning):\s*(.+)$")
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def reserve_port() -> int:
@@ -807,9 +816,127 @@ class PreviewSession:
         self.control_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.last_status: dict[str, object] = {"kind": "Idle"}
+        self.last_diagnostics: list[dict[str, object]] = []
         self.outline: list[dict[str, object]] = []
         self.last_access = time.monotonic()
         self.listeners: set[asyncio.Queue[str]] = set()
+        self._pending_diagnostics: list[dict[str, object]] = []
+        self._current_diagnostic_lines: list[str] = []
+
+    def _compose_status(self, base_status: dict[str, object] | None = None) -> dict[str, object]:
+        status = dict(base_status or self.last_status)
+        if self.last_diagnostics:
+            status["diagnostics"] = list(self.last_diagnostics)
+        else:
+            status.pop("diagnostics", None)
+        return status
+
+    def _update_status(self, message: dict[str, object]) -> None:
+        self.last_status = self._compose_status(message)
+
+    def _set_diagnostics(self, diagnostics: list[dict[str, object]]) -> None:
+        self.last_diagnostics = diagnostics
+        self.last_status = self._compose_status()
+
+    def _extract_location(self, line: str) -> dict[str, object] | None:
+        if "┌─" not in line:
+            return None
+
+        location_text = line.split("┌─", 1)[1].strip()
+        path_text, separator, column_text = location_text.rpartition(":")
+        if not separator:
+            return None
+
+        path_text, separator, line_text = path_text.rpartition(":")
+        if not separator:
+            return None
+
+        try:
+            line_number = max(int(line_text), 1)
+            column_number = max(int(column_text), 1)
+        except ValueError:
+            return None
+
+        return {
+            "path": path_text,
+            "start": [line_number - 1, column_number - 1],
+            "end": [line_number - 1, column_number - 1],
+        }
+
+    def _parse_diagnostic_block(self, lines: list[str]) -> dict[str, object] | None:
+        if not lines:
+            return None
+
+        header_match = DIAGNOSTIC_HEADER_PATTERN.match(lines[0])
+        if not header_match:
+            return None
+
+        severity, message = header_match.groups()
+        location = None
+        hints: list[str] = []
+        snippets: list[str] = []
+
+        for line in lines[1:]:
+            if not location:
+                location = self._extract_location(line)
+
+            stripped_line = line.rstrip()
+            if "│" in stripped_line:
+                prefix, _, suffix = stripped_line.partition("│")
+                if prefix.strip().isdigit() and suffix.strip():
+                    snippets.append(suffix.strip())
+
+            hint_prefix = "= hint:"
+            if hint_prefix in stripped_line:
+                hints.append(stripped_line.split(hint_prefix, 1)[1].strip())
+
+        diagnostic: dict[str, object] = {
+            "severity": severity,
+            "message": message,
+            "raw": "\n".join(lines).strip(),
+        }
+        if location:
+            diagnostic["range"] = location
+        if hints:
+            diagnostic["hints"] = hints
+        if snippets:
+            diagnostic["snippets"] = snippets
+        return diagnostic
+
+    def _flush_current_diagnostic(self) -> None:
+        diagnostic = self._parse_diagnostic_block(self._current_diagnostic_lines)
+        if diagnostic is not None:
+            self._pending_diagnostics.append(diagnostic)
+        self._current_diagnostic_lines = []
+
+    def _consume_stdout_line(self, line: str) -> None:
+        stripped = line.rstrip()
+
+        if "compilation succeeded" in stripped:
+            self._current_diagnostic_lines = []
+            self._pending_diagnostics = []
+            self._set_diagnostics([])
+            return
+
+        if "compilation failed" in stripped:
+            self._current_diagnostic_lines = []
+            self._pending_diagnostics = []
+            self._set_diagnostics([])
+            return
+
+        if DIAGNOSTIC_HEADER_PATTERN.match(stripped):
+            self._flush_current_diagnostic()
+            self._current_diagnostic_lines = [stripped]
+            return
+
+        if self._current_diagnostic_lines:
+            if not stripped or stripped.startswith("["):
+                self._flush_current_diagnostic()
+                self._set_diagnostics(list(self._pending_diagnostics))
+                return
+
+            self._current_diagnostic_lines.append(stripped)
+            return
 
     async def ensure_running(self) -> None:
         self.last_access = time.monotonic()
@@ -864,8 +991,13 @@ class PreviewSession:
         while True:
             line = await self.process.stdout.readline()
             if not line:
+                self._flush_current_diagnostic()
+                if self._pending_diagnostics:
+                    self._set_diagnostics(list(self._pending_diagnostics))
                 return
-            print(f"[preview:{self.project_id}] {line.decode('utf-8', errors='replace').rstrip()}")
+            decoded_line = line.decode("utf-8", errors="replace").rstrip()
+            self._consume_stdout_line(decoded_line)
+            print(f"[preview:{self.project_id}] {decoded_line}")
 
     async def _consume_control_socket(self) -> None:
         if not self.control_socket:
@@ -880,7 +1012,9 @@ class PreviewSession:
 
                 event = message.get("event")
                 if event == "compileStatus":
-                    self.last_status = message
+                    if message.get("kind") != "CompileError":
+                        self._set_diagnostics([])
+                    self._update_status(message)
                 elif event == "outline":
                     self.outline = message.get("items", [])
                 elif event == "editorScrollTo":

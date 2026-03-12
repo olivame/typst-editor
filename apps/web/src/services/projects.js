@@ -136,6 +136,11 @@ export function getProjectPreviewUrl(projectId) {
   return `${PREVIEW_URL}/sessions/${projectId}/data`
 }
 
+export async function getProjectPreviewStatus(projectId) {
+  const response = await fetch(`${PREVIEW_URL}/sessions/${projectId}/status`)
+  return parseJsonResponse(response)
+}
+
 export async function downloadProjectPdf(projectId) {
   const response = await fetch(`${API_URL}/projects/${projectId}/pdf/download`)
   if (!response.ok) {
