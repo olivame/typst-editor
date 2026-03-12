@@ -24,6 +24,21 @@ import {
   uploadProjectFiles,
 } from './services/projects'
 
+function ListToolGlyph({ kind }) {
+  const markers = kind === 'ordered' ? ['1', '2', '3'] : ['•', '•', '•']
+
+  return (
+    <span style={styles.listToolGlyph}>
+      {markers.map((marker, index) => (
+        <span key={`${kind}-${marker}-${index}`} style={styles.listToolGlyphRow}>
+          <span style={styles.listToolGlyphMarker}>{marker}</span>
+          <span style={styles.listToolGlyphLine} />
+        </span>
+      ))}
+    </span>
+  )
+}
+
 const RAIL_ITEMS = [
   { id: 'files', label: '≡', title: 'Files' },
   { id: 'search', label: '⌕', title: 'Search' },
@@ -64,7 +79,8 @@ const EDITOR_TOOL_ITEMS = [
   { id: 'italic', label: 'I', title: 'Italic' },
   { id: 'underline', label: 'U', title: 'Underline' },
   { id: 'heading', label: 'H', title: 'Heading' },
-  { id: 'align', label: '≣', title: 'Alignment' },
+  { id: 'bullet', label: <ListToolGlyph kind="bullet" />, title: 'Bullet list' },
+  { id: 'align', label: <ListToolGlyph kind="ordered" />, title: 'Numbered list' },
   { id: 'math', label: 'Σ', title: 'Math' },
   { id: 'code', label: '<>', title: 'Code block' },
   { id: 'reference', label: '@', title: 'Reference' },
@@ -591,6 +607,14 @@ function transformList(source, selectionStart, selectionEnd, prefix, emptyTempla
     selectionStart: lineStart,
     selectionEnd: lineStart + replacement.length,
   }
+}
+
+function transformMath(source, selectionStart, selectionEnd) {
+  if (selectionStart !== selectionEnd) {
+    return wrapSelection(source, selectionStart, selectionEnd, '$', '$')
+  }
+
+  return insertTemplate(source, selectionStart, selectionEnd, '$$', 1)
 }
 
 function transformHeading(source, selectionStart, selectionEnd) {
@@ -1303,15 +1327,21 @@ export default function Editor({ projectId, onBack }) {
       case 'heading':
         applyEditorTransformation(transformHeading, 'Updated heading')
         return
+      case 'bullet':
+        applyEditorTransformation(
+          (source, selectionStart, selectionEnd) => transformList(source, selectionStart, selectionEnd, '- ', '- '),
+          'Inserted bullet list',
+        )
+        return
       case 'align':
         applyEditorTransformation(
-          (source, selectionStart, selectionEnd) => transformList(source, selectionStart, selectionEnd, '+ ', '+ \n+ '),
+          (source, selectionStart, selectionEnd) => transformList(source, selectionStart, selectionEnd, '+ ', '+ '),
           'Inserted numbered list',
         )
         return
       case 'math':
         applyEditorTransformation(
-          (source, selectionStart, selectionEnd) => wrapSelection(source, selectionStart, selectionEnd, '$$', '$$'),
+          transformMath,
           'Inserted formula markers',
         )
         return
@@ -1769,15 +1799,15 @@ const styles = {
     overflow: 'visible',
   },
   toolChip: {
-    minWidth: '30px',
+    width: '30px',
     height: '30px',
-    padding: '0 10px',
+    padding: '0',
     borderRadius: '8px',
     border: '1px solid #cbced6',
     background: '#ffffff',
     color: '#404552',
     cursor: 'pointer',
-    fontSize: '13px',
+    fontSize: '12px',
     fontWeight: '700',
     outline: 'none',
     boxShadow: 'none',
@@ -1786,6 +1816,29 @@ const styles = {
     alignItems: 'center',
     justifyContent: 'center',
     WebkitTapHighlightColor: 'transparent',
+  },
+  listToolGlyph: {
+    display: 'grid',
+    gap: '1px',
+    width: '9px',
+  },
+  listToolGlyphRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '1px',
+  },
+  listToolGlyphMarker: {
+    width: '3px',
+    fontSize: '5px',
+    fontWeight: '800',
+    lineHeight: 1,
+    textAlign: 'center',
+  },
+  listToolGlyphLine: {
+    width: '5px',
+    height: '1px',
+    borderRadius: '999px',
+    background: 'currentColor',
   },
   toolbarRailButton: {
     width: '34px',

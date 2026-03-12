@@ -293,6 +293,33 @@ def ensure_entry_path_available(
 def sync_project_workspace(project_id: int, entries: list[models.File]):
     project_dir = get_project_dir(project_id)
     project_dir.mkdir(parents=True, exist_ok=True)
+    expected_files: set[str] = set()
+    expected_dirs: set[str] = set()
+
+    for entry in entries:
+        relative_path = str(PurePosixPath(entry.path))
+        parent_parts = PurePosixPath(relative_path).parent.parts
+        for index in range(len(parent_parts)):
+            expected_dirs.add(str(PurePosixPath(*parent_parts[: index + 1])))
+
+        if entry.kind == FOLDER_ENTRY_KIND:
+            expected_dirs.add(relative_path)
+        else:
+            expected_files.add(relative_path)
+
+    for disk_path in sorted(project_dir.rglob('*'), key=lambda current: len(current.parts), reverse=True):
+        relative_path = disk_path.relative_to(project_dir).as_posix()
+        if disk_path.is_file():
+            if relative_path in expected_files or relative_path == 'main.pdf':
+                continue
+            disk_path.unlink()
+            continue
+
+        if relative_path in expected_dirs:
+            continue
+
+        with contextlib.suppress(OSError):
+            disk_path.rmdir()
 
     for entry in sorted(entries, key=lambda current: (current.path.count('/'), current.path)):
         disk_path = get_entry_disk_path(project_id, entry.path)
@@ -657,6 +684,10 @@ def rename_file_entry(file_id: int, payload: FilePathUpdate, db: Session = Depen
         current_entry.name = PurePosixPath(current_entry.path).name
 
     db.commit()
+    sync_project_workspace(
+        entry.project_id,
+        db.query(models.File).filter(models.File.project_id == entry.project_id).all(),
+    )
     db.refresh(entry)
 
     return serialize_entry(entry)
@@ -676,6 +707,10 @@ def delete_file_entry(file_id: int, db: Session = Depends(get_db)):
         db.delete(entry)
 
     db.commit()
+    sync_project_workspace(
+        project_id,
+        db.query(models.File).filter(models.File.project_id == project_id).all(),
+    )
 
     if disk_path.exists():
         if disk_path.is_dir():
