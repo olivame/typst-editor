@@ -314,6 +314,34 @@ function normalizeOutlineItems(items, projectId, depth = 0, lineage = []) {
   })
 }
 
+function normalizeComparisonText(value) {
+  return `${value || ''}`.toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+function findOutlineHeadingInSource(source, title) {
+  const normalizedTitle = normalizeComparisonText(title)
+  if (!normalizedTitle) return null
+
+  const lines = source.split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const match = line.match(/^\s*(=+)\s+(.*)$/)
+    if (!match) continue
+
+    const headingText = match[2].replace(/\s*<[^>]+>\s*$/g, '').trim()
+    if (normalizeComparisonText(headingText) !== normalizedTitle) continue
+
+    const start = line.indexOf(headingText)
+    return {
+      lineNumber: index + 1,
+      start: Math.max(start, 0),
+      end: Math.max(start, 0) + headingText.length,
+    }
+  }
+
+  return null
+}
+
 function sortFontNames(fontNames) {
   return [...fontNames].sort((left, right) => left.localeCompare(right))
 }
@@ -756,8 +784,10 @@ export default function Editor({ projectId, onBack }) {
   const [content, setContent] = useState('')
   const [statusMessage, setStatusMessage] = useState('')
   const [sidebarMode, setSidebarMode] = useState('files')
+  const [editorZoom, setEditorZoom] = useState(1)
   const [previewZoom, setPreviewZoom] = useState(1)
   const [isPreviewDetached, setIsPreviewDetached] = useState(false)
+  const [editorWheelElement, setEditorWheelElement] = useState(null)
   const [previewWheelElement, setPreviewWheelElement] = useState(null)
   const [floatingPreviewPosition, setFloatingPreviewPosition] = useState({ top: 88, right: 28 })
   const [jumpNonce, setJumpNonce] = useState(0)
@@ -767,6 +797,10 @@ export default function Editor({ projectId, onBack }) {
   const [openFontPicker, setOpenFontPicker] = useState('')
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
+  const editorFontSize = Math.round(15 * editorZoom * 10) / 10
+  const editorLineHeight = Math.round(24 * editorZoom * 10) / 10
+  const lineNumberFontSize = Math.round(13 * editorZoom * 10) / 10
+  const gutterWidth = Math.max(52, Math.round(52 * editorZoom))
 
   function showStatus(message, duration = 0) {
     if (statusTimerRef.current) {
@@ -1047,6 +1081,58 @@ export default function Editor({ projectId, onBack }) {
     await selectEntry(matchingEntry)
   }
 
+  async function handleOutlineItemSelect(item) {
+    if (item?.location) {
+      await handleSidebarLocationJump(item.location)
+      return
+    }
+
+    const outlineTitle = `${item?.title || item?.text || item?.label || ''}`.trim()
+    if (!outlineTitle) return
+
+    const candidateEntries = [
+      ...(selectedEntry?.kind === 'file' && !selectedEntry?.is_binary ? [selectedEntry] : []),
+      ...files.filter((entry) => (
+        entry.kind === 'file'
+        && !entry.is_binary
+        && entry.id !== selectedEntry?.id
+      )),
+    ]
+
+    for (const entry of candidateEntries) {
+      let source = ''
+
+      if (currentFile?.id === entry.id) {
+        source = content
+      } else {
+        try {
+          const fileData = await getFileContent(entry.id)
+          source = fileData.content || ''
+        } catch {
+          continue
+        }
+      }
+
+      const match = findOutlineHeadingInSource(source, outlineTitle)
+      if (!match) continue
+
+      pendingCursorJumpRef.current = {
+        fileId: entry.id,
+        start: match.start,
+        end: match.end,
+        lineNumber: match.lineNumber,
+      }
+
+      if (currentFile?.id === entry.id) {
+        setJumpNonce((current) => current + 1)
+        return
+      }
+
+      await selectEntry(entry)
+      return
+    }
+  }
+
   function handleEditorDoubleClick() {
     const textarea = textareaRef.current
     if (!textarea || !currentFile) return
@@ -1091,7 +1177,7 @@ export default function Editor({ projectId, onBack }) {
       textarea.focus()
       textarea.setSelectionRange(selectionStart, selectionEnd)
 
-      const lineHeight = 24
+      const lineHeight = editorLineHeight
       const lineNumber = matchesPreviewJump ? pendingCursorJump.startLine + 1 : pendingCursorJump.lineNumber
       const scrollTop = Math.max((lineNumber - 3) * lineHeight, 0)
       textarea.scrollTop = scrollTop
@@ -1118,7 +1204,7 @@ export default function Editor({ projectId, onBack }) {
       }
     }
     pendingEditorSelectionRef.current = null
-  }, [content, currentFile, jumpNonce])
+  }, [content, currentFile, editorLineHeight, jumpNonce])
 
   async function handleDownload() {
     try {
@@ -1138,8 +1224,16 @@ export default function Editor({ projectId, onBack }) {
     setPreviewZoom(1)
   }
 
+  function resetEditorZoom() {
+    setEditorZoom(1)
+  }
+
   function handlePreviewZoomChange(nextZoom) {
     setPreviewZoom(findNearestPreviewZoom(nextZoom))
+  }
+
+  function changeEditorZoom(delta) {
+    setEditorZoom((current) => getAdjacentPreviewZoom(current, delta))
   }
 
   const handlePreviewWheel = useEffectEvent((event) => {
@@ -1148,6 +1242,26 @@ export default function Editor({ projectId, onBack }) {
     event.preventDefault()
     changePreviewZoom(event.deltaY < 0 ? 1 : -1)
   })
+
+  const handleEditorWheel = useEffectEvent((event) => {
+    if (!event.ctrlKey && !event.metaKey) return
+
+    event.preventDefault()
+    changeEditorZoom(event.deltaY < 0 ? 1 : -1)
+  })
+
+  useEffect(() => {
+    if (!editorWheelElement) return undefined
+
+    const handleNativeWheel = (event) => {
+      handleEditorWheel(event)
+    }
+
+    editorWheelElement.addEventListener('wheel', handleNativeWheel, { passive: false })
+    return () => {
+      editorWheelElement.removeEventListener('wheel', handleNativeWheel)
+    }
+  }, [editorWheelElement])
 
   useEffect(() => {
     if (!previewWheelElement) return undefined
@@ -1243,6 +1357,7 @@ export default function Editor({ projectId, onBack }) {
     : ''
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
+  const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
   const diagnostics = useMemo(
@@ -1478,7 +1593,7 @@ export default function Editor({ projectId, onBack }) {
           <OutlineSidebar
             items={outlineItems}
             onClose={() => setSidebarMode('')}
-            onSelectItem={(item) => void handleSidebarLocationJump(item.location)}
+            onSelectItem={(item) => void handleOutlineItemSelect(item)}
           />
         ) : null}
 
@@ -1504,6 +1619,10 @@ export default function Editor({ projectId, onBack }) {
             <section style={{ ...styles.editorColumn, ...(isPreviewDetached ? styles.editorColumnExpanded : null) }}>
               <div style={styles.panelToolbar}>
                 <div style={styles.panelTools}>
+                  <button onClick={resetEditorZoom} style={styles.previewChip} title="Reset editor zoom" type="button">⟲</button>
+                  <button onClick={() => changeEditorZoom(-1)} style={styles.previewChip} title="Zoom out editor" type="button">−</button>
+                  <button style={styles.previewChipLabel} title="Editor zoom" type="button">{editorZoomLabel}</button>
+                  <button onClick={() => changeEditorZoom(1)} style={styles.previewChip} title="Zoom in editor" type="button">+</button>
                   <div ref={fontMenuRef} style={styles.fontMenuShell}>
                     <div
                       ref={fontButtonRef}
@@ -1577,7 +1696,7 @@ export default function Editor({ projectId, onBack }) {
                 <div style={styles.panelMeta}>{currentEntryName}</div>
               </div>
 
-              <div style={styles.editorSurface}>
+              <div ref={setEditorWheelElement} style={styles.editorSurface}>
                 {selectedEntry?.kind === 'folder' ? (
                   <div style={styles.centerPlaceholder}>
                     Folder selected. New files and uploads will be created in
@@ -1587,12 +1706,28 @@ export default function Editor({ projectId, onBack }) {
                   <FileAssetPreview
                     path={selectedEntry.path}
                     src={selectedFilePreviewUrl}
+                    zoom={editorZoom}
                   />
                 ) : (
-                  <div style={styles.codeFrame}>
+                  <div
+                    style={{
+                      ...styles.codeFrame,
+                      gridTemplateColumns: `${gutterWidth}px 1fr`,
+                    }}
+                  >
                     <div ref={gutterRef} style={styles.lineGutter}>
                       {lineNumbers.map((lineNumber) => (
-                        <div key={lineNumber} style={styles.lineNumber}>{lineNumber}</div>
+                        <div
+                          key={lineNumber}
+                          style={{
+                            ...styles.lineNumber,
+                            height: `${editorLineHeight}px`,
+                            lineHeight: `${editorLineHeight}px`,
+                            fontSize: `${lineNumberFontSize}px`,
+                          }}
+                        >
+                          {lineNumber}
+                        </div>
                       ))}
                     </div>
                     <textarea
@@ -1605,7 +1740,11 @@ export default function Editor({ projectId, onBack }) {
                         }
                       }}
                       spellCheck={false}
-                      style={styles.textarea}
+                      style={{
+                        ...styles.textarea,
+                        fontSize: `${editorFontSize}px`,
+                        lineHeight: `${editorLineHeight}px`,
+                      }}
                       value={content}
                     />
                   </div>
@@ -1790,13 +1929,15 @@ const styles = {
     padding: '0 14px',
     background: '#efeff2',
     borderBottom: '1px solid #dadce2',
+    minWidth: 0,
   },
   panelTools: {
     display: 'flex',
     alignItems: 'center',
     gap: '8px',
-    flexWrap: 'wrap',
+    flexWrap: 'nowrap',
     overflow: 'visible',
+    flexShrink: 0,
   },
   toolChip: {
     width: '30px',
@@ -1979,11 +2120,17 @@ const styles = {
     cursor: 'default',
   },
   panelMeta: {
+    flex: 1,
+    minWidth: 0,
     fontSize: '12px',
     fontWeight: '700',
     color: '#646b78',
     textTransform: 'uppercase',
     letterSpacing: '0.05em',
+    textAlign: 'right',
+    overflow: 'hidden',
+    whiteSpace: 'nowrap',
+    textOverflow: 'ellipsis',
   },
   editorSurface: {
     flex: 1,

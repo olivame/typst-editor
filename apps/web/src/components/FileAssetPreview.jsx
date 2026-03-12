@@ -19,14 +19,21 @@ function getPreviewKind(path) {
   return 'unknown'
 }
 
-export default function FileAssetPreview({ path, src }) {
+export default function FileAssetPreview({ path, src, zoom = 1 }) {
   const previewKind = getPreviewKind(path)
 
   if (previewKind === 'image') {
     return (
       <div style={styles.assetViewport}>
         <div style={styles.centerStage}>
-          <img alt={path} src={src} style={styles.imagePreview} />
+          <div
+            style={{
+              ...styles.scaledStage,
+              transform: `scale(${zoom})`,
+            }}
+          >
+            <img alt={path} src={src} style={styles.imagePreview} />
+          </div>
         </div>
       </div>
     )
@@ -36,7 +43,14 @@ export default function FileAssetPreview({ path, src }) {
     return (
       <div style={styles.assetViewport}>
         <div style={styles.centerStage}>
-          <video controls src={src} style={styles.mediaPreview} />
+          <div
+            style={{
+              ...styles.scaledStage,
+              transform: `scale(${zoom})`,
+            }}
+          >
+            <video controls src={src} style={styles.mediaPreview} />
+          </div>
         </div>
       </div>
     )
@@ -54,7 +68,7 @@ export default function FileAssetPreview({ path, src }) {
   }
 
   if (previewKind === 'pdf') {
-    return <PdfPreview src={src} zoom={1} />
+    return <PdfPreview src={src} zoom={zoom} />
   }
 
   return (
@@ -83,6 +97,9 @@ const styles = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  scaledStage: {
+    transformOrigin: 'center center',
   },
   imagePreview: {
     maxWidth: '100%',

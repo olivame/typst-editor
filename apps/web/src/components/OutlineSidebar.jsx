@@ -81,7 +81,12 @@ export default function OutlineSidebar({ items, onClose, onSelectItem }) {
         {items.map((item, index) => {
           const depth = Math.max(Number(item?.depth) || 0, 0)
           const visuals = getItemVisuals(depth)
-          const isClickable = Boolean(item?.location)
+          const isClickable = Boolean(
+            item?.location
+            || (typeof item?.title === 'string' && item.title.trim())
+            || (typeof item?.text === 'string' && item.text.trim())
+            || (typeof item?.label === 'string' && item.label.trim()),
+          )
           const pageNumber = item?.position?.page_no
 
           return (
