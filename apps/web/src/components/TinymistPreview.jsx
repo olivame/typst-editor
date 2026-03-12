@@ -1,6 +1,7 @@
 import {
   forwardRef,
   useEffect,
+  useEffectEvent,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -28,16 +29,17 @@ const TinymistPreview = forwardRef(function TinymistPreview(
     contentWindow.postMessage(message, targetOrigin)
     return true
   }
+  const postPreviewMessage = useEffectEvent((message) => postMessage(message))
 
   useImperativeHandle(ref, () => ({
     revealCursor(payload) {
-      return postMessage({ type: 'revealCursor', payload })
+      return postPreviewMessage({ type: 'revealCursor', payload })
     },
   }))
 
   useEffect(() => {
     if (frameState !== 'ready') return
-    postMessage({ type: 'setZoom', zoom })
+    postPreviewMessage({ type: 'setZoom', zoom })
   }, [frameState, zoom])
 
   useEffect(() => {
@@ -72,7 +74,7 @@ const TinymistPreview = forwardRef(function TinymistPreview(
         onLoad={() => {
           setFrameState('ready')
           window.setTimeout(() => {
-            postMessage({ type: 'setZoom', zoom })
+            postPreviewMessage({ type: 'setZoom', zoom })
           }, 0)
         }}
         src={src}
