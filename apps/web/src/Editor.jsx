@@ -1,6 +1,7 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import DiagnosticsSidebar from './components/DiagnosticsSidebar'
 import EditorToolbar from './components/EditorToolbar'
+import FileAssetPreview from './components/FileAssetPreview'
 import FileSidebar from './components/FileSidebar'
 import OutlineSidebar from './components/OutlineSidebar'
 import SearchSidebar from './components/SearchSidebar'
@@ -8,12 +9,16 @@ import TinymistPreview from './components/TinymistPreview'
 import {
   createProjectFile,
   createProjectFolder,
+  deleteProjectEntry,
+  downloadProjectFile,
   downloadProjectPdf,
   getFileContent,
+  getProjectFileUrl,
   getProjectPreviewStatus,
   getProjectPreviewUrl,
   listAvailableFonts,
   listProjectFiles,
+  renameProjectEntry,
   searchProjectFiles,
   updateFileContent,
   uploadProjectFiles,
@@ -97,6 +102,11 @@ function getSelectionOffset(content, line, character) {
     .reduce((total, currentLine) => total + currentLine.length + 1, 0)
   const boundedCharacter = Math.max(0, Math.min(character, lines[boundedLine]?.length ?? 0))
   return offsetBeforeLine + boundedCharacter
+}
+
+function getParentPath(path) {
+  if (!path || !path.includes('/')) return ''
+  return path.split('/').slice(0, -1).join('/')
 }
 
 function normalizePreviewFilePath(filepath, projectId) {
@@ -271,11 +281,21 @@ function normalizeDiagnostics(status, projectId) {
   return Array.from(deduped.values())
 }
 
-function normalizeOutlineItems(items, projectId) {
-  return (Array.isArray(items) ? items : []).map((item) => ({
-    ...item,
-    location: normalizePreviewLocation(extractLocation(item), projectId),
-  }))
+function normalizeOutlineItems(items, projectId, depth = 0, lineage = []) {
+  return (Array.isArray(items) ? items : []).flatMap((item, index) => {
+    const path = [...lineage, index]
+    const normalizedItem = {
+      ...item,
+      depth,
+      pathKey: path.join('-'),
+      location: normalizePreviewLocation(extractLocation(item), projectId),
+    }
+
+    return [
+      normalizedItem,
+      ...normalizeOutlineItems(item?.children, projectId, depth + 1, path),
+    ]
+  })
 }
 
 function sortFontNames(fontNames) {
@@ -923,6 +943,24 @@ export default function Editor({ projectId, onBack }) {
     showStatus(`Uploaded ${uploadFiles.length} file${uploadFiles.length > 1 ? 's' : ''}`, 2500)
   }
 
+  async function handleRenameEntry(entry, nextPath) {
+    const updatedEntry = await renameProjectEntry(entry.id, nextPath)
+    await refreshFiles(updatedEntry.path)
+    showStatus(`Renamed to ${updatedEntry.path}`, 2500)
+  }
+
+  async function handleDeleteEntry(entry) {
+    await deleteProjectEntry(entry.id)
+    await refreshFiles(getParentPath(entry.path))
+    showStatus(`Deleted ${entry.path}`, 2500)
+  }
+
+  function handleDownloadEntry(entry) {
+    if (entry.kind !== 'file') return
+    downloadProjectFile(entry.id, entry.name)
+    showStatus(`Downloading ${entry.name}`, 2000)
+  }
+
   async function handleSearch(query) {
     return searchProjectFiles(projectId, query)
   }
@@ -1176,6 +1214,9 @@ export default function Editor({ projectId, onBack }) {
   )
 
   const previewUrl = getProjectPreviewUrl(projectId)
+  const selectedFilePreviewUrl = selectedEntry?.kind === 'file'
+    ? getProjectFileUrl(selectedEntry.id)
+    : ''
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
@@ -1386,6 +1427,9 @@ export default function Editor({ projectId, onBack }) {
             onClose={() => setSidebarMode('')}
             onCreateFile={handleCreateFile}
             onCreateFolder={handleCreateFolder}
+            onDeleteEntry={handleDeleteEntry}
+            onDownloadEntry={handleDownloadEntry}
+            onRenameEntry={handleRenameEntry}
             onSelectEntry={selectEntry}
             onUploadFiles={handleUploadFiles}
             selectedEntry={selectedEntry}
@@ -1510,10 +1554,10 @@ export default function Editor({ projectId, onBack }) {
                     <strong style={styles.placeholderStrong}> {selectedEntry.path}</strong>.
                   </div>
                 ) : selectedEntry?.is_binary ? (
-                  <div style={styles.centerPlaceholder}>
-                    This asset is part of the project workspace. It can be referenced by Typst,
-                    but it is not editable in the browser.
-                  </div>
+                  <FileAssetPreview
+                    path={selectedEntry.path}
+                    src={selectedFilePreviewUrl}
+                  />
                 ) : (
                   <div style={styles.codeFrame}>
                     <div ref={gutterRef} style={styles.lineGutter}>

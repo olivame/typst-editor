@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import shutil
 from pathlib import Path, PurePosixPath
 
@@ -81,6 +82,10 @@ class FileUpdate(BaseModel):
 
 class ProjectStatusUpdate(BaseModel):
     status: str
+
+
+class FilePathUpdate(BaseModel):
+    path: str
 
 
 def get_available_fonts_from_compiler():
@@ -231,6 +236,18 @@ def get_project_entries_map(db: Session, project_id: int):
     return {entry.path: entry for entry in entries}
 
 
+def list_descendant_entries(db: Session, project_id: int, relative_path: str):
+    return (
+        db.query(models.File)
+        .filter(
+            models.File.project_id == project_id,
+            models.File.path.startswith(f'{relative_path}/'),
+        )
+        .order_by(models.File.path.asc())
+        .all()
+    )
+
+
 def ensure_parent_folders(
     db: Session,
     project_id: int,
@@ -318,6 +335,22 @@ def create_text_file_entry(
     disk_path.write_text(content, encoding='utf-8')
 
     return entry
+
+
+def ensure_disk_entry(project_id: int, entry: models.File):
+    disk_path = get_entry_disk_path(project_id, entry.path)
+    if disk_path.exists():
+        return disk_path
+
+    if entry.kind == FOLDER_ENTRY_KIND:
+        disk_path.mkdir(parents=True, exist_ok=True)
+        return disk_path
+
+    disk_path.parent.mkdir(parents=True, exist_ok=True)
+    if not entry.is_binary:
+        disk_path.write_text(entry.content or '', encoding='utf-8')
+
+    return disk_path
 
 
 @app.get('/health')
@@ -575,6 +608,105 @@ def update_file_content(file_id: int, file_update: FileUpdate, db: Session = Dep
     disk_path.write_text(entry.content, encoding='utf-8')
 
     return serialize_entry(entry)
+
+
+@app.patch('/files/{file_id}')
+def rename_file_entry(file_id: int, payload: FilePathUpdate, db: Session = Depends(get_db)):
+    entry = get_entry_or_404(db, file_id)
+    next_path = normalize_relative_path(payload.path)
+    old_path = entry.path
+
+    if next_path == old_path:
+        return serialize_entry(entry)
+
+    if entry.kind == FOLDER_ENTRY_KIND and (
+        next_path == old_path
+        or next_path.startswith(f'{old_path}/')
+    ):
+        raise HTTPException(status_code=400, detail='Folder cannot be moved into itself')
+
+    affected_entries = [entry]
+    if entry.kind == FOLDER_ENTRY_KIND:
+        affected_entries.extend(list_descendant_entries(db, entry.project_id, old_path))
+
+    affected_paths = {current.path for current in affected_entries}
+    entries_by_path = get_project_entries_map(db, entry.project_id)
+
+    for current_entry in affected_entries:
+        entries_by_path.pop(current_entry.path, None)
+
+    ensure_parent_folders(db, entry.project_id, get_parent_path(next_path), entries_by_path)
+
+    remapped_paths = {}
+    for current_entry in affected_entries:
+        suffix = current_entry.path[len(old_path):]
+        mapped_path = f'{next_path}{suffix}' if suffix else next_path
+        if mapped_path in entries_by_path or mapped_path in remapped_paths.values():
+            raise HTTPException(status_code=409, detail=f'Path already exists: "{mapped_path}"')
+        remapped_paths[current_entry.id] = mapped_path
+
+    source_path = get_entry_disk_path(entry.project_id, old_path)
+    destination_path = get_entry_disk_path(entry.project_id, next_path)
+
+    if source_path.exists():
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source_path), str(destination_path))
+
+    for current_entry in affected_entries:
+        current_entry.path = remapped_paths[current_entry.id]
+        current_entry.name = PurePosixPath(current_entry.path).name
+
+    db.commit()
+    db.refresh(entry)
+
+    return serialize_entry(entry)
+
+
+@app.delete('/files/{file_id}')
+def delete_file_entry(file_id: int, db: Session = Depends(get_db)):
+    entry = get_entry_or_404(db, file_id)
+    project_id = entry.project_id
+    disk_path = get_entry_disk_path(project_id, entry.path)
+
+    if entry.kind == FOLDER_ENTRY_KIND:
+        affected_entries = [entry, *list_descendant_entries(db, project_id, entry.path)]
+        for current_entry in affected_entries:
+            db.delete(current_entry)
+    else:
+        db.delete(entry)
+
+    db.commit()
+
+    if disk_path.exists():
+        if disk_path.is_dir():
+            shutil.rmtree(disk_path)
+        else:
+            disk_path.unlink()
+
+    return {'status': 'success', 'id': file_id}
+
+
+@app.get('/files/{file_id}/raw')
+def get_file_raw(
+    file_id: int,
+    download: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    entry = get_entry_or_404(db, file_id)
+    if entry.kind == FOLDER_ENTRY_KIND:
+        raise HTTPException(status_code=400, detail='Folders do not have raw content')
+
+    disk_path = ensure_disk_entry(entry.project_id, entry)
+    if not disk_path.exists():
+        raise HTTPException(status_code=404, detail='File not found on disk')
+
+    media_type, _ = mimetypes.guess_type(entry.path)
+    return FileResponse(
+        disk_path,
+        media_type=media_type or 'application/octet-stream',
+        filename=entry.name,
+        content_disposition_type='attachment' if download else 'inline',
+    )
 
 
 @app.post('/projects/{project_id}/compile')

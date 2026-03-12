@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 function getParentPath(path) {
   if (!path || !path.includes('/')) return ''
@@ -73,6 +73,11 @@ function renderTree({
   collapsedFolders,
   depth = 0,
   nodes,
+  menuPath,
+  onDeleteEntry,
+  onDownloadEntry,
+  onOpenMenu,
+  onRenameEntry,
   onSelectEntry,
   onToggleFolder,
 }) {
@@ -80,9 +85,10 @@ function renderTree({
     const isFolder = node.kind === 'folder'
     const isCollapsed = Boolean(collapsedFolders[node.path])
     const isActive = activePath === node.path
+    const isMenuOpen = menuPath === node.path
 
     return (
-      <div key={node.path}>
+      <div key={node.path} style={styles.treeNode}>
         <div
           onClick={() => onSelectEntry(node)}
           style={{
@@ -106,13 +112,69 @@ function renderTree({
           <span style={styles.nodeIcon}>{getIconForNode(node)}</span>
           <span style={styles.treeLabel}>{node.name}</span>
           {node.is_binary ? <span style={styles.assetTag}>asset</span> : null}
-          {isActive ? <span style={styles.moreGlyph}>⋮</span> : null}
+          {(isActive || isMenuOpen) ? (
+            <button
+              onClick={(event) => {
+                event.stopPropagation()
+                onOpenMenu(isMenuOpen ? '' : node.path)
+              }}
+              style={{
+                ...styles.menuTrigger,
+                ...(isActive ? styles.menuTriggerActive : null),
+              }}
+              title="More actions"
+              type="button"
+            >
+              ⋮
+            </button>
+          ) : null}
         </div>
+        {isMenuOpen ? (
+          <div style={styles.menuPanel}>
+            <button
+              onClick={() => {
+                onOpenMenu('')
+                onRenameEntry(node)
+              }}
+              style={styles.menuItem}
+              type="button"
+            >
+              Rename
+            </button>
+            {!isFolder ? (
+              <button
+                onClick={() => {
+                  onOpenMenu('')
+                  onDownloadEntry(node)
+                }}
+                style={styles.menuItem}
+                type="button"
+              >
+                Download
+              </button>
+            ) : null}
+            <button
+              onClick={() => {
+                onOpenMenu('')
+                onDeleteEntry(node)
+              }}
+              style={{ ...styles.menuItem, ...styles.menuItemDanger }}
+              type="button"
+            >
+              Delete
+            </button>
+          </div>
+        ) : null}
         {isFolder && !isCollapsed ? renderTree({
           activePath,
           collapsedFolders,
           depth: depth + 1,
+          menuPath,
           nodes: node.children,
+          onDeleteEntry,
+          onDownloadEntry,
+          onOpenMenu,
+          onRenameEntry,
           onSelectEntry,
           onToggleFolder,
         }) : null}
@@ -126,16 +188,21 @@ export default function FileSidebar({
   onClose,
   onCreateFile,
   onCreateFolder,
+  onDeleteEntry,
+  onDownloadEntry,
+  onRenameEntry,
   onSelectEntry,
   onUploadFiles,
   selectedEntry,
 }) {
   const fileUploadRef = useRef(null)
   const folderUploadRef = useRef(null)
+  const sidebarRef = useRef(null)
   const [collapsedFolders, setCollapsedFolders] = useState({})
   const [createMode, setCreateMode] = useState('')
   const [draftName, setDraftName] = useState('')
   const [actionError, setActionError] = useState('')
+  const [menuPath, setMenuPath] = useState('')
 
   const tree = useMemo(() => buildTree(entries), [entries])
 
@@ -163,6 +230,21 @@ export default function FileSidebar({
     setDraftName('')
     setActionError('')
   }
+
+  const openMenu = (path) => {
+    setMenuPath(path)
+  }
+
+  useEffect(() => {
+    const handlePointerDown = (event) => {
+      if (!sidebarRef.current?.contains(event.target)) {
+        setMenuPath('')
+      }
+    }
+
+    window.addEventListener('mousedown', handlePointerDown)
+    return () => window.removeEventListener('mousedown', handlePointerDown)
+  }, [])
 
   const handleCreate = async () => {
     const trimmedName = draftName.trim()
@@ -204,8 +286,53 @@ export default function FileSidebar({
     }
   }
 
+  const handleRenameEntry = async (entry) => {
+    const nextName = window.prompt('Rename to', entry.name)
+    if (nextName == null) return
+
+    const trimmedName = nextName.trim()
+    if (!trimmedName) {
+      setActionError('Name is required')
+      return
+    }
+
+    const nextPath = joinPath(getParentPath(entry.path), trimmedName)
+
+    try {
+      await onRenameEntry(entry, nextPath)
+      setActionError('')
+    } catch (error) {
+      setActionError(error.message || 'Failed to rename entry')
+    }
+  }
+
+  const handleDeleteEntry = async (entry) => {
+    const confirmed = window.confirm(
+      entry.kind === 'folder'
+        ? `Delete folder "${entry.path}" and all nested files?`
+        : `Delete file "${entry.path}"?`,
+    )
+    if (!confirmed) return
+
+    try {
+      await onDeleteEntry(entry)
+      setActionError('')
+    } catch (error) {
+      setActionError(error.message || 'Failed to delete entry')
+    }
+  }
+
+  const handleDownloadEntry = (entry) => {
+    try {
+      onDownloadEntry(entry)
+      setActionError('')
+    } catch (error) {
+      setActionError(error.message || 'Failed to download entry')
+    }
+  }
+
   return (
-    <aside style={styles.sidebar}>
+    <aside ref={sidebarRef} style={styles.sidebar}>
       <div style={styles.header}>
         <div style={styles.headerTitleRow}>
           <button onClick={onClose} style={styles.headerChevron}>▾</button>
@@ -274,7 +401,12 @@ export default function FileSidebar({
         {tree.length > 0 ? renderTree({
           activePath: selectedEntry?.path || '',
           collapsedFolders,
+          menuPath,
           nodes: tree,
+          onDeleteEntry: handleDeleteEntry,
+          onDownloadEntry: handleDownloadEntry,
+          onOpenMenu: openMenu,
+          onRenameEntry: handleRenameEntry,
           onSelectEntry,
           onToggleFolder: handleToggleFolder,
         }) : (
@@ -422,6 +554,9 @@ const styles = {
     overflow: 'auto',
     padding: '8px 0 14px',
   },
+  treeNode: {
+    position: 'relative',
+  },
   treeItem: {
     display: 'flex',
     alignItems: 'center',
@@ -472,11 +607,51 @@ const styles = {
     fontWeight: '700',
     textTransform: 'uppercase',
   },
-  moreGlyph: {
-    width: '18px',
-    textAlign: 'center',
-    color: 'rgba(255, 255, 255, 0.88)',
+  menuTrigger: {
+    width: '24px',
+    height: '24px',
+    borderRadius: '8px',
+    border: 'none',
+    background: 'transparent',
+    color: '#64748b',
+    cursor: 'pointer',
     fontSize: '14px',
+    lineHeight: 1,
+    outline: 'none',
+    flexShrink: 0,
+  },
+  menuTriggerActive: {
+    color: 'rgba(255, 255, 255, 0.9)',
+  },
+  menuPanel: {
+    position: 'absolute',
+    top: '36px',
+    right: '10px',
+    zIndex: 10,
+    minWidth: '128px',
+    padding: '6px',
+    borderRadius: '12px',
+    border: '1px solid #d5dbe5',
+    background: '#ffffff',
+    boxShadow: '0 18px 34px rgba(15, 23, 42, 0.16)',
+    display: 'grid',
+    gap: '4px',
+  },
+  menuItem: {
+    height: '34px',
+    padding: '0 10px',
+    borderRadius: '8px',
+    border: 'none',
+    background: 'transparent',
+    color: '#334155',
+    cursor: 'pointer',
+    textAlign: 'left',
+    fontSize: '12px',
+    fontWeight: '600',
+    outline: 'none',
+  },
+  menuItemDanger: {
+    color: '#b91c1c',
   },
   emptyState: {
     padding: '18px',

@@ -119,6 +119,24 @@ export async function updateFileContent(fileId, content) {
   return parseJsonResponse(response)
 }
 
+export async function renameProjectEntry(fileId, path) {
+  const response = await fetch(`${API_URL}/files/${fileId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function deleteProjectEntry(fileId) {
+  const response = await fetch(`${API_URL}/files/${fileId}`, {
+    method: 'DELETE',
+  })
+
+  return parseJsonResponse(response)
+}
+
 export async function compileProject(projectId) {
   const response = await fetch(`${API_URL}/projects/${projectId}/compile`, {
     method: 'POST',
@@ -134,6 +152,14 @@ export async function listAvailableFonts() {
 
 export function getProjectPreviewUrl(projectId) {
   return `${PREVIEW_URL}/sessions/${projectId}/data`
+}
+
+export function getProjectFileUrl(fileId, options = {}) {
+  const url = new URL(`${API_URL}/files/${fileId}/raw`)
+  if (options.download) {
+    url.searchParams.set('download', '1')
+  }
+  return url.toString()
 }
 
 export async function getProjectPreviewStatus(projectId) {
@@ -162,4 +188,15 @@ export async function downloadProjectPdf(projectId) {
   anchor.click()
   anchor.remove()
   window.URL.revokeObjectURL(objectUrl)
+}
+
+export function downloadProjectFile(fileId, filename = '') {
+  const anchor = document.createElement('a')
+  anchor.href = getProjectFileUrl(fileId, { download: true })
+  if (filename) {
+    anchor.download = filename
+  }
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
 }

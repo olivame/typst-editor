@@ -5,6 +5,61 @@ function formatOutlineTitle(item) {
   return 'Untitled section'
 }
 
+function getHeadingLabel(depth) {
+  return `H${Math.min(depth + 1, 6)}`
+}
+
+function getItemVisuals(depth) {
+  if (depth === 0) {
+    return {
+      label: {
+        fontSize: '14px',
+        fontWeight: '700',
+        color: '#111827',
+      },
+      badge: {
+        background: '#dbeafe',
+        color: '#1d4ed8',
+      },
+      branch: {
+        background: '#93c5fd',
+      },
+    }
+  }
+
+  if (depth === 1) {
+    return {
+      label: {
+        fontSize: '13px',
+        fontWeight: '650',
+        color: '#1f2937',
+      },
+      badge: {
+        background: '#e0f2fe',
+        color: '#0369a1',
+      },
+      branch: {
+        background: '#7dd3fc',
+      },
+    }
+  }
+
+  return {
+    label: {
+      fontSize: '12px',
+      fontWeight: '600',
+      color: '#475569',
+    },
+    badge: {
+      background: '#f1f5f9',
+      color: '#64748b',
+    },
+    branch: {
+      background: '#cbd5e1',
+    },
+  }
+}
+
 export default function OutlineSidebar({ items, onClose, onSelectItem }) {
   return (
     <aside style={styles.sidebar}>
@@ -25,11 +80,13 @@ export default function OutlineSidebar({ items, onClose, onSelectItem }) {
 
         {items.map((item, index) => {
           const depth = Math.max(Number(item?.depth) || 0, 0)
+          const visuals = getItemVisuals(depth)
           const isClickable = Boolean(item?.location)
+          const pageNumber = item?.position?.page_no
 
           return (
             <button
-              key={`${formatOutlineTitle(item)}-${index}`}
+              key={item.pathKey || `${formatOutlineTitle(item)}-${index}`}
               disabled={!isClickable}
               onClick={() => {
                 if (!isClickable) return
@@ -37,16 +94,36 @@ export default function OutlineSidebar({ items, onClose, onSelectItem }) {
               }}
               style={{
                 ...styles.outlineItem,
-                paddingLeft: `${16 + Math.min(depth, 6) * 18}px`,
+                paddingLeft: `${14 + Math.min(depth, 6) * 18}px`,
                 ...(isClickable ? null : styles.outlineItemDisabled),
               }}
               type="button"
             >
-              <span style={styles.outlineDepthMarker}>{depth > 0 ? '└' : '•'}</span>
-              <span style={styles.outlineLabel}>{formatOutlineTitle(item)}</span>
-              {item?.location?.lineNumber ? (
-                <span style={styles.outlineMeta}>L{item.location.lineNumber}</span>
-              ) : null}
+              <span style={styles.branchColumn}>
+                <span
+                  style={{
+                    ...styles.branchLine,
+                    ...visuals.branch,
+                    marginLeft: `${Math.min(depth, 6) * 2}px`,
+                  }}
+                />
+              </span>
+              <span style={{ ...styles.headingBadge, ...visuals.badge }}>
+                {getHeadingLabel(depth)}
+              </span>
+              <span style={styles.outlineTextColumn}>
+                <span style={{ ...styles.outlineLabel, ...visuals.label }}>
+                  {formatOutlineTitle(item)}
+                </span>
+                <span style={styles.outlineSubline}>
+                  <span style={styles.outlineDepthText}>Level {depth + 1}</span>
+                  {item?.location?.lineNumber ? (
+                    <span style={styles.outlineMeta}>L{item.location.lineNumber}</span>
+                  ) : pageNumber ? (
+                    <span style={styles.outlineMeta}>P{pageNumber}</span>
+                  ) : null}
+                </span>
+              </span>
             </button>
           )
         })}
@@ -111,7 +188,7 @@ const styles = {
     lineHeight: '1.6',
   },
   outlineItem: {
-    minHeight: '42px',
+    minHeight: '46px',
     padding: '10px 12px',
     borderRadius: '12px',
     border: '1px solid #dde3eb',
@@ -124,31 +201,62 @@ const styles = {
     appearance: 'none',
     WebkitAppearance: 'none',
     display: 'flex',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     gap: '8px',
   },
   outlineItemDisabled: {
     cursor: 'default',
     opacity: 0.7,
   },
-  outlineDepthMarker: {
-    color: '#94a3b8',
-    fontSize: '12px',
+  branchColumn: {
+    width: '12px',
+    display: 'flex',
+    justifyContent: 'center',
     flexShrink: 0,
+    paddingTop: '3px',
   },
-  outlineLabel: {
+  branchLine: {
+    width: '2px',
+    minHeight: '26px',
+    borderRadius: '999px',
+  },
+  headingBadge: {
+    minWidth: '30px',
+    height: '22px',
+    padding: '0 7px',
+    borderRadius: '999px',
+    fontSize: '10px',
+    fontWeight: '800',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    marginTop: '1px',
+  },
+  outlineTextColumn: {
     flex: 1,
     minWidth: 0,
-    fontSize: '13px',
-    fontWeight: '600',
-    color: '#1f2937',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+  },
+  outlineLabel: {
     overflow: 'hidden',
     whiteSpace: 'nowrap',
     textOverflow: 'ellipsis',
   },
+  outlineSubline: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    flexWrap: 'wrap',
+  },
+  outlineDepthText: {
+    fontSize: '11px',
+    color: '#94a3b8',
+  },
   outlineMeta: {
     fontSize: '11px',
     color: '#64748b',
-    flexShrink: 0,
   },
 }
