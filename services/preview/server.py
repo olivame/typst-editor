@@ -23,6 +23,19 @@ PROXY_TIMEOUT_SECONDS = float(os.getenv("PROXY_TIMEOUT_SECONDS", "30"))
 
 HTML_WS_SNIPPET = 'let urlObject = new URL("/", window.location.href);'
 DIAGNOSTIC_HEADER_PATTERN = re.compile(r"^(error|warning):\s*(.+)$")
+INCLUDE_PATTERN = re.compile(r'#include\s+"([^"]+)"')
+IMPORT_PATTERN = re.compile(r'#import\s+"([^"]+)"')
+IMAGE_PATTERN = re.compile(r'image\s*\(\s*"([^"]+)"')
+BIBLIOGRAPHY_PATTERN = re.compile(r'bibliography\s*\(\s*"([^"]+)"')
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".bmp", ".tif", ".tiff", ".avif",
+}
+LARGE_PREVIEW_TEXT_BYTES = 150 * 1024
+LARGE_PREVIEW_LINE_COUNT = 2500
+LARGE_PREVIEW_REFERENCE_COUNT = 30
+LARGE_PREVIEW_IMAGE_BYTES = 20 * 1024 * 1024
+LARGE_PREVIEW_IMAGE_COUNT = 25
+LARGE_PREVIEW_TYP_COUNT = 12
 
 app = FastAPI()
 app.add_middleware(
@@ -111,6 +124,99 @@ def resolve_entrypoint_in_project(project_dir: Path, raw_path: str) -> str:
         return nested_main[0]
 
     return sorted(typ_files, key=lambda path: (path.count("/"), path))[0]
+
+
+def resolve_local_project_path(project_dir: Path, source_file: Path, raw_path: str) -> Path | None:
+    normalized_raw = (raw_path or "").strip().replace("\\", "/")
+    if not normalized_raw or normalized_raw.startswith("@"):
+        return None
+    if "://" in normalized_raw:
+        return None
+
+    candidate = Path(normalized_raw)
+    resolved = candidate if candidate.is_absolute() else (source_file.parent / candidate)
+
+    try:
+        normalized = resolved.resolve(strict=False)
+        project_root = project_dir.resolve(strict=False)
+        normalized.relative_to(project_root)
+    except (OSError, ValueError):
+        return None
+
+    return normalized
+
+
+def should_enable_efficient_preview(project_dir: Path, entrypoint: str) -> tuple[bool, list[str]]:
+    entrypoint_path = project_dir / entrypoint
+    try:
+        entrypoint_source = entrypoint_path.read_text(encoding="utf-8")
+    except OSError:
+        return False, []
+
+    reasons: list[str] = []
+
+    if entrypoint_path.stat().st_size > LARGE_PREVIEW_TEXT_BYTES:
+        reasons.append("entrypoint_size")
+
+    if entrypoint_source.count("\n") + 1 > LARGE_PREVIEW_LINE_COUNT:
+        reasons.append("entrypoint_lines")
+
+    referenced_image_paths: set[Path] = set()
+    scanned_typ_paths: set[Path] = set()
+    pending_typ_paths = [entrypoint_path]
+    reference_count = 0
+
+    while pending_typ_paths:
+        current_path = pending_typ_paths.pop()
+        if current_path in scanned_typ_paths or not current_path.exists():
+            continue
+
+        scanned_typ_paths.add(current_path)
+
+        try:
+            source = current_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        include_refs = INCLUDE_PATTERN.findall(source)
+        import_refs = IMPORT_PATTERN.findall(source)
+        image_refs = IMAGE_PATTERN.findall(source)
+        bibliography_refs = BIBLIOGRAPHY_PATTERN.findall(source)
+        reference_count += len(include_refs) + len(import_refs) + len(image_refs) + len(bibliography_refs)
+
+        for candidate_ref in [*include_refs, *import_refs]:
+            candidate_path = resolve_local_project_path(project_dir, current_path, candidate_ref)
+            if candidate_path is None or candidate_path.suffix != ".typ":
+                continue
+            pending_typ_paths.append(candidate_path)
+
+        for image_ref in image_refs:
+            image_path = resolve_local_project_path(project_dir, current_path, image_ref)
+            if image_path is None or image_path.suffix.lower() not in IMAGE_EXTENSIONS or not image_path.exists():
+                continue
+            referenced_image_paths.add(image_path)
+
+    if reference_count > LARGE_PREVIEW_REFERENCE_COUNT:
+        reasons.append("reference_count")
+
+    image_total_bytes = 0
+    for image_path in referenced_image_paths:
+        try:
+            image_total_bytes += image_path.stat().st_size
+        except OSError:
+            continue
+
+    if image_total_bytes > LARGE_PREVIEW_IMAGE_BYTES:
+        reasons.append("image_bytes")
+
+    if len(referenced_image_paths) > LARGE_PREVIEW_IMAGE_COUNT:
+        reasons.append("image_count")
+
+    project_typ_count = sum(1 for current in project_dir.rglob("*.typ") if current.is_file())
+    if project_typ_count > LARGE_PREVIEW_TYP_COUNT:
+        reasons.append("project_typ_count")
+
+    return bool(reasons), reasons
 
 
 def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
@@ -1025,12 +1131,22 @@ class PreviewSession:
             if not entrypoint.exists():
                 raise HTTPException(status_code=404, detail=f"{self.entrypoint} not found")
 
+            efficient_preview, efficient_preview_reasons = should_enable_efficient_preview(
+                self.project_dir,
+                self.entrypoint,
+            )
+
             self.data_port = reserve_port()
             self.control_port = reserve_port()
-            self.process = await asyncio.create_subprocess_exec(
+            command = [
                 TINYMIST_BIN,
                 "preview",
                 "--not-primary",
+            ]
+            if efficient_preview:
+                command.extend(["--partial-rendering", "true"])
+
+            command.extend([
                 str(entrypoint),
                 "--root",
                 str(self.project_dir),
@@ -1039,6 +1155,16 @@ class PreviewSession:
                 f"127.0.0.1:{self.data_port}",
                 "--control-plane-host",
                 f"127.0.0.1:{self.control_port}",
+            ])
+
+            print(
+                f"[preview:{self.project_id}:{self.entrypoint}] "
+                f"efficient_preview={'on' if efficient_preview else 'off'} "
+                f"reasons={','.join(efficient_preview_reasons) or 'none'}"
+            )
+
+            self.process = await asyncio.create_subprocess_exec(
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
