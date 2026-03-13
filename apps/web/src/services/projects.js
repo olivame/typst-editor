@@ -137,9 +137,11 @@ export async function deleteProjectEntry(fileId) {
   return parseJsonResponse(response)
 }
 
-export async function compileProject(projectId) {
+export async function compileProject(projectId, options = {}) {
   const response = await fetch(`${API_URL}/projects/${projectId}/compile`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entrypoint: options.entrypoint || '' }),
   })
 
   return parseJsonResponse(response)
@@ -150,8 +152,12 @@ export async function listAvailableFonts() {
   return parseJsonResponse(response)
 }
 
-export function getProjectPreviewUrl(projectId) {
-  return `${PREVIEW_URL}/sessions/${projectId}/data`
+export function getProjectPreviewUrl(projectId, options = {}) {
+  const url = new URL(`${PREVIEW_URL}/sessions/${projectId}/data`)
+  if (options.entrypoint) {
+    url.searchParams.set('entrypoint', options.entrypoint)
+  }
+  return url.toString()
 }
 
 export function getProjectFileUrl(fileId, options = {}) {
@@ -162,13 +168,21 @@ export function getProjectFileUrl(fileId, options = {}) {
   return url.toString()
 }
 
-export async function getProjectPreviewStatus(projectId) {
-  const response = await fetch(`${PREVIEW_URL}/sessions/${projectId}/status`)
+export async function getProjectPreviewStatus(projectId, options = {}) {
+  const url = new URL(`${PREVIEW_URL}/sessions/${projectId}/status`)
+  if (options.entrypoint) {
+    url.searchParams.set('entrypoint', options.entrypoint)
+  }
+  const response = await fetch(url)
   return parseJsonResponse(response)
 }
 
-export async function downloadProjectPdf(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/pdf/download`)
+export async function downloadProjectPdf(projectId, options = {}) {
+  const url = new URL(`${API_URL}/projects/${projectId}/pdf/download`)
+  if (options.entrypoint) {
+    url.searchParams.set('entrypoint', options.entrypoint)
+  }
+  const response = await fetch(url)
   if (!response.ok) {
     const message = await response.text()
     try {
@@ -183,7 +197,7 @@ export async function downloadProjectPdf(projectId) {
   const objectUrl = window.URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = objectUrl
-  anchor.download = 'main.pdf'
+  anchor.download = options.filename || 'main.pdf'
   document.body.appendChild(anchor)
   anchor.click()
   anchor.remove()

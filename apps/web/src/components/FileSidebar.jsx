@@ -63,9 +63,20 @@ function buildTree(entries) {
 }
 
 function getIconForNode(node) {
-  if (node.kind === 'folder') return '▸'
+  if (node.kind === 'folder') return '▣'
   if (node.is_binary) return '◫'
   return '≡'
+}
+
+function collectExpandedFolderMap(nodes, targetPath, expanded = {}) {
+  for (const node of nodes) {
+    if (node.kind !== 'folder') continue
+    if (targetPath === node.path || targetPath.startsWith(`${node.path}/`)) {
+      expanded[node.path] = false
+      collectExpandedFolderMap(node.children, targetPath, expanded)
+    }
+  }
+  return expanded
 }
 
 function renderTree({
@@ -90,7 +101,12 @@ function renderTree({
     return (
       <div key={node.path} style={styles.treeNode}>
         <div
-          onClick={() => onSelectEntry(node)}
+          onClick={() => {
+            if (isFolder) {
+              onToggleFolder(node.path)
+            }
+            onSelectEntry(node)
+          }}
           style={{
             ...styles.treeItem,
             ...(isActive ? styles.treeItemActive : null),
@@ -218,6 +234,15 @@ export default function FileSidebar({
       [path]: !current[path],
     }))
   }
+
+  useEffect(() => {
+    if (!selectedEntry?.path) return
+
+    setCollapsedFolders((current) => ({
+      ...current,
+      ...collectExpandedFolderMap(tree, selectedEntry.path),
+    }))
+  }, [selectedEntry?.path, tree])
 
   const openCreateForm = (mode) => {
     setCreateMode(mode)

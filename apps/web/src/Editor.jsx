@@ -631,6 +631,66 @@ function insertTemplate(source, selectionStart, selectionEnd, template, cursorOf
   }
 }
 
+function insertReferenceTemplate(source, selectionStart, selectionEnd, citationKey = '') {
+  const referenceMarker = citationKey ? `@${citationKey}` : '@'
+  return insertTemplate(source, selectionStart, selectionEnd, referenceMarker, referenceMarker.length)
+}
+
+function parseBibReferenceOptions(bibliographyFiles) {
+  const referencesByKey = new Map()
+  const citationPattern = /@([A-Za-z]+)\s*[{(]\s*([^,\s]+)\s*,/g
+
+  bibliographyFiles.forEach((file) => {
+    const source = `${file?.content || ''}`
+    citationPattern.lastIndex = 0
+    let match = citationPattern.exec(source)
+
+    while (match) {
+      const entryType = `${match[1] || ''}`.toLowerCase()
+      const citationKey = `${match[2] || ''}`.trim()
+
+      if (!['comment', 'preamble', 'string'].includes(entryType) && citationKey) {
+        const existingReference = referencesByKey.get(citationKey)
+
+        if (existingReference) {
+          if (!existingReference.paths.includes(file.path)) {
+            existingReference.paths.push(file.path)
+          }
+        } else {
+          referencesByKey.set(citationKey, {
+            key: citationKey,
+            label: citationKey,
+            paths: [file.path],
+          })
+        }
+      }
+
+      match = citationPattern.exec(source)
+    }
+  })
+
+  return Array.from(referencesByKey.values())
+    .sort((left, right) => left.key.localeCompare(right.key))
+}
+
+function isTypEntry(entry) {
+  return Boolean(
+    entry
+    && entry.kind === 'file'
+    && !entry.is_binary
+    && `${entry.path || ''}`.toLowerCase().endsWith('.typ'),
+  )
+}
+
+function findPreferredTypEntry(entries, preferredPath = '') {
+  const typEntries = entries.filter((entry) => isTypEntry(entry))
+  if (typEntries.length === 0) return null
+
+  return typEntries.find((entry) => entry.path === preferredPath)
+    || typEntries.find((entry) => entry.path === 'main.typ')
+    || typEntries[0]
+}
+
 function getSelectedLineRange(source, selectionStart, selectionEnd) {
   const lineStart = source.lastIndexOf('\n', Math.max(selectionStart - 1, 0)) + 1
   const anchor = selectionEnd > selectionStart ? selectionEnd : selectionStart
@@ -803,6 +863,8 @@ export default function Editor({ projectId, onBack }) {
   const previewApiRef = useRef(null)
   const fontButtonRef = useRef(null)
   const fontMenuRef = useRef(null)
+  const referenceButtonRef = useRef(null)
+  const referenceMenuRef = useRef(null)
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [currentFile, setCurrentFile] = useState(null)
@@ -818,8 +880,13 @@ export default function Editor({ projectId, onBack }) {
   const [jumpNonce, setJumpNonce] = useState(0)
   const [isFontMenuOpen, setIsFontMenuOpen] = useState(false)
   const [fontMenuPosition, setFontMenuPosition] = useState({ top: 0, left: 0 })
+  const [isReferenceMenuOpen, setIsReferenceMenuOpen] = useState(false)
+  const [referenceMenuPosition, setReferenceMenuPosition] = useState({ top: 0, left: 0 })
+  const [referenceOptions, setReferenceOptions] = useState([])
+  const [isReferenceOptionsLoading, setIsReferenceOptionsLoading] = useState(false)
   const [availableFonts, setAvailableFonts] = useState([])
   const [openFontPicker, setOpenFontPicker] = useState('')
+  const [activePreviewPath, setActivePreviewPath] = useState('main.typ')
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
   const editorFontSize = Math.round(15 * editorZoom * 10) / 10
@@ -845,6 +912,9 @@ export default function Editor({ projectId, onBack }) {
 
   async function selectEntry(entry) {
     setSelectedEntry(entry)
+    if (isTypEntry(entry)) {
+      setActivePreviewPath(entry.path)
+    }
 
     if (entry.kind === 'folder' || entry.is_binary) {
       setCurrentFile(null)
@@ -876,8 +946,12 @@ export default function Editor({ projectId, onBack }) {
       setSelectedEntry(null)
       setCurrentFile(null)
       setContent('')
+      setActivePreviewPath('')
       return
     }
+
+    const nextPreviewEntry = findPreferredTypEntry(nextFiles, preferredPath || activePreviewPath || fallbackEntry.path)
+    setActivePreviewPath(nextPreviewEntry?.path || '')
 
     await selectEntry(fallbackEntry)
   }
@@ -901,8 +975,12 @@ export default function Editor({ projectId, onBack }) {
         setSelectedEntry(null)
         setCurrentFile(null)
         setContent('')
+        setActivePreviewPath('')
         return
       }
+
+      const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, fallbackEntry.path)
+      setActivePreviewPath(fallbackPreviewEntry?.path || '')
 
       setSelectedEntry(fallbackEntry)
 
@@ -954,8 +1032,15 @@ export default function Editor({ projectId, onBack }) {
     let isCancelled = false
 
     async function loadPreviewStatus() {
+      const previewEntry = findPreferredTypEntry(files, activePreviewPath)
+      if (!previewEntry?.path) {
+        setPreviewStatus({ kind: 'Idle' })
+        setPreviewOutline([])
+        return
+      }
+
       try {
-        const payload = await getProjectPreviewStatus(projectId)
+        const payload = await getProjectPreviewStatus(projectId, { entrypoint: previewEntry.path })
         if (isCancelled) return
 
         setPreviewStatus(payload?.status && typeof payload.status === 'object' ? payload.status : { kind: 'Idle' })
@@ -977,7 +1062,7 @@ export default function Editor({ projectId, onBack }) {
       isCancelled = true
       window.clearInterval(intervalId)
     }
-  }, [projectId])
+  }, [activePreviewPath, files, projectId])
 
   async function saveAndPreview() {
     if (!currentFile) return
@@ -1232,10 +1317,23 @@ export default function Editor({ projectId, onBack }) {
   }, [content, currentFile, editorLineHeight, jumpNonce])
 
   async function handleDownload() {
+    if (!activePreviewEntry?.path) {
+      showStatus('No .typ file selected for export', 2500)
+      return
+    }
+
     try {
-      showStatus('Exporting PDF...')
-      await downloadProjectPdf(projectId)
-      showStatus('PDF exported', 3000)
+      if (currentFile?.path === activePreviewEntry.path && !selectedEntry?.is_binary) {
+        await updateFileContent(currentFile.id, content)
+        setCurrentFile((current) => (current ? { ...current, content } : current))
+      }
+
+      showStatus(`Exporting ${activePreviewEntry.name}...`)
+      await downloadProjectPdf(projectId, {
+        entrypoint: activePreviewEntry.path,
+        filename: `${activePreviewEntry.name.replace(/\.typ$/i, '')}.pdf`,
+      })
+      showStatus(`Exported ${activePreviewEntry.name}`, 3000)
     } catch (error) {
       showStatus(error.message || 'Failed to export PDF')
     }
@@ -1362,6 +1460,91 @@ export default function Editor({ projectId, onBack }) {
     }
   }, [isFontMenuOpen])
 
+  useEffect(() => {
+    if (!isReferenceMenuOpen) return undefined
+
+    const updateReferenceMenuPosition = () => {
+      const buttonRect = referenceButtonRef.current?.getBoundingClientRect()
+      if (!buttonRect) return
+
+      setReferenceMenuPosition({
+        top: buttonRect.bottom + 8,
+        left: buttonRect.left,
+      })
+    }
+
+    updateReferenceMenuPosition()
+
+    const handlePointerDown = (event) => {
+      if (
+        referenceMenuRef.current?.contains(event.target)
+        || referenceButtonRef.current?.contains(event.target)
+      ) {
+        return
+      }
+
+      setIsReferenceMenuOpen(false)
+    }
+
+    window.addEventListener('resize', updateReferenceMenuPosition)
+    window.addEventListener('scroll', updateReferenceMenuPosition, true)
+    window.addEventListener('mousedown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('resize', updateReferenceMenuPosition)
+      window.removeEventListener('scroll', updateReferenceMenuPosition, true)
+      window.removeEventListener('mousedown', handlePointerDown)
+    }
+  }, [isReferenceMenuOpen])
+
+  useEffect(() => {
+    if (!isReferenceMenuOpen) return undefined
+
+    let isCancelled = false
+
+    async function loadReferenceOptions() {
+      setIsReferenceOptionsLoading(true)
+
+      const bibliographyEntries = files.filter((entry) => (
+        entry.kind === 'file'
+        && !entry.is_binary
+        && `${entry.path || ''}`.toLowerCase().endsWith('.bib')
+      ))
+
+      if (bibliographyEntries.length === 0) {
+        setReferenceOptions([])
+        setIsReferenceOptionsLoading(false)
+        return
+      }
+
+      const bibliographyFiles = await Promise.all(
+        bibliographyEntries.map(async (entry) => {
+          try {
+            if (currentFile?.id === entry.id) {
+              return { path: entry.path, content }
+            }
+
+            const fileData = await getFileContent(entry.id)
+            return { path: entry.path, content: fileData.content || '' }
+          } catch {
+            return null
+          }
+        }),
+      )
+
+      if (isCancelled) return
+
+      setReferenceOptions(parseBibReferenceOptions(bibliographyFiles.filter(Boolean)))
+      setIsReferenceOptionsLoading(false)
+    }
+
+    void loadReferenceOptions()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [isReferenceMenuOpen, files, currentFile?.id, content])
+
   const lineCount = useMemo(
     () => Math.max(content.split('\n').length, 1),
     [content],
@@ -1376,12 +1559,19 @@ export default function Editor({ projectId, onBack }) {
     [lineCount],
   )
 
-  const previewUrl = getProjectPreviewUrl(projectId)
+  const activePreviewEntry = useMemo(
+    () => findPreferredTypEntry(files, activePreviewPath),
+    [activePreviewPath, files],
+  )
+  const previewUrl = activePreviewEntry
+    ? getProjectPreviewUrl(projectId, { entrypoint: activePreviewEntry.path })
+    : ''
   const selectedFilePreviewUrl = selectedEntry?.kind === 'file'
     ? getProjectFileUrl(selectedEntry.id)
     : ''
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
+  const previewEntryName = activePreviewEntry?.name || 'No preview'
   const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
@@ -1397,6 +1587,14 @@ export default function Editor({ projectId, onBack }) {
   const outlineItems = useMemo(
     () => normalizeOutlineItems(previewOutline, projectId),
     [previewOutline, projectId],
+  )
+  const bibliographyFileCount = useMemo(
+    () => files.filter((entry) => (
+      entry.kind === 'file'
+      && !entry.is_binary
+      && `${entry.path || ''}`.toLowerCase().endsWith('.bib')
+    )).length,
+    [files],
   )
 
   const togglePreviewDetach = () => {
@@ -1427,6 +1625,19 @@ export default function Editor({ projectId, onBack }) {
   const handleChineseFontSelect = (fontName) => {
     applyFontSelection(fontSelection.englishFont, fontName)
     setOpenFontPicker('')
+  }
+
+  const insertReference = (citationKey = '') => {
+    applyEditorTransformation(
+      (source, selectionStart, selectionEnd) => insertReferenceTemplate(
+        source,
+        selectionStart,
+        selectionEnd,
+        citationKey,
+      ),
+      citationKey ? `Inserted @${citationKey}` : 'Inserted reference marker',
+    )
+    setIsReferenceMenuOpen(false)
   }
 
   const applyEditorTransformation = (transformer, statusText) => {
@@ -1503,10 +1714,7 @@ export default function Editor({ projectId, onBack }) {
         )
         return
       case 'reference':
-        applyEditorTransformation(
-          (source, selectionStart, selectionEnd) => insertTemplate(source, selectionStart, selectionEnd, '@', 1),
-          'Inserted reference marker',
-        )
+        insertReference('')
         return
       default:
         return
@@ -1531,14 +1739,18 @@ export default function Editor({ projectId, onBack }) {
 
   const renderPreviewViewport = () => (
     <div ref={setPreviewWheelElement} style={styles.previewFrame}>
-      <TinymistPreview
-        ref={previewApiRef}
-        key={`${projectId}-${isPreviewDetached ? 'floating' : 'embedded'}`}
-        onJumpToSource={handlePreviewJump}
-        onZoomChange={handlePreviewZoomChange}
-        src={previewUrl}
-        zoom={previewZoom}
-      />
+      {activePreviewEntry ? (
+        <TinymistPreview
+          ref={previewApiRef}
+          key={`${projectId}-${activePreviewEntry.path}-${isPreviewDetached ? 'floating' : 'embedded'}`}
+          onJumpToSource={handlePreviewJump}
+          onZoomChange={handlePreviewZoomChange}
+          src={previewUrl}
+          zoom={previewZoom}
+        />
+      ) : (
+        <div style={styles.previewPlaceholder}>Select a `.typ` file to preview.</div>
+      )}
     </div>
   )
 
@@ -1549,6 +1761,7 @@ export default function Editor({ projectId, onBack }) {
   }
 
   const toggleFontMenu = () => {
+    setIsReferenceMenuOpen(false)
     setIsFontMenuOpen((current) => {
       const nextValue = !current
       if (!nextValue) {
@@ -1564,6 +1777,12 @@ export default function Editor({ projectId, onBack }) {
 
   const toggleFontPicker = (pickerId) => {
     setOpenFontPicker((current) => (current === pickerId ? '' : pickerId))
+  }
+
+  const toggleReferenceMenu = () => {
+    setIsFontMenuOpen(false)
+    setOpenFontPicker('')
+    setIsReferenceMenuOpen((current) => !current)
   }
 
   return (
@@ -1717,16 +1936,108 @@ export default function Editor({ projectId, onBack }) {
                     ) : null}
                   </div>
                   {EDITOR_TOOL_ITEMS.filter((item) => item.id !== 'font').map((item) => (
-                    <button
-                      key={item.id}
-                      onClick={() => handleEditorToolClick(item.id)}
-                      onMouseDown={handleFontMenuMouseDown}
-                      style={styles.toolChip}
-                      title={item.title}
-                      type="button"
-                    >
-                      {item.label}
-                    </button>
+                    item.id === 'reference' ? (
+                      <div key={item.id} ref={referenceMenuRef} style={styles.fontMenuShell}>
+                        <button
+                          ref={referenceButtonRef}
+                          onClick={toggleReferenceMenu}
+                          onMouseDown={handleFontMenuMouseDown}
+                          style={{
+                            ...styles.toolChip,
+                            ...(isReferenceMenuOpen ? styles.toolbarRailButtonActive : null),
+                          }}
+                          title={item.title}
+                          type="button"
+                        >
+                          {item.label}
+                        </button>
+                        {isReferenceMenuOpen ? (
+                          <div
+                            style={{
+                              ...styles.referenceMenuPanel,
+                              top: `${referenceMenuPosition.top}px`,
+                              left: `${referenceMenuPosition.left}px`,
+                            }}
+                          >
+                            {!isEditableDocument ? (
+                              <div style={styles.fontMenuNotice}>
+                                请选择一个可编辑的 `.typ` 文件后再插入引用。
+                              </div>
+                            ) : null}
+                            <div style={styles.referenceMenuLabel}>References</div>
+                            <div style={styles.referenceOptionList}>
+                              <div
+                                onClick={() => insertReference('')}
+                                onMouseDown={handleFontMenuMouseDown}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter' || event.key === ' ') {
+                                    event.preventDefault()
+                                    insertReference('')
+                                  }
+                                }}
+                                role="button"
+                                style={{
+                                  ...styles.referenceOptionItem,
+                                  ...styles.referenceOptionItemPrimary,
+                                }}
+                                tabIndex={0}
+                              >
+                                <div style={styles.referenceOptionTextGroup}>
+                                  <span style={styles.referenceOptionTitle}>basics</span>
+                                  <span style={styles.referenceOptionMeta}>Insert `@` only</span>
+                                </div>
+                              </div>
+                              {isReferenceOptionsLoading ? (
+                                <div style={styles.fontMenuNotice}>Loading bibliography entries...</div>
+                              ) : null}
+                              {!isReferenceOptionsLoading && bibliographyFileCount === 0 ? (
+                                <div style={styles.fontMenuNotice}>
+                                  当前项目还没有 `.bib` 文件，先新增 bibliography 文件后这里才会列出可引用项。
+                                </div>
+                              ) : null}
+                              {!isReferenceOptionsLoading && bibliographyFileCount > 0 && referenceOptions.length === 0 ? (
+                                <div style={styles.fontMenuNotice}>
+                                  已检测到 `.bib` 文件，但暂时没有解析到可引用的 key。
+                                </div>
+                              ) : null}
+                              {referenceOptions.map((option) => (
+                                <div
+                                  key={`${option.key}-${option.paths.join('|')}`}
+                                  onClick={() => insertReference(option.key)}
+                                  onMouseDown={handleFontMenuMouseDown}
+                                  onKeyDown={(event) => {
+                                    if (event.key === 'Enter' || event.key === ' ') {
+                                      event.preventDefault()
+                                      insertReference(option.key)
+                                    }
+                                  }}
+                                  role="button"
+                                  style={styles.referenceOptionItem}
+                                  tabIndex={0}
+                                  title={`Insert @${option.key}`}
+                                >
+                                  <div style={styles.referenceOptionTextGroup}>
+                                    <span style={styles.referenceOptionTitle}>{option.label}</span>
+                                    <span style={styles.referenceOptionMeta}>{option.paths.join(', ')}</span>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <button
+                        key={item.id}
+                        onClick={() => handleEditorToolClick(item.id)}
+                        onMouseDown={handleFontMenuMouseDown}
+                        style={styles.toolChip}
+                        title={item.title}
+                        type="button"
+                      >
+                        {item.label}
+                      </button>
+                    )
                   ))}
                 </div>
                 <div style={styles.panelMeta}>{currentEntryName}</div>
@@ -1792,7 +2103,7 @@ export default function Editor({ projectId, onBack }) {
               <section style={styles.previewColumn}>
                 <div style={styles.panelToolbar}>
                   {renderPreviewTools()}
-                  <div style={styles.panelMeta}>Preview</div>
+                  <div style={styles.panelMeta}>{`Preview · ${previewEntryName}`}</div>
                 </div>
 
                 {renderPreviewViewport()}
@@ -1816,7 +2127,7 @@ export default function Editor({ projectId, onBack }) {
               {renderPreviewTools()}
               <div style={styles.floatingPreviewMeta}>
                 <span style={styles.floatingDragHandle}>⋮⋮</span>
-                Preview
+                {`Preview · ${previewEntryName}`}
               </div>
             </div>
 
@@ -2068,10 +2379,29 @@ const styles = {
     boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
     zIndex: 200,
   },
+  referenceMenuPanel: {
+    position: 'fixed',
+    width: '280px',
+    display: 'grid',
+    gap: '10px',
+    padding: '12px',
+    borderRadius: '12px',
+    border: '1px solid #d4d7de',
+    background: '#ffffff',
+    boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
+    zIndex: 200,
+  },
   fontMenuLabel: {
     color: '#4b5563',
     fontSize: '12px',
     fontWeight: '700',
+  },
+  referenceMenuLabel: {
+    color: '#4b5563',
+    fontSize: '12px',
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
   },
   fontPicker: {
     display: 'grid',
@@ -2134,6 +2464,51 @@ const styles = {
   fontOptionItemActive: {
     background: '#ffffff',
     boxShadow: 'inset 0 0 0 1px #cbd5e1',
+  },
+  referenceOptionList: {
+    maxHeight: '220px',
+    overflowY: 'auto',
+    display: 'grid',
+    gap: '4px',
+    padding: '6px',
+    borderRadius: '10px',
+    border: '1px solid #d8dde6',
+    background: '#f8fafc',
+  },
+  referenceOptionItem: {
+    minHeight: '40px',
+    padding: '8px 10px',
+    borderRadius: '8px',
+    color: '#1f2937',
+    cursor: 'pointer',
+    outline: 'none',
+    userSelect: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    background: '#ffffff',
+    boxShadow: 'inset 0 0 0 1px #e2e8f0',
+  },
+  referenceOptionItemPrimary: {
+    background: '#eff6ff',
+    boxShadow: 'inset 0 0 0 1px #bfdbfe',
+  },
+  referenceOptionTextGroup: {
+    minWidth: 0,
+    display: 'grid',
+    gap: '2px',
+  },
+  referenceOptionTitle: {
+    fontSize: '13px',
+    fontWeight: '700',
+    lineHeight: '1.3',
+  },
+  referenceOptionMeta: {
+    color: '#64748b',
+    fontSize: '11px',
+    lineHeight: '1.4',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
   },
   fontMenuNotice: {
     padding: '8px 10px',

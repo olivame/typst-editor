@@ -88,6 +88,10 @@ class FilePathUpdate(BaseModel):
     path: str
 
 
+class ProjectCompileRequest(BaseModel):
+    entrypoint: str = ''
+
+
 def get_available_fonts_from_compiler():
     try:
         response = requests.get(
@@ -173,6 +177,65 @@ def normalize_parent_path(raw_path: str):
         return ''
 
     return normalize_relative_path(raw_path)
+
+
+def normalize_entrypoint_path(raw_path: str):
+    normalized = normalize_relative_path(raw_path or 'main.typ')
+    if not normalized.endswith('.typ'):
+        raise HTTPException(status_code=400, detail='Entrypoint must be a .typ file')
+    return normalized
+
+
+def resolve_project_entrypoint(entries: list[models.File], raw_path: str):
+    typ_entries = [
+        entry
+        for entry in entries
+        if entry.kind == TEXT_ENTRY_KIND and not entry.is_binary and entry.path.endswith('.typ')
+    ]
+    if not typ_entries:
+        raise HTTPException(status_code=404, detail='No .typ entrypoint found in project')
+
+    candidate_paths = [entry.path for entry in typ_entries]
+    entry_by_path = {entry.path: entry for entry in typ_entries}
+
+    normalized_raw = (raw_path or '').strip().replace('\\', '/')
+    search_candidates = []
+    if normalized_raw:
+        if normalized_raw.startswith(f'/workspace/projects/{entries[0].project_id}/'):
+            normalized_raw = normalized_raw.split(f'/workspace/projects/{entries[0].project_id}/', 1)[1]
+        search_candidates = [normalized_raw]
+        if normalized_raw.startswith('/'):
+            search_candidates.append(normalized_raw.lstrip('/'))
+
+    for candidate in search_candidates:
+        if not candidate.endswith('.typ'):
+            continue
+        if candidate in entry_by_path:
+            return entry_by_path[candidate]
+
+        suffix_matches = [path for path in candidate_paths if path.endswith(f'/{candidate}')]
+        if len(suffix_matches) == 1:
+            return entry_by_path[suffix_matches[0]]
+
+        basename_matches = [path for path in candidate_paths if Path(path).name == Path(candidate).name]
+        if len(basename_matches) == 1:
+            return entry_by_path[basename_matches[0]]
+
+    preferred_names = ['main.typ']
+    for preferred_name in preferred_names:
+        direct_match = entry_by_path.get(preferred_name)
+        if direct_match:
+            return direct_match
+
+        nested_matches = sorted(
+            [path for path in candidate_paths if path.endswith(f'/{preferred_name}')],
+            key=lambda path: (path.count('/'), path),
+        )
+        if nested_matches:
+            return entry_by_path[nested_matches[0]]
+
+    best_path = sorted(candidate_paths, key=lambda path: (path.count('/'), path))[0]
+    return entry_by_path[best_path]
 
 
 def join_relative_path(parent_path: str, child_path: str):
@@ -310,7 +373,7 @@ def sync_project_workspace(project_id: int, entries: list[models.File]):
     for disk_path in sorted(project_dir.rglob('*'), key=lambda current: len(current.parts), reverse=True):
         relative_path = disk_path.relative_to(project_dir).as_posix()
         if disk_path.is_file():
-            if relative_path in expected_files or relative_path == 'main.pdf':
+            if relative_path in expected_files or relative_path.endswith('.pdf'):
                 continue
             disk_path.unlink()
             continue
@@ -745,16 +808,23 @@ def get_file_raw(
 
 
 @app.post('/projects/{project_id}/compile')
-def compile_project(project_id: int, db: Session = Depends(get_db)):
+def compile_project(
+    project_id: int,
+    payload: ProjectCompileRequest,
+    db: Session = Depends(get_db),
+):
     get_project_or_404(db, project_id)
 
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    entry = resolve_project_entrypoint(entries, payload.entrypoint)
+    entrypoint = entry.path
+
     sync_project_workspace(project_id, entries)
 
     try:
         response = requests.post(
             COMPILER_URL,
-            json={'project_id': project_id},
+            json={'project_id': project_id, 'entrypoint': entrypoint},
             timeout=COMPILER_TIMEOUT_SECONDS,
         )
         return response.json()
@@ -768,23 +838,33 @@ def list_available_fonts():
 
 
 @app.get('/projects/{project_id}/pdf')
-def get_pdf(project_id: int):
-    pdf_path = get_project_dir(project_id) / 'main.pdf'
+def get_pdf(project_id: int, entrypoint: str = Query('main.typ'), db: Session = Depends(get_db)):
+    get_project_or_404(db, project_id)
+    entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    entry = resolve_project_entrypoint(entries, entrypoint)
+    pdf_path = get_project_dir(project_id) / Path(entry.path).with_suffix('.pdf')
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail='PDF not found')
     return FileResponse(pdf_path, media_type='application/pdf')
 
 
 @app.get('/projects/{project_id}/pdf/download')
-def download_pdf(project_id: int, db: Session = Depends(get_db)):
+def download_pdf(
+    project_id: int,
+    entrypoint: str = Query('main.typ'),
+    db: Session = Depends(get_db),
+):
     get_project_or_404(db, project_id)
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    entry = resolve_project_entrypoint(entries, entrypoint)
+    normalized_entrypoint = entry.path
+
     sync_project_workspace(project_id, entries)
 
     try:
         response = requests.post(
             COMPILER_URL,
-            json={'project_id': project_id},
+            json={'project_id': project_id, 'entrypoint': normalized_entrypoint},
             timeout=COMPILER_TIMEOUT_SECONDS,
         )
         payload = response.json()
@@ -794,12 +874,13 @@ def download_pdf(project_id: int, db: Session = Depends(get_db)):
     if payload.get('status') != 'success':
         raise HTTPException(status_code=400, detail=payload.get('message') or 'Failed to export PDF')
 
-    pdf_path = get_project_dir(project_id) / 'main.pdf'
+    pdf_relative_path = Path(normalized_entrypoint).with_suffix('.pdf')
+    pdf_path = get_project_dir(project_id) / pdf_relative_path
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail='PDF not found')
     return FileResponse(
         pdf_path,
         media_type='application/pdf',
-        filename='main.pdf',
+        filename=pdf_relative_path.name,
         content_disposition_type='attachment',
     )
