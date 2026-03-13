@@ -13,6 +13,9 @@ const TinymistPreview = forwardRef(function TinymistPreview(
   ref,
 ) {
   const iframeRef = useRef(null)
+  const lastSentZoomRef = useRef(Number.NaN)
+  const pendingZoomTargetRef = useRef(null)
+  const suppressZoomEchoUntilRef = useRef(0)
   const [frameState, setFrameState] = useState('loading')
 
   const targetOrigin = useMemo(() => {
@@ -30,6 +33,17 @@ const TinymistPreview = forwardRef(function TinymistPreview(
     return true
   }
   const postPreviewMessage = useEffectEvent((message) => postMessage(message))
+  const sendZoomToPreview = useEffectEvent((nextZoom, force = false) => {
+    const normalizedZoom = Number(nextZoom) || 1
+    if (!force && Math.abs(lastSentZoomRef.current - normalizedZoom) < 0.0001) {
+      return false
+    }
+
+    lastSentZoomRef.current = normalizedZoom
+    pendingZoomTargetRef.current = normalizedZoom
+    suppressZoomEchoUntilRef.current = Date.now() + 2200
+    return postPreviewMessage({ type: 'setZoom', zoom: normalizedZoom })
+  })
 
   useImperativeHandle(ref, () => ({
     revealCursor(payload) {
@@ -39,8 +53,8 @@ const TinymistPreview = forwardRef(function TinymistPreview(
 
   useEffect(() => {
     if (frameState !== 'ready') return
-    postPreviewMessage({ type: 'setZoom', zoom })
-  }, [frameState, zoom])
+    sendZoomToPreview(zoom)
+  }, [frameState, sendZoomToPreview, zoom])
 
   useEffect(() => {
     if (!onJumpToSource && !onZoomChange) return undefined
@@ -53,7 +67,30 @@ const TinymistPreview = forwardRef(function TinymistPreview(
         onJumpToSource(message.payload)
       }
       if (message.type === 'previewZoomChange' && onZoomChange) {
-        onZoomChange(message.payload?.zoom ?? 1)
+        const nextZoom = message.payload?.zoom ?? 1
+        const pendingZoomTarget = pendingZoomTargetRef.current
+
+        if (Number.isFinite(pendingZoomTarget)) {
+          if (Math.abs(nextZoom - pendingZoomTarget) < 0.05) {
+            pendingZoomTargetRef.current = null
+            suppressZoomEchoUntilRef.current = 0
+            return
+          }
+
+          if (Date.now() < suppressZoomEchoUntilRef.current) {
+            return
+          }
+
+          pendingZoomTargetRef.current = null
+        }
+
+        if (
+          Date.now() < suppressZoomEchoUntilRef.current
+          && Math.abs(nextZoom - lastSentZoomRef.current) < 0.05
+        ) {
+          return
+        }
+        onZoomChange(nextZoom)
       }
     }
 
@@ -74,7 +111,7 @@ const TinymistPreview = forwardRef(function TinymistPreview(
         onLoad={() => {
           setFrameState('ready')
           window.setTimeout(() => {
-            postPreviewMessage({ type: 'setZoom', zoom })
+            sendZoomToPreview(zoom, true)
           }, 0)
         }}
         src={src}

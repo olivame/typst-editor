@@ -1491,7 +1491,8 @@ export default function Editor({ projectId, onBack }) {
   }
 
   function handlePreviewZoomChange(nextZoom) {
-    setPreviewZoom(findNearestPreviewZoom(nextZoom))
+    const snappedZoom = findNearestPreviewZoom(nextZoom)
+    setPreviewZoom((current) => (Math.abs(current - snappedZoom) < 0.0001 ? current : snappedZoom))
   }
 
   function changeEditorZoom(delta) {

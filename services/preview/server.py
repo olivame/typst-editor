@@ -322,6 +322,7 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
       let currentZoom = 1;
       let eventSocket = null;
       let zoomSyncTimer = null;
+      let activeZoomTask = 0;
 
       function setStatus(message) {{
         if (!message) {{
@@ -426,12 +427,16 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
         return true;
       }}
 
-      function ensureNativeZoom(value, attempts = 24) {{
+      function ensureNativeZoom(value, attempts = 24, zoomTaskId = activeZoomTask) {{
+        if (zoomTaskId !== activeZoomTask) {{
+          return;
+        }}
+
         if (applyNativeZoom(value) || attempts <= 0) {{
           return;
         }}
 
-        window.setTimeout(() => ensureNativeZoom(value, attempts - 1), 80);
+        window.setTimeout(() => ensureNativeZoom(value, attempts - 1, zoomTaskId), 80);
       }}
 
       function notifyParent(message) {{
@@ -581,7 +586,8 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
 
         if (message.type === "setZoom") {{
           currentZoom = message.zoom || 1;
-          ensureNativeZoom(currentZoom);
+          activeZoomTask += 1;
+          ensureNativeZoom(currentZoom, 24, activeZoomTask);
           return;
         }}
 
@@ -628,6 +634,7 @@ def make_bridge_script(project_id: int, entrypoint: str) -> str:
   ];
   let eventSocket = null;
   let zoomSyncTimer = null;
+  let activeZoomTask = 0;
   let activeRevealToken = 0;
   let cursorCleanupObserver = null;
   let cursorCleanupFrame = 0;
@@ -742,11 +749,15 @@ def make_bridge_script(project_id: int, entrypoint: str) -> str:
     return true;
   }}
 
-  function ensureNativeZoom(value, attempts = 40) {{
+  function ensureNativeZoom(value, attempts = 40, zoomTaskId = activeZoomTask) {{
+    if (zoomTaskId !== activeZoomTask) {{
+      return;
+    }}
+
     const zoomState = getZoomState();
     if (!zoomState) {{
       if (attempts > 0) {{
-        window.setTimeout(() => ensureNativeZoom(value, attempts - 1), 80);
+        window.setTimeout(() => ensureNativeZoom(value, attempts - 1, zoomTaskId), 80);
       }}
       return;
     }}
@@ -762,7 +773,7 @@ def make_bridge_script(project_id: int, entrypoint: str) -> str:
     const pageX = viewportRect.width / 2;
     const pageY = viewportRect.height / 2;
     applyTinymistZoomStep(targetZoom > currentZoom ? -1 : 1, pageX, pageY);
-    window.setTimeout(() => ensureNativeZoom(targetZoom, attempts - 1), 45);
+    window.setTimeout(() => ensureNativeZoom(targetZoom, attempts - 1, zoomTaskId), 45);
   }}
 
   function ensureFlashStyle() {{
@@ -956,7 +967,8 @@ def make_bridge_script(project_id: int, entrypoint: str) -> str:
     }}
 
     if (message.type === "setZoom") {{
-      ensureNativeZoom(message.zoom || 1);
+      activeZoomTask += 1;
+      ensureNativeZoom(message.zoom || 1, 40, activeZoomTask);
       return;
     }}
 
