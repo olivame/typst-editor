@@ -105,11 +105,13 @@ function formatProjectDate(value) {
 
 export default function ProjectList({ onOpenProject }) {
   const actionMenuTriggerRefs = useRef({})
+  const headerCheckboxRef = useRef(null)
   const [projects, setProjects] = useState([])
   const [selectedView, setSelectedView] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [activeProjectAction, setActiveProjectAction] = useState('')
+  const [selectedProjectIds, setSelectedProjectIds] = useState([])
   const [openActionMenuProjectId, setOpenActionMenuProjectId] = useState(null)
   const [actionMenuPosition, setActionMenuPosition] = useState(null)
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false)
@@ -165,6 +167,39 @@ export default function ProjectList({ onOpenProject }) {
     const currentItem = SIDEBAR_ITEMS.find((item) => item.id === selectedView)
     return currentItem?.label || 'All projects'
   }, [selectedView])
+
+  const visibleProjectIds = useMemo(
+    () => filteredProjects.map((project) => project.id),
+    [filteredProjects],
+  )
+
+  const selectedProjectIdSet = useMemo(
+    () => new Set(selectedProjectIds),
+    [selectedProjectIds],
+  )
+
+  const selectedProjects = useMemo(
+    () => filteredProjects.filter((project) => selectedProjectIdSet.has(project.id)),
+    [filteredProjects, selectedProjectIdSet],
+  )
+
+  const allVisibleSelected = visibleProjectIds.length > 0
+    && visibleProjectIds.every((projectId) => selectedProjectIdSet.has(projectId))
+  const someVisibleSelected = visibleProjectIds.some((projectId) => selectedProjectIdSet.has(projectId))
+    && !allVisibleSelected
+
+  useEffect(() => {
+    if (!headerCheckboxRef.current) return
+    headerCheckboxRef.current.indeterminate = someVisibleSelected
+  }, [someVisibleSelected])
+
+  useEffect(() => {
+    const visibleIdSet = new Set(visibleProjectIds)
+    setSelectedProjectIds((currentIds) => {
+      const nextIds = currentIds.filter((projectId) => visibleIdSet.has(projectId))
+      return nextIds.length === currentIds.length ? currentIds : nextIds
+    })
+  }, [visibleProjectIds])
 
   const openTemplateModal = (template) => {
     if (!template.enabled) return
@@ -244,6 +279,134 @@ export default function ProjectList({ onOpenProject }) {
       setConfirmationModal(null)
       setOpenActionMenuProjectId(null)
     }
+  }
+
+  const updateProjectsStatusBatch = async (targetProjects, nextStatus) => {
+    if (activeProjectAction || targetProjects.length === 0) return
+
+    setOpenActionMenuProjectId(null)
+    setActiveProjectAction(`bulk-${nextStatus}`)
+
+    try {
+      const results = await Promise.allSettled(
+        targetProjects.map((project) => updateProjectStatusRequest(project.id, nextStatus)),
+      )
+      const updatedProjects = results
+        .filter((result) => result.status === 'fulfilled')
+        .map((result) => result.value)
+      const failedCount = results.length - updatedProjects.length
+
+      if (updatedProjects.length > 0) {
+        const updatedProjectMap = new Map(updatedProjects.map((project) => [project.id, project]))
+        const updatedIdSet = new Set(updatedProjectMap.keys())
+
+        setProjects((currentProjects) =>
+          currentProjects.map((currentProject) => (
+            updatedProjectMap.get(currentProject.id) || currentProject
+          )),
+        )
+        setSelectedProjectIds((currentIds) => currentIds.filter((projectId) => !updatedIdSet.has(projectId)))
+      }
+
+      if (failedCount > 0) {
+        setErrorMessage(`${updatedProjects.length} projects updated, ${failedCount} failed.`)
+      } else {
+        setErrorMessage('')
+      }
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to update selected projects')
+    } finally {
+      setActiveProjectAction('')
+      setConfirmationModal(null)
+    }
+  }
+
+  const deleteProjectsBatch = async (targetProjects) => {
+    if (activeProjectAction || targetProjects.length === 0) return
+
+    setOpenActionMenuProjectId(null)
+    setActiveProjectAction('bulk-delete')
+
+    try {
+      const results = await Promise.allSettled(
+        targetProjects.map((project) => deleteProjectRequest(project.id)),
+      )
+      const deletedIds = results
+        .map((result, index) => (result.status === 'fulfilled' ? targetProjects[index].id : null))
+        .filter((projectId) => projectId !== null)
+      const deletedIdSet = new Set(deletedIds)
+      const failedCount = results.length - deletedIds.length
+
+      if (deletedIds.length > 0) {
+        setProjects((currentProjects) =>
+          currentProjects.filter((currentProject) => !deletedIdSet.has(currentProject.id)),
+        )
+        setSelectedProjectIds((currentIds) => currentIds.filter((projectId) => !deletedIdSet.has(projectId)))
+      }
+
+      if (failedCount > 0) {
+        setErrorMessage(`${deletedIds.length} projects deleted, ${failedCount} failed.`)
+      } else {
+        setErrorMessage('')
+      }
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to delete selected projects')
+    } finally {
+      setActiveProjectAction('')
+      setConfirmationModal(null)
+    }
+  }
+
+  const toggleProjectSelection = (projectId) => {
+    setSelectedProjectIds((currentIds) => (
+      currentIds.includes(projectId)
+        ? currentIds.filter((currentId) => currentId !== projectId)
+        : [...currentIds, projectId]
+    ))
+  }
+
+  const toggleAllVisibleProjects = () => {
+    setSelectedProjectIds((currentIds) => {
+      if (allVisibleSelected) {
+        const visibleIdSet = new Set(visibleProjectIds)
+        return currentIds.filter((projectId) => !visibleIdSet.has(projectId))
+      }
+
+      const nextIds = new Set(currentIds)
+      visibleProjectIds.forEach((projectId) => nextIds.add(projectId))
+      return Array.from(nextIds)
+    })
+  }
+
+  const batchArchiveProjects = async () => {
+    await updateProjectsStatusBatch(selectedProjects, 'archived')
+  }
+
+  const batchRestoreProjects = async () => {
+    await updateProjectsStatusBatch(selectedProjects, 'active')
+  }
+
+  const confirmBatchDelete = () => {
+    if (selectedProjects.length === 0) return
+
+    if (selectedView === 'trashed') {
+      setConfirmationModal({
+        title: `Delete ${selectedProjects.length} projects permanently?`,
+        description: `${selectedProjects.length} selected projects will be deleted permanently together with their files. This cannot be undone.`,
+        confirmLabel: 'Delete permanently',
+        tone: 'danger',
+        onConfirm: () => deleteProjectsBatch(selectedProjects),
+      })
+      return
+    }
+
+    setConfirmationModal({
+      title: `Move ${selectedProjects.length} projects to trash?`,
+      description: `${selectedProjects.length} selected projects will be moved to Trashed projects. You can restore them later.`,
+      confirmLabel: 'Move to trash',
+      tone: 'danger',
+      onConfirm: () => updateProjectsStatusBatch(selectedProjects, 'trashed'),
+    })
   }
 
   const trashProject = async (project) => {
@@ -411,11 +574,94 @@ export default function ProjectList({ onOpenProject }) {
             </div>
           </div>
 
+          {selectedProjects.length > 0 && (
+            <div style={styles.selectionToolbar}>
+              <div style={styles.selectionSummary}>{selectedProjects.length} selected</div>
+              <div style={styles.selectionActions}>
+                {selectedView === 'trashed' ? (
+                  <>
+                    <button
+                      type="button"
+                      style={styles.selectionActionButton}
+                      onClick={batchRestoreProjects}
+                      disabled={Boolean(activeProjectAction)}
+                    >
+                      {activeProjectAction === 'bulk-active' ? 'Restoring...' : 'Restore'}
+                    </button>
+                    <button
+                      type="button"
+                      style={{ ...styles.selectionActionButton, ...styles.selectionActionButtonDanger }}
+                      onClick={confirmBatchDelete}
+                      disabled={Boolean(activeProjectAction)}
+                    >
+                      {activeProjectAction === 'bulk-delete' ? 'Deleting...' : 'Delete permanently'}
+                    </button>
+                  </>
+                ) : selectedView === 'archived' ? (
+                  <>
+                    <button
+                      type="button"
+                      style={styles.selectionActionButton}
+                      onClick={batchRestoreProjects}
+                      disabled={Boolean(activeProjectAction)}
+                    >
+                      {activeProjectAction === 'bulk-active' ? 'Restoring...' : 'Restore'}
+                    </button>
+                    <button
+                      type="button"
+                      style={{ ...styles.selectionActionButton, ...styles.selectionActionButtonDanger }}
+                      onClick={confirmBatchDelete}
+                      disabled={Boolean(activeProjectAction)}
+                    >
+                      {activeProjectAction === 'bulk-trashed' ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      style={styles.selectionActionButton}
+                      onClick={batchArchiveProjects}
+                      disabled={Boolean(activeProjectAction)}
+                    >
+                      {activeProjectAction === 'bulk-archived' ? 'Archiving...' : 'Archive'}
+                    </button>
+                    <button
+                      type="button"
+                      style={{ ...styles.selectionActionButton, ...styles.selectionActionButtonDanger }}
+                      onClick={confirmBatchDelete}
+                      disabled={Boolean(activeProjectAction)}
+                    >
+                      {activeProjectAction === 'bulk-trashed' ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  style={styles.selectionClearButton}
+                  onClick={() => setSelectedProjectIds([])}
+                  disabled={Boolean(activeProjectAction)}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          )}
+
           {errorMessage && <div style={styles.errorBanner}>{errorMessage}</div>}
 
           <div style={styles.table}>
             <div style={{ ...styles.tableRow, ...styles.tableHead }}>
-              <div style={{ ...styles.tableCell, ...styles.checkboxCell }}>□</div>
+              <div style={{ ...styles.tableCell, ...styles.checkboxCell }}>
+                <input
+                  ref={headerCheckboxRef}
+                  checked={allVisibleSelected}
+                  disabled={visibleProjectIds.length === 0}
+                  onChange={toggleAllVisibleProjects}
+                  style={styles.checkboxInput}
+                  type="checkbox"
+                />
+              </div>
               <div style={{ ...styles.tableCell, ...styles.titleCell }}>Title</div>
               <div style={{ ...styles.tableCell, ...styles.ownerCell }}>Owner</div>
               <div style={{ ...styles.tableCell, ...styles.modifiedCell }}>Last modified ↓</div>
@@ -423,8 +669,22 @@ export default function ProjectList({ onOpenProject }) {
             </div>
 
             {filteredProjects.map((project) => (
-              <div key={project.id} style={styles.tableRow}>
-                <div style={{ ...styles.tableCell, ...styles.checkboxCell }}>□</div>
+              <div
+                key={project.id}
+                style={{
+                  ...styles.tableRow,
+                  ...(selectedProjectIdSet.has(project.id) ? styles.tableRowSelected : null),
+                }}
+              >
+                <div style={{ ...styles.tableCell, ...styles.checkboxCell }}>
+                  <input
+                    aria-label={`Select project ${project.name}`}
+                    checked={selectedProjectIdSet.has(project.id)}
+                    onChange={() => toggleProjectSelection(project.id)}
+                    style={styles.checkboxInput}
+                    type="checkbox"
+                  />
+                </div>
                 <button
                   type="button"
                   onClick={() => onOpenProject(project.id)}
@@ -756,6 +1016,51 @@ const styles = {
     color: '#b42318',
     fontSize: '14px',
   },
+  selectionToolbar: {
+    margin: '0 20px 14px',
+    padding: '12px 14px',
+    borderRadius: '12px',
+    background: '#edf5fd',
+    border: '1px solid #cfe0f4',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '14px',
+  },
+  selectionSummary: {
+    fontSize: '14px',
+    fontWeight: '700',
+    color: '#23476d',
+  },
+  selectionActions: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+  },
+  selectionActionButton: {
+    border: '1px solid #7da3cc',
+    background: '#ffffff',
+    color: '#2c4e74',
+    borderRadius: '999px',
+    padding: '9px 14px',
+    fontSize: '14px',
+    fontWeight: '700',
+    cursor: 'pointer',
+  },
+  selectionActionButtonDanger: {
+    borderColor: '#d7a4a0',
+    color: '#a83f35',
+  },
+  selectionClearButton: {
+    border: 'none',
+    background: 'transparent',
+    color: '#56718f',
+    fontSize: '14px',
+    fontWeight: '600',
+    cursor: 'pointer',
+  },
   table: {
     display: 'flex',
     flexDirection: 'column',
@@ -778,9 +1083,18 @@ const styles = {
     fontSize: '15px',
     color: '#334155',
   },
+  tableRowSelected: {
+    background: '#f5f9fe',
+  },
   checkboxCell: {
     textAlign: 'center',
     color: '#94a3b8',
+  },
+  checkboxInput: {
+    width: '14px',
+    height: '14px',
+    accentColor: '#4f97dd',
+    cursor: 'pointer',
   },
   titleCell: {
     fontWeight: '700',
