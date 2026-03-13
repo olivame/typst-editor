@@ -296,7 +296,7 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
     <div id="viewport">
       <div id="stage">
         <div id="frame-shell">
-          <iframe id="preview-frame" src="/sessions/{project_id}/data?entrypoint={entrypoint}" title="Typst Preview"></iframe>
+          <iframe id="preview-frame" src="data?entrypoint={entrypoint}" title="Typst Preview"></iframe>
         </div>
       </div>
     </div>
@@ -475,7 +475,7 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
       const entrypointParam = {json.dumps(entrypoint)};
 
       async function revealCursor(payload) {{
-        const cursorUrl = new URL(`/sessions/{project_id}/cursor`, window.location.href);
+        const cursorUrl = new URL("cursor", window.location.href);
         cursorUrl.searchParams.set("entrypoint", entrypointParam);
         const response = await fetch(cursorUrl, {{
           method: "POST",
@@ -523,7 +523,7 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ") -> str:
           return;
         }}
 
-        const wsUrl = new URL(`/sessions/{project_id}/events`, window.location.href);
+        const wsUrl = new URL("events", window.location.href);
         wsUrl.searchParams.set("entrypoint", entrypointParam);
         wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
         eventSocket = new WebSocket(wsUrl);
@@ -860,7 +860,7 @@ def make_bridge_script(project_id: int, entrypoint: str) -> str:
 
   async function revealCursor(payload) {{
     const revealToken = ++activeRevealToken;
-    const cursorUrl = new URL(`/sessions/{project_id}/cursor`, window.location.href);
+    const cursorUrl = new URL("cursor", window.location.href);
     cursorUrl.searchParams.set("entrypoint", entrypointParam);
     const response = await fetch(cursorUrl, {{
       method: "POST",
@@ -913,7 +913,7 @@ def make_bridge_script(project_id: int, entrypoint: str) -> str:
       return;
     }}
 
-    const wsUrl = new URL(`/sessions/{project_id}/events`, window.location.href);
+    const wsUrl = new URL("events", window.location.href);
     wsUrl.searchParams.set("entrypoint", entrypointParam);
     wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
     eventSocket = new WebSocket(wsUrl);
@@ -1374,7 +1374,7 @@ async def get_session_status(project_id: int, entrypoint: str = Query("main.typ"
 async def get_wrapper(project_id: int, entrypoint: str = Query("main.typ")) -> RedirectResponse:
     session = await manager.get_session(project_id, entrypoint)
     return RedirectResponse(
-        url=f"/sessions/{project_id}/data?entrypoint={session.entrypoint}",
+        url=f"data?entrypoint={session.entrypoint}",
         status_code=307,
     )
 
@@ -1423,7 +1423,7 @@ async def proxy_data_http(project_id: int, request: Request, asset_path: str = "
         html_text = html_text.replace(
             HTML_WS_SNIPPET,
             (
-                f'let urlObject = new URL("/sessions/{project_id}/ws", window.location.origin);'
+                'let urlObject = new URL("ws", window.location.href);'
                 f'urlObject.searchParams.set("entrypoint", {json.dumps(session.entrypoint)});'
             ),
         )
