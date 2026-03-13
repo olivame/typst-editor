@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   createProject as createProjectRequest,
+  createTag as createTagRequest,
   copyProject as copyProjectRequest,
   deleteProject as deleteProjectRequest,
+  deleteTag as deleteTagRequest,
   listProjectFiles,
   listProjects,
+  listTags,
+  updateProjectTags as updateProjectTagsRequest,
   updateProjectStatus as updateProjectStatusRequest,
   updateFileContent,
 } from './services/projects'
@@ -107,7 +111,9 @@ export default function ProjectList({ onOpenProject }) {
   const actionMenuTriggerRefs = useRef({})
   const headerCheckboxRef = useRef(null)
   const [projects, setProjects] = useState([])
+  const [tags, setTags] = useState([])
   const [selectedView, setSelectedView] = useState('all')
+  const [selectedTagId, setSelectedTagId] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [activeProjectAction, setActiveProjectAction] = useState('')
@@ -119,10 +125,19 @@ export default function ProjectList({ onOpenProject }) {
   const [newProjectName, setNewProjectName] = useState('')
   const [isCreatingProject, setIsCreatingProject] = useState(false)
   const [confirmationModal, setConfirmationModal] = useState(null)
+  const [isTagModalOpen, setIsTagModalOpen] = useState(false)
+  const [newTagName, setNewTagName] = useState('')
+  const [isCreatingTag, setIsCreatingTag] = useState(false)
+  const [editingProjectTags, setEditingProjectTags] = useState(null)
+  const [draftTagIds, setDraftTagIds] = useState([])
+  const [isSavingProjectTags, setIsSavingProjectTags] = useState(false)
 
   useEffect(() => {
-    listProjects()
-      .then(setProjects)
+    Promise.all([listProjects(), listTags()])
+      .then(([loadedProjects, loadedTags]) => {
+        setProjects(loadedProjects)
+        setTags(loadedTags)
+      })
       .catch((error) => setErrorMessage(error.message || 'Failed to load projects'))
   }, [])
 
@@ -150,23 +165,42 @@ export default function ProjectList({ onOpenProject }) {
 
   const filteredProjects = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase()
-    const visibleProjects = projects.filter((project) => {
+    const viewProjects = projects.filter((project) => {
       if (selectedView === 'archived') return project.status === 'archived'
       if (selectedView === 'trashed') return project.status === 'trashed'
       return project.status !== 'trashed' && project.status !== 'archived'
     })
+    const visibleProjects = selectedTagId == null
+      ? viewProjects
+      : viewProjects.filter((project) => project.tags?.some((tag) => tag.id === selectedTagId))
 
     if (!normalizedQuery) return visibleProjects
 
     return visibleProjects.filter((project) =>
       project.name.toLowerCase().includes(normalizedQuery),
     )
-  }, [projects, searchQuery, selectedView])
+  }, [projects, searchQuery, selectedTagId, selectedView])
 
   const viewTitle = useMemo(() => {
     const currentItem = SIDEBAR_ITEMS.find((item) => item.id === selectedView)
     return currentItem?.label || 'All projects'
   }, [selectedView])
+
+  const selectedTag = useMemo(
+    () => tags.find((tag) => tag.id === selectedTagId) || null,
+    [selectedTagId, tags],
+  )
+
+  const tagProjectCounts = useMemo(() => {
+    const counts = new Map()
+    tags.forEach((tag) => counts.set(tag.id, 0))
+    projects.forEach((project) => {
+      project.tags?.forEach((tag) => {
+        counts.set(tag.id, (counts.get(tag.id) || 0) + 1)
+      })
+    })
+    return counts
+  }, [projects, tags])
 
   const visibleProjectIds = useMemo(
     () => filteredProjects.map((project) => project.id),
@@ -200,6 +234,12 @@ export default function ProjectList({ onOpenProject }) {
       return nextIds.length === currentIds.length ? currentIds : nextIds
     })
   }, [visibleProjectIds])
+
+  useEffect(() => {
+    if (selectedTagId == null) return
+    if (tags.some((tag) => tag.id === selectedTagId)) return
+    setSelectedTagId(null)
+  }, [selectedTagId, tags])
 
   const openTemplateModal = (template) => {
     if (!template.enabled) return
@@ -239,6 +279,83 @@ export default function ProjectList({ onOpenProject }) {
     } catch (error) {
       setErrorMessage(error.message || 'Failed to create project')
       setIsCreatingProject(false)
+    }
+  }
+
+  const closeTagModal = () => {
+    setIsTagModalOpen(false)
+    setNewTagName('')
+    setIsCreatingTag(false)
+  }
+
+  const openProjectTagsModal = (project) => {
+    setEditingProjectTags(project)
+    setDraftTagIds(project.tags?.map((tag) => tag.id) || [])
+    setOpenActionMenuProjectId(null)
+    setErrorMessage('')
+  }
+
+  const closeProjectTagsModal = () => {
+    setEditingProjectTags(null)
+    setDraftTagIds([])
+    setIsSavingProjectTags(false)
+  }
+
+  const createTag = async () => {
+    const trimmedName = newTagName.trim()
+    if (!trimmedName || isCreatingTag) return
+
+    setIsCreatingTag(true)
+    try {
+      const createdTag = await createTagRequest(trimmedName)
+      setTags((currentTags) => [...currentTags, createdTag].sort((left, right) => left.name.localeCompare(right.name)))
+      setErrorMessage('')
+      closeTagModal()
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to create tag')
+      setIsCreatingTag(false)
+    }
+  }
+
+  const removeTag = async (tag) => {
+    if (activeProjectAction) return
+
+    setActiveProjectAction(`delete-tag-${tag.id}`)
+    try {
+      await deleteTagRequest(tag.id)
+      setTags((currentTags) => currentTags.filter((currentTag) => currentTag.id !== tag.id))
+      setProjects((currentProjects) => currentProjects.map((project) => ({
+        ...project,
+        tags: (project.tags || []).filter((projectTag) => projectTag.id !== tag.id),
+      })))
+      setDraftTagIds((currentIds) => currentIds.filter((tagId) => tagId !== tag.id))
+      if (selectedTagId === tag.id) {
+        setSelectedTagId(null)
+      }
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to delete tag')
+    } finally {
+      setActiveProjectAction('')
+    }
+  }
+
+  const saveProjectTags = async () => {
+    if (!editingProjectTags || isSavingProjectTags) return
+
+    setIsSavingProjectTags(true)
+    try {
+      const updatedProject = await updateProjectTagsRequest(editingProjectTags.id, draftTagIds)
+      setProjects((currentProjects) =>
+        currentProjects.map((project) => (
+          project.id === updatedProject.id ? updatedProject : project
+        )),
+      )
+      setErrorMessage('')
+      closeProjectTagsModal()
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to update project tags')
+      setIsSavingProjectTags(false)
     }
   }
 
@@ -471,6 +588,9 @@ export default function ProjectList({ onOpenProject }) {
     if (selectedView === 'archived') {
       return (
         <>
+          <button type="button" style={styles.actionMenuItem} onClick={() => openProjectTagsModal(project)}>
+            Tags
+          </button>
           <button type="button" style={styles.actionMenuItem} onClick={() => restoreProject(project)}>
             Restore
           </button>
@@ -485,6 +605,9 @@ export default function ProjectList({ onOpenProject }) {
       <>
         <button type="button" style={styles.actionMenuItem} onClick={() => copyProject(project)}>
           {activeProjectAction === `copy-${project.id}` ? 'Copying...' : 'Copy'}
+        </button>
+        <button type="button" style={styles.actionMenuItem} onClick={() => openProjectTagsModal(project)}>
+          Tags
         </button>
         <button type="button" style={styles.actionMenuItem} onClick={() => archiveProject(project)}>
           {activeProjectAction === `archived-${project.id}` ? 'Archiving...' : 'Archive'}
@@ -551,13 +674,61 @@ export default function ProjectList({ onOpenProject }) {
 
         <div style={styles.sidebarSection}>
           <div style={styles.sidebarSectionTitle}>Organize tags</div>
-          <button type="button" style={styles.tagButton}>+ New tag</button>
+          <button type="button" style={styles.tagButton} onClick={() => setIsTagModalOpen(true)}>
+            + New tag
+          </button>
+          {tags.length > 0 ? (
+            <div style={styles.tagList}>
+              <button
+                type="button"
+                onClick={() => setSelectedTagId(null)}
+                style={{
+                  ...styles.tagListItem,
+                  ...(selectedTagId == null ? styles.tagListItemActive : null),
+                }}
+              >
+                <span>All tags</span>
+                <span style={styles.tagCount}>{projects.filter((project) => (project.tags || []).length > 0).length}</span>
+              </button>
+              {tags.map((tag) => (
+                <div
+                  key={tag.id}
+                  style={{
+                    ...styles.tagListRow,
+                    ...(selectedTagId === tag.id ? styles.tagListRowActive : null),
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTagId(tag.id)}
+                    style={{
+                      ...styles.tagListItem,
+                      ...(selectedTagId === tag.id ? styles.tagListItemActive : null),
+                    }}
+                  >
+                    <span style={styles.tagLabel}>{tag.name}</span>
+                    <span style={styles.tagCount}>{tagProjectCounts.get(tag.id) || 0}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => removeTag(tag)}
+                    style={styles.tagDeleteButton}
+                    title={`Delete tag ${tag.name}`}
+                  >
+                    {activeProjectAction === `delete-tag-${tag.id}` ? '…' : '×'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
       </aside>
 
       <main style={styles.main}>
         <div style={styles.topbar}>
-          <div style={styles.pageTitle}>{viewTitle}</div>
+          <div style={styles.pageTitle}>
+            {selectedTag ? `${viewTitle} · ${selectedTag.name}` : viewTitle}
+          </div>
           <button type="button" style={styles.accountButton}>Admin ▾</button>
         </div>
 
@@ -690,7 +861,16 @@ export default function ProjectList({ onOpenProject }) {
                   onClick={() => onOpenProject(project.id)}
                   style={{ ...styles.tableCell, ...styles.titleButton }}
                 >
-                  {project.name}
+                  <div style={styles.projectTitleStack}>
+                    <span>{project.name}</span>
+                    {project.tags?.length ? (
+                      <span style={styles.projectTagRow}>
+                        {project.tags.map((tag) => (
+                          <span key={tag.id} style={styles.projectTagChip}>{tag.name}</span>
+                        ))}
+                      </span>
+                    ) : null}
+                  </div>
                 </button>
                 <div style={{ ...styles.tableCell, ...styles.ownerCell }}>You</div>
                 <div style={{ ...styles.tableCell, ...styles.modifiedCell }}>
@@ -768,6 +948,103 @@ export default function ProjectList({ onOpenProject }) {
                 disabled={!newProjectName.trim() || isCreatingProject}
               >
                 {isCreatingProject ? 'Creating...' : 'Create'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isTagModalOpen && (
+        <div style={styles.modalOverlay} onClick={closeTagModal}>
+          <div style={styles.tagModal} onClick={(event) => event.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div style={styles.modalTitle}>New tag</div>
+              <button type="button" style={styles.modalClose} onClick={closeTagModal}>×</button>
+            </div>
+            <div style={styles.modalBody}>
+              <label style={styles.modalLabel} htmlFor="new-tag-name">
+                Tag name
+              </label>
+              <input
+                id="new-tag-name"
+                value={newTagName}
+                onChange={(event) => setNewTagName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    createTag()
+                  }
+                }}
+                style={styles.modalInput}
+                autoFocus
+              />
+            </div>
+            <div style={styles.modalFooter}>
+              <button type="button" onClick={closeTagModal} style={styles.modalSecondaryButton}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={createTag}
+                style={{
+                  ...styles.modalPrimaryButton,
+                  ...(newTagName.trim() && !isCreatingTag ? styles.modalPrimaryButtonEnabled : styles.modalPrimaryButtonDisabled),
+                }}
+                disabled={!newTagName.trim() || isCreatingTag}
+              >
+                {isCreatingTag ? 'Creating...' : 'Create'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editingProjectTags && (
+        <div style={styles.modalOverlay} onClick={closeProjectTagsModal}>
+          <div style={styles.tagModal} onClick={(event) => event.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div style={styles.modalTitle}>Project tags</div>
+              <button type="button" style={styles.modalClose} onClick={closeProjectTagsModal}>×</button>
+            </div>
+            <div style={styles.modalBody}>
+              <div style={styles.modalLabel}>{editingProjectTags.name}</div>
+              {tags.length > 0 ? (
+                <div style={styles.projectTagSelectionList}>
+                  {tags.map((tag) => (
+                    <label key={tag.id} style={styles.projectTagSelectionItem}>
+                      <input
+                        checked={draftTagIds.includes(tag.id)}
+                        onChange={() => {
+                          setDraftTagIds((currentIds) => (
+                            currentIds.includes(tag.id)
+                              ? currentIds.filter((currentId) => currentId !== tag.id)
+                              : [...currentIds, tag.id]
+                          ))
+                        }}
+                        style={styles.checkboxInput}
+                        type="checkbox"
+                      />
+                      <span>{tag.name}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div style={styles.emptyTagHint}>Create a tag first, then assign it here.</div>
+              )}
+            </div>
+            <div style={styles.modalFooter}>
+              <button type="button" onClick={closeProjectTagsModal} style={styles.modalSecondaryButton}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={saveProjectTags}
+                style={{
+                  ...styles.modalPrimaryButton,
+                  ...(isSavingProjectTags ? styles.modalPrimaryButtonDisabled : styles.modalPrimaryButtonEnabled),
+                }}
+                disabled={isSavingProjectTags}
+              >
+                {isSavingProjectTags ? 'Saving...' : 'Save'}
               </button>
             </div>
           </div>
@@ -952,6 +1229,69 @@ const styles = {
     cursor: 'pointer',
     fontSize: '15px',
   },
+  tagList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  },
+  tagListRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+  },
+  tagListRowActive: {
+    background: '#eef5fd',
+    borderRadius: '10px',
+  },
+  tagListItem: {
+    border: 'none',
+    background: 'transparent',
+    color: '#475569',
+    padding: '8px 10px',
+    borderRadius: '10px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '10px',
+    width: '100%',
+    cursor: 'pointer',
+    fontSize: '14px',
+    textAlign: 'left',
+  },
+  tagListItemActive: {
+    color: '#163a63',
+    fontWeight: '700',
+  },
+  tagLabel: {
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  tagCount: {
+    minWidth: '22px',
+    height: '22px',
+    borderRadius: '999px',
+    background: '#dde8f5',
+    color: '#4b6684',
+    fontSize: '12px',
+    fontWeight: '700',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '0 6px',
+  },
+  tagDeleteButton: {
+    border: 'none',
+    background: 'transparent',
+    color: '#7c8da0',
+    width: '28px',
+    height: '28px',
+    borderRadius: '999px',
+    cursor: 'pointer',
+    fontSize: '18px',
+    lineHeight: 1,
+    flexShrink: 0,
+  },
   main: {
     flex: 1,
     padding: '26px 28px',
@@ -1109,6 +1449,27 @@ const styles = {
     color: '#0f172a',
     cursor: 'pointer',
   },
+  projectTitleStack: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    padding: '10px 0',
+  },
+  projectTagRow: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '6px',
+  },
+  projectTagChip: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    borderRadius: '999px',
+    background: '#e9f1fa',
+    color: '#476788',
+    fontSize: '12px',
+    fontWeight: '700',
+    padding: '4px 8px',
+  },
   ownerCell: {
     color: '#475569',
   },
@@ -1193,6 +1554,14 @@ const styles = {
     overflow: 'hidden',
     boxShadow: '0 30px 80px rgba(15, 23, 42, 0.28)',
   },
+  tagModal: {
+    width: '100%',
+    maxWidth: '460px',
+    background: '#fff',
+    borderRadius: '18px',
+    overflow: 'hidden',
+    boxShadow: '0 30px 80px rgba(15, 23, 42, 0.28)',
+  },
   modalHeader: {
     display: 'flex',
     alignItems: 'center',
@@ -1243,6 +1612,25 @@ const styles = {
     borderRadius: '10px',
     outline: 'none',
     fontSize: '15px',
+  },
+  projectTagSelectionList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+    marginTop: '8px',
+  },
+  projectTagSelectionItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    fontSize: '15px',
+    color: '#334155',
+  },
+  emptyTagHint: {
+    fontSize: '14px',
+    color: '#64748b',
+    lineHeight: '1.5',
+    marginTop: '6px',
   },
   modalFooter: {
     display: 'flex',

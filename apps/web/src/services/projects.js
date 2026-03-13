@@ -25,6 +25,29 @@ export async function createProject(name) {
   return parseJsonResponse(response)
 }
 
+export async function listTags() {
+  const response = await fetch(`${API_URL}/tags`)
+  return parseJsonResponse(response)
+}
+
+export async function createTag(name) {
+  const response = await fetch(`${API_URL}/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function deleteTag(tagId) {
+  const response = await fetch(`${API_URL}/tags/${tagId}`, {
+    method: 'DELETE',
+  })
+
+  return parseJsonResponse(response)
+}
+
 export async function copyProject(projectId) {
   const response = await fetch(`${API_URL}/projects/${projectId}/copy`, {
     method: 'POST',
@@ -46,6 +69,16 @@ export async function updateProjectStatus(projectId, status) {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ status }),
+  })
+
+  return parseJsonResponse(response)
+}
+
+export async function updateProjectTags(projectId, tagIds) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/tags`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tag_ids: tagIds }),
   })
 
   return parseJsonResponse(response)

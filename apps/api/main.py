@@ -88,6 +88,14 @@ class FilePathUpdate(BaseModel):
     path: str
 
 
+class TagCreate(BaseModel):
+    name: str
+
+
+class ProjectTagsUpdate(BaseModel):
+    tag_ids: list[int]
+
+
 class ProjectCompileRequest(BaseModel):
     entrypoint: str = ''
 
@@ -116,6 +124,20 @@ def serialize_project(project: models.Project):
         'name': project.name,
         'status': project.status,
         'created_at': project.created_at,
+        'tags': [
+            {
+                'id': tag.id,
+                'name': tag.name,
+            }
+            for tag in sorted(project.tags, key=lambda current_tag: current_tag.name.lower())
+        ],
+    }
+
+
+def serialize_tag(tag: models.Tag):
+    return {
+        'id': tag.id,
+        'name': tag.name,
     }
 
 
@@ -294,6 +316,15 @@ def make_unique_project_name(db: Session, base_name: str):
         suffix += 1
 
 
+def normalize_tag_name(raw_name: str):
+    normalized = (raw_name or '').strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail='Tag name is required')
+    if len(normalized) > 64:
+        raise HTTPException(status_code=400, detail='Tag name must be 64 characters or fewer')
+    return normalized
+
+
 def get_project_entries_map(db: Session, project_id: int):
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     return {entry.path: entry for entry in entries}
@@ -467,6 +498,38 @@ def list_projects(db: Session = Depends(get_db)):
     return [serialize_project(project) for project in projects]
 
 
+@app.get('/tags')
+def list_tags(db: Session = Depends(get_db)):
+    tags = db.query(models.Tag).order_by(models.Tag.name.asc()).all()
+    return [serialize_tag(tag) for tag in tags]
+
+
+@app.post('/tags')
+def create_tag(payload: TagCreate, db: Session = Depends(get_db)):
+    normalized_name = normalize_tag_name(payload.name)
+    existing_tag = db.query(models.Tag).filter(models.Tag.name == normalized_name).first()
+    if existing_tag:
+        raise HTTPException(status_code=409, detail='Tag already exists')
+
+    tag = models.Tag(name=normalized_name)
+    db.add(tag)
+    db.commit()
+    db.refresh(tag)
+    return serialize_tag(tag)
+
+
+@app.delete('/tags/{tag_id}')
+def delete_tag(tag_id: int, db: Session = Depends(get_db)):
+    tag = db.query(models.Tag).filter(models.Tag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail='Tag not found')
+
+    tag.projects = []
+    db.delete(tag)
+    db.commit()
+    return {'status': 'success', 'id': tag_id}
+
+
 @app.post('/projects/{project_id}/copy')
 def copy_project(project_id: int, db: Session = Depends(get_db)):
     project = get_project_or_404(db, project_id)
@@ -476,6 +539,7 @@ def copy_project(project_id: int, db: Session = Depends(get_db)):
         status='active',
     )
     db.add(copied_project)
+    copied_project.tags = list(project.tags)
     db.commit()
     db.refresh(copied_project)
 
@@ -524,10 +588,31 @@ def update_project_status(
     return serialize_project(project)
 
 
+@app.patch('/projects/{project_id}/tags')
+def update_project_tags(
+    project_id: int,
+    payload: ProjectTagsUpdate,
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    tag_ids = list(dict.fromkeys(payload.tag_ids or []))
+    tags = []
+    if tag_ids:
+        tags = db.query(models.Tag).filter(models.Tag.id.in_(tag_ids)).all()
+        if len(tags) != len(tag_ids):
+            raise HTTPException(status_code=404, detail='One or more tags were not found')
+
+    project.tags = sorted(tags, key=lambda tag: tag.name.lower())
+    db.commit()
+    db.refresh(project)
+    return serialize_project(project)
+
+
 @app.delete('/projects/{project_id}')
 def delete_project(project_id: int, db: Session = Depends(get_db)):
     project = get_project_or_404(db, project_id)
 
+    project.tags = []
     db.delete(project)
     db.commit()
 
