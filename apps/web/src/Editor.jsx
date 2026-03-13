@@ -135,6 +135,15 @@ function getAdjacentPreviewZoom(current, direction) {
   return nearest
 }
 
+function areFolderStatesEqual(left, right) {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+
+  if (leftKeys.length !== rightKeys.length) return false
+
+  return rightKeys.every((key) => left[key] === right[key])
+}
+
 function getSelectionOffset(content, line, character) {
   const lines = content.split('\n')
   const boundedLine = Math.max(0, Math.min(line, lines.length - 1))
@@ -871,6 +880,8 @@ export default function Editor({ projectId, onBack }) {
   const [content, setContent] = useState('')
   const [statusMessage, setStatusMessage] = useState('')
   const [sidebarMode, setSidebarMode] = useState('files')
+  const [fileTreeCollapsedStateByProject, setFileTreeCollapsedStateByProject] = useState({})
+  const [lastOpenedFilePathByProject, setLastOpenedFilePathByProject] = useState({})
   const [editorZoom, setEditorZoom] = useState(1)
   const [previewZoom, setPreviewZoom] = useState(1)
   const [isPreviewDetached, setIsPreviewDetached] = useState(false)
@@ -889,10 +900,33 @@ export default function Editor({ projectId, onBack }) {
   const [activePreviewPath, setActivePreviewPath] = useState('main.typ')
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
+  const fileTreeCollapsedFolders = fileTreeCollapsedStateByProject[projectId] || {}
+  const lastOpenedFilePath = lastOpenedFilePathByProject[projectId] || ''
   const editorFontSize = Math.round(15 * editorZoom * 10) / 10
   const editorLineHeight = Math.round(24 * editorZoom * 10) / 10
   const lineNumberFontSize = Math.round(13 * editorZoom * 10) / 10
   const gutterWidth = Math.max(52, Math.round(52 * editorZoom))
+
+  const updateFileTreeCollapsedFolders = (updater) => {
+    setFileTreeCollapsedStateByProject((current) => {
+      const projectState = current[projectId] || {}
+      const nextProjectState = typeof updater === 'function'
+        ? updater(projectState)
+        : updater
+
+      if (
+        nextProjectState === projectState
+        || areFolderStatesEqual(projectState, nextProjectState)
+      ) {
+        return current
+      }
+
+      return {
+        ...current,
+        [projectId]: nextProjectState,
+      }
+    })
+  }
 
   function showStatus(message, duration = 0) {
     if (statusTimerRef.current) {
@@ -914,6 +948,14 @@ export default function Editor({ projectId, onBack }) {
     setSelectedEntry(entry)
     if (isTypEntry(entry)) {
       setActivePreviewPath(entry.path)
+    }
+
+    if (entry?.kind === 'file' && !entry?.is_binary) {
+      setLastOpenedFilePathByProject((current) => (
+        current[projectId] === entry.path
+          ? current
+          : { ...current, [projectId]: entry.path }
+      ))
     }
 
     if (entry.kind === 'folder' || entry.is_binary) {
@@ -1006,6 +1048,22 @@ export default function Editor({ projectId, onBack }) {
       }
     }
   }, [projectId])
+
+  useEffect(() => {
+    if (sidebarMode !== 'files') return
+    if (selectedEntry?.kind === 'file' && !selectedEntry?.is_binary) return
+    if (!lastOpenedFilePath) return
+
+    const matchingEntry = files.find((entry) => (
+      entry.path === lastOpenedFilePath
+      && entry.kind === 'file'
+      && !entry.is_binary
+    ))
+
+    if (!matchingEntry) return
+
+    void selectEntry(matchingEntry)
+  }, [files, lastOpenedFilePath, selectedEntry, sidebarMode])
 
   useEffect(() => {
     let isCancelled = false
@@ -1823,7 +1881,9 @@ export default function Editor({ projectId, onBack }) {
 
         {sidebarMode === 'files' ? (
           <FileSidebar
+            collapsedFolders={fileTreeCollapsedFolders}
             entries={files}
+            onCollapsedFoldersChange={updateFileTreeCollapsedFolders}
             onClose={() => setSidebarMode('')}
             onCreateFile={handleCreateFile}
             onCreateFolder={handleCreateFolder}
@@ -1832,6 +1892,7 @@ export default function Editor({ projectId, onBack }) {
             onRenameEntry={handleRenameEntry}
             onSelectEntry={selectEntry}
             onUploadFiles={handleUploadFiles}
+            projectId={projectId}
             selectedEntry={selectedEntry}
           />
         ) : null}

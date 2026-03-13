@@ -1,4 +1,9 @@
 import { useEffect, useState } from 'react'
+import {
+  APP_SIDEBAR_BACKGROUND,
+  APP_SIDEBAR_BORDER,
+  APP_SIDEBAR_WIDTH,
+} from '../config/sidebar'
 
 export default function SearchSidebar({ onClose, onOpenResult, onSearch }) {
   const [query, setQuery] = useState('')
@@ -87,13 +92,14 @@ export default function SearchSidebar({ onClose, onOpenResult, onSearch }) {
 
 const styles = {
   sidebar: {
-    width: '282px',
+    width: APP_SIDEBAR_WIDTH,
     height: '100%',
     display: 'flex',
     flexDirection: 'column',
-    background: '#f3f4f6',
+    background: APP_SIDEBAR_BACKGROUND,
     color: '#334155',
-    borderRight: '1px solid #d3d8e0',
+    borderRight: `1px solid ${APP_SIDEBAR_BORDER}`,
+    flexShrink: 0,
   },
   header: {
     padding: '12px 10px',

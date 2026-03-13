@@ -1,3 +1,9 @@
+import {
+  APP_SIDEBAR_BACKGROUND,
+  APP_SIDEBAR_BORDER,
+  APP_SIDEBAR_WIDTH,
+} from '../config/sidebar'
+
 function formatOutlineTitle(item) {
   if (typeof item?.title === 'string' && item.title.trim()) return item.title.trim()
   if (typeof item?.text === 'string' && item.text.trim()) return item.text.trim()
@@ -139,13 +145,14 @@ export default function OutlineSidebar({ items, onClose, onSelectItem }) {
 
 const styles = {
   sidebar: {
-    width: '308px',
+    width: APP_SIDEBAR_WIDTH,
     height: '100%',
     display: 'flex',
     flexDirection: 'column',
-    background: '#f3f4f6',
+    background: APP_SIDEBAR_BACKGROUND,
     color: '#334155',
-    borderRight: '1px solid #d3d8e0',
+    borderRight: `1px solid ${APP_SIDEBAR_BORDER}`,
+    flexShrink: 0,
   },
   header: {
     padding: '12px 10px',

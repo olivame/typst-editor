@@ -1,4 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  APP_SIDEBAR_BACKGROUND,
+  APP_SIDEBAR_BORDER,
+  APP_SIDEBAR_WIDTH,
+} from '../config/sidebar'
+import { ensureSetiFont, getSetiFileIcon } from '../config/setiFileIcons'
 
 function getParentPath(path) {
   if (!path || !path.includes('/')) return ''
@@ -7,6 +13,19 @@ function getParentPath(path) {
 
 function joinPath(parentPath, childName) {
   return parentPath ? `${parentPath}/${childName}` : childName
+}
+
+function getAncestorFolderPaths(path) {
+  if (!path || !path.includes('/')) return []
+
+  const parts = path.split('/')
+  const ancestors = []
+
+  for (let index = 1; index < parts.length; index += 1) {
+    ancestors.push(parts.slice(0, index).join('/'))
+  }
+
+  return ancestors
 }
 
 function sortNodes(nodes) {
@@ -62,21 +81,67 @@ function buildTree(entries) {
   return root
 }
 
-function getIconForNode(node) {
-  if (node.kind === 'folder') return '▣'
-  if (node.is_binary) return '◫'
-  return '≡'
+function getFolderVisual(isCollapsed) {
+  return {
+    type: 'folder',
+    tone: '#b98724',
+    accent: isCollapsed ? '#f3cf6b' : '#efb94f',
+    background: isCollapsed ? '#fbf1c7' : '#f7e4ac',
+  }
 }
 
-function collectExpandedFolderMap(nodes, targetPath, expanded = {}) {
+function getNodeVisual(node, isCollapsed) {
+  if (node.kind === 'folder') {
+    return getFolderVisual(isCollapsed)
+  }
+
+  return {
+    type: 'file',
+    ...getSetiFileIcon(node.name),
+  }
+}
+
+function collectInitialCollapsedFolders(nodes, collapsed = {}) {
   for (const node of nodes) {
     if (node.kind !== 'folder') continue
-    if (targetPath === node.path || targetPath.startsWith(`${node.path}/`)) {
-      expanded[node.path] = false
-      collectExpandedFolderMap(node.children, targetPath, expanded)
-    }
+    collapsed[node.path] = true
+    collectInitialCollapsedFolders(node.children, collapsed)
   }
-  return expanded
+  return collapsed
+}
+
+function renderNodeIcon(node, isCollapsed) {
+  const visual = getNodeVisual(node, isCollapsed)
+
+  if (visual.type === 'folder') {
+    return (
+      <span style={styles.nodeIcon}>
+        <svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16">
+          <path
+            d="M1.5 4.5a1.5 1.5 0 0 1 1.5-1.5h2.2c.44 0 .85.2 1.13.53l.82.97H13a1.5 1.5 0 0 1 1.5 1.5v.2c0 .28-.22.5-.5.5H2a.5.5 0 0 0-.5.5v4.85A1.5 1.5 0 0 0 3 13.5h9.84a1.5 1.5 0 0 0 1.46-1.18l.95-4.13A1.5 1.5 0 0 0 13.79 6H7.55l-.98-1.17A1.47 1.47 0 0 0 5.43 4.3H3A1.5 1.5 0 0 0 1.5 5.8z"
+            fill={visual.background}
+            stroke={visual.tone}
+            strokeWidth="0.8"
+          />
+          <path d="M1.8 6.2h12.6" stroke={visual.accent} strokeLinecap="round" strokeWidth="1" />
+        </svg>
+      </span>
+    )
+  }
+
+  return (
+    <span style={styles.nodeIcon}>
+      <span
+        aria-hidden="true"
+        style={{
+          ...styles.fileGlyph,
+          color: visual.color,
+        }}
+      >
+        {visual.character}
+      </span>
+    </span>
+  )
 }
 
 function renderTree({
@@ -97,7 +162,6 @@ function renderTree({
     const isCollapsed = Boolean(collapsedFolders[node.path])
     const isActive = activePath === node.path
     const isMenuOpen = menuPath === node.path
-
     return (
       <div key={node.path} style={styles.treeNode}>
         <div
@@ -110,7 +174,7 @@ function renderTree({
           style={{
             ...styles.treeItem,
             ...(isActive ? styles.treeItemActive : null),
-            paddingLeft: `${12 + depth * 18}px`,
+            paddingLeft: `${10 + depth * 16}px`,
           }}
         >
           <button
@@ -122,12 +186,12 @@ function renderTree({
               ...styles.expandButton,
               visibility: isFolder ? 'visible' : 'hidden',
             }}
+            type="button"
           >
-            {isCollapsed ? '▸' : '▾'}
+            {isCollapsed ? '›' : '⌄'}
           </button>
-          <span style={styles.nodeIcon}>{getIconForNode(node)}</span>
+          {renderNodeIcon(node, isCollapsed)}
           <span style={styles.treeLabel}>{node.name}</span>
-          {node.is_binary ? <span style={styles.assetTag}>asset</span> : null}
           {(isActive || isMenuOpen) ? (
             <button
               onClick={(event) => {
@@ -200,6 +264,8 @@ function renderTree({
 }
 
 export default function FileSidebar({
+  collapsedFolders,
+  onCollapsedFoldersChange,
   entries,
   onClose,
   onCreateFile,
@@ -209,18 +275,28 @@ export default function FileSidebar({
   onRenameEntry,
   onSelectEntry,
   onUploadFiles,
+  projectId,
   selectedEntry,
 }) {
   const fileUploadRef = useRef(null)
   const folderUploadRef = useRef(null)
   const sidebarRef = useRef(null)
-  const [collapsedFolders, setCollapsedFolders] = useState({})
   const [createMode, setCreateMode] = useState('')
   const [draftName, setDraftName] = useState('')
   const [actionError, setActionError] = useState('')
   const [menuPath, setMenuPath] = useState('')
 
   const tree = useMemo(() => buildTree(entries), [entries])
+  const defaultCollapsedFolders = useMemo(() => collectInitialCollapsedFolders(tree), [tree])
+  const effectiveCollapsedFolders = useMemo(() => {
+    const next = {}
+    Object.keys(defaultCollapsedFolders).forEach((path) => {
+      next[path] = Object.prototype.hasOwnProperty.call(collapsedFolders, path)
+        ? collapsedFolders[path]
+        : defaultCollapsedFolders[path]
+    })
+    return next
+  }, [collapsedFolders, defaultCollapsedFolders])
 
   const targetDirectory = useMemo(() => {
     if (!selectedEntry) return ''
@@ -229,20 +305,60 @@ export default function FileSidebar({
   }, [selectedEntry])
 
   const handleToggleFolder = (path) => {
-    setCollapsedFolders((current) => ({
+    onCollapsedFoldersChange((current) => ({
       ...current,
-      [path]: !current[path],
+      [path]: !effectiveCollapsedFolders[path],
     }))
   }
 
   useEffect(() => {
-    if (!selectedEntry?.path) return
+    ensureSetiFont()
+  }, [])
 
-    setCollapsedFolders((current) => ({
-      ...current,
-      ...collectExpandedFolderMap(tree, selectedEntry.path),
-    }))
-  }, [selectedEntry?.path, tree])
+  useEffect(() => {
+    onCollapsedFoldersChange((current) => {
+      const next = {}
+      Object.keys(defaultCollapsedFolders).forEach((path) => {
+        next[path] = Object.prototype.hasOwnProperty.call(current, path)
+          ? current[path]
+          : defaultCollapsedFolders[path]
+      })
+      const currentKeys = Object.keys(current)
+      const nextKeys = Object.keys(next)
+      if (
+        currentKeys.length === nextKeys.length
+        && nextKeys.every((path) => current[path] === next[path])
+      ) {
+        return current
+      }
+      return next
+    })
+  }, [defaultCollapsedFolders, onCollapsedFoldersChange])
+
+  useEffect(() => {
+    if (!selectedEntry || selectedEntry.kind !== 'file' || selectedEntry.is_binary) return
+
+    const ancestorPaths = getAncestorFolderPaths(selectedEntry.path)
+    if (ancestorPaths.length === 0) return
+
+    onCollapsedFoldersChange((current) => {
+      let changed = false
+      const next = { ...current }
+
+      ancestorPaths.forEach((path) => {
+        if (next[path] !== false) {
+          next[path] = false
+          changed = true
+        }
+      })
+
+      return changed ? next : current
+    })
+  }, [onCollapsedFoldersChange, selectedEntry])
+
+  useEffect(() => {
+    setMenuPath('')
+  }, [projectId])
 
   const openCreateForm = (mode) => {
     setCreateMode(mode)
@@ -425,7 +541,7 @@ export default function FileSidebar({
       <div style={styles.treeRoot}>
         {tree.length > 0 ? renderTree({
           activePath: selectedEntry?.path || '',
-          collapsedFolders,
+          collapsedFolders: effectiveCollapsedFolders,
           menuPath,
           nodes: tree,
           onDeleteEntry: handleDeleteEntry,
@@ -460,14 +576,15 @@ export default function FileSidebar({
 
 const styles = {
   sidebar: {
-    width: '282px',
+    width: APP_SIDEBAR_WIDTH,
     height: '100%',
     display: 'flex',
     flexDirection: 'column',
-    background: '#f3f4f6',
+    background: APP_SIDEBAR_BACKGROUND,
     color: '#334155',
-    borderRight: '1px solid #d3d8e0',
+    borderRight: `1px solid ${APP_SIDEBAR_BORDER}`,
     boxShadow: 'inset -1px 0 0 rgba(255, 255, 255, 0.5)',
+    flexShrink: 0,
   },
   header: {
     padding: '12px 10px 10px',
@@ -585,8 +702,10 @@ const styles = {
   treeItem: {
     display: 'flex',
     alignItems: 'center',
-    gap: '6px',
-    minHeight: '34px',
+    gap: '5px',
+    minHeight: '28px',
+    paddingTop: '1px',
+    paddingBottom: '1px',
     paddingRight: '12px',
     color: '#334155',
     cursor: 'pointer',
@@ -599,38 +718,44 @@ const styles = {
     borderLeftColor: '#b7dbfb',
   },
   expandButton: {
-    width: '18px',
-    height: '18px',
+    width: '14px',
+    height: '14px',
     border: 'none',
     background: 'transparent',
     color: '#64748b',
     cursor: 'pointer',
-    fontSize: '11px',
+    fontSize: '13px',
+    lineHeight: 1,
     padding: 0,
     outline: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
   },
   nodeIcon: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
     width: '16px',
-    color: '#64748b',
-    fontSize: '12px',
-    textAlign: 'center',
+    height: '16px',
+    flexShrink: 0,
+  },
+  fileGlyph: {
+    fontFamily: 'Seti, monospace',
+    fontSize: '18px',
+    lineHeight: 1,
+    display: 'block',
+    width: '16px',
+    height: '16px',
   },
   treeLabel: {
     flex: 1,
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap',
-    fontSize: '13px',
-    fontWeight: '600',
-  },
-  assetTag: {
-    padding: '2px 6px',
-    borderRadius: '999px',
-    background: '#fef3c7',
-    color: '#a16207',
-    fontSize: '10px',
-    fontWeight: '700',
-    textTransform: 'uppercase',
+    fontSize: '12px',
+    fontWeight: '500',
   },
   menuTrigger: {
     width: '24px',
