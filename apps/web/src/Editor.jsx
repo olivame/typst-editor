@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
+import { useDeferredValue, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import DiagnosticsSidebar from './components/DiagnosticsSidebar'
 import EditorToolbar from './components/EditorToolbar'
 import FileAssetPreview from './components/FileAssetPreview'
@@ -253,21 +253,56 @@ function collectDiagnosticCandidates(node, results, visited = new Set(), depth =
   visited.add(node)
 
   if (Array.isArray(node)) {
-    node.forEach((item) => collectDiagnosticCandidates(item, results, visited, depth + 1))
+    node.forEach((item) => {
+      if (looksLikeDiagnostic(item)) {
+        results.push(item)
+        return
+      }
+
+      collectDiagnosticCandidates(item, results, visited, depth + 1)
+    })
     return
   }
 
-  if (looksLikeDiagnostic(node)) {
+  if (depth === 0 && looksLikeDiagnostic(node)) {
     results.push(node)
   }
 
   Object.entries(node).forEach(([key, value]) => {
     if (
       depth === 0
-      || ['diagnostics', 'errors', 'warnings', 'messages', 'items', 'causes', 'notes', 'status'].includes(key)
+      || ['diagnostics', 'errors', 'warnings', 'messages', 'items', 'status', 'payload', 'result', 'data'].includes(key)
     ) {
       collectDiagnosticCandidates(value, results, visited, depth + 1)
     }
+  })
+}
+
+function extractDiagnosticNotes(candidate, projectId) {
+  const sources = [
+    ...(Array.isArray(candidate?.notes) ? candidate.notes : []),
+    ...(Array.isArray(candidate?.causes) ? candidate.causes : []),
+    ...(Array.isArray(candidate?.relatedInformation) ? candidate.relatedInformation : []),
+    ...(Array.isArray(candidate?.related) ? candidate.related : []),
+    ...(Array.isArray(candidate?.children) ? candidate.children : []),
+  ]
+
+  const uniqueNotes = new Set()
+
+  return sources.flatMap((item) => {
+    const message = extractTextValue(
+      item?.message || item?.reason || item?.error || item?.description || item?.title || item?.label,
+    )
+    if (!message) return []
+
+    const location = normalizePreviewLocation(extractLocation(item), projectId)
+    const label = location
+      ? `${message} (${location.path}:${location.lineNumber}:${(location.startCharacter ?? 0) + 1})`
+      : message
+
+    if (uniqueNotes.has(label)) return []
+    uniqueNotes.add(label)
+    return [label]
   })
 }
 
@@ -325,6 +360,10 @@ function normalizeDiagnostics(status, projectId) {
       path,
       location,
       locationLabel,
+      notes: extractDiagnosticNotes(candidate, projectId),
+      snippet: Array.isArray(candidate?.snippets) && typeof candidate.snippets[0] === 'string'
+        ? candidate.snippets[0]
+        : '',
     })
   })
 
@@ -865,6 +904,7 @@ function FontPicker({
 export default function Editor({ projectId, onBack }) {
   const gutterRef = useRef(null)
   const textareaRef = useRef(null)
+  const lineMeasureRef = useRef(null)
   const statusTimerRef = useRef(null)
   const pendingCursorJumpRef = useRef(null)
   const pendingEditorSelectionRef = useRef(null)
@@ -881,6 +921,7 @@ export default function Editor({ projectId, onBack }) {
   const [statusMessage, setStatusMessage] = useState('')
   const [sidebarMode, setSidebarMode] = useState('files')
   const [fileTreeCollapsedStateByProject, setFileTreeCollapsedStateByProject] = useState({})
+  const [selectedEntryPathByProject, setSelectedEntryPathByProject] = useState({})
   const [lastOpenedFilePathByProject, setLastOpenedFilePathByProject] = useState({})
   const [editorZoom, setEditorZoom] = useState(1)
   const [previewZoom, setPreviewZoom] = useState(1)
@@ -900,8 +941,12 @@ export default function Editor({ projectId, onBack }) {
   const [activePreviewPath, setActivePreviewPath] = useState('main.typ')
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
+  const [wrappedLineLayout, setWrappedLineLayout] = useState([])
+  const [textareaMeasureWidth, setTextareaMeasureWidth] = useState(0)
   const fileTreeCollapsedFolders = fileTreeCollapsedStateByProject[projectId] || {}
+  const rememberedSelectedEntryPath = selectedEntryPathByProject[projectId] || ''
   const lastOpenedFilePath = lastOpenedFilePathByProject[projectId] || ''
+  const deferredContent = useDeferredValue(content)
   const editorFontSize = Math.round(15 * editorZoom * 10) / 10
   const editorLineHeight = Math.round(24 * editorZoom * 10) / 10
   const lineNumberFontSize = Math.round(13 * editorZoom * 10) / 10
@@ -946,6 +991,12 @@ export default function Editor({ projectId, onBack }) {
 
   async function selectEntry(entry) {
     setSelectedEntry(entry)
+    setSelectedEntryPathByProject((current) => (
+      current[projectId] === entry.path
+        ? current
+        : { ...current, [projectId]: entry.path }
+    ))
+
     if (isTypEntry(entry)) {
       setActivePreviewPath(entry.path)
     }
@@ -973,29 +1024,29 @@ export default function Editor({ projectId, onBack }) {
     const nextFiles = await listProjectFiles(projectId)
     setFiles(nextFiles)
 
-    const nextSelectedEntry = preferredPath
-      ? nextFiles.find((entry) => entry.path === preferredPath)
-      : nextFiles.find((entry) => entry.path === selectedEntry?.path)
+    const nextSelectedEntry = nextFiles.find((entry) => (
+      entry.path === (preferredPath || selectedEntry?.path || rememberedSelectedEntryPath)
+    ))
 
-    const fallbackEntry =
-      nextSelectedEntry ||
-      nextFiles.find((entry) => entry.path === 'main.typ') ||
-      nextFiles.find((entry) => entry.kind === 'file') ||
-      nextFiles[0] ||
-      null
-
-    if (!fallbackEntry) {
+    if (!nextSelectedEntry) {
       setSelectedEntry(null)
       setCurrentFile(null)
       setContent('')
-      setActivePreviewPath('')
+      setSelectedEntryPathByProject((current) => (
+        current[projectId]
+          ? { ...current, [projectId]: '' }
+          : current
+      ))
       return
     }
 
-    const nextPreviewEntry = findPreferredTypEntry(nextFiles, preferredPath || activePreviewPath || fallbackEntry.path)
+    const nextPreviewEntry = findPreferredTypEntry(
+      nextFiles,
+      preferredPath || activePreviewPath || nextSelectedEntry.path,
+    )
     setActivePreviewPath(nextPreviewEntry?.path || '')
 
-    await selectEntry(fallbackEntry)
+    await selectEntry(nextSelectedEntry)
   }
 
   useEffect(() => {
@@ -1007,32 +1058,31 @@ export default function Editor({ projectId, onBack }) {
 
       setFiles(nextFiles)
 
-      const fallbackEntry =
-        nextFiles.find((entry) => entry.path === 'main.typ') ||
-        nextFiles.find((entry) => entry.kind === 'file') ||
-        nextFiles[0] ||
-        null
+      const rememberedEntry = rememberedSelectedEntryPath
+        ? nextFiles.find((entry) => entry.path === rememberedSelectedEntryPath) || null
+        : null
 
-      if (!fallbackEntry) {
+      if (!rememberedEntry) {
         setSelectedEntry(null)
         setCurrentFile(null)
         setContent('')
-        setActivePreviewPath('')
+        const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, activePreviewPath)
+        setActivePreviewPath(fallbackPreviewEntry?.path || '')
         return
       }
 
-      const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, fallbackEntry.path)
+      const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, rememberedEntry.path)
       setActivePreviewPath(fallbackPreviewEntry?.path || '')
 
-      setSelectedEntry(fallbackEntry)
+      setSelectedEntry(rememberedEntry)
 
-      if (fallbackEntry.kind === 'folder' || fallbackEntry.is_binary) {
+      if (rememberedEntry.kind === 'folder' || rememberedEntry.is_binary) {
         setCurrentFile(null)
         setContent('')
         return
       }
 
-      const data = await getFileContent(fallbackEntry.id)
+      const data = await getFileContent(rememberedEntry.id)
       if (isCancelled) return
 
       setCurrentFile(data)
@@ -1051,19 +1101,17 @@ export default function Editor({ projectId, onBack }) {
 
   useEffect(() => {
     if (sidebarMode !== 'files') return
-    if (selectedEntry?.kind === 'file' && !selectedEntry?.is_binary) return
-    if (!lastOpenedFilePath) return
+    if (selectedEntry?.path) return
+    if (!rememberedSelectedEntryPath) return
 
     const matchingEntry = files.find((entry) => (
-      entry.path === lastOpenedFilePath
-      && entry.kind === 'file'
-      && !entry.is_binary
+      entry.path === rememberedSelectedEntryPath
     ))
 
     if (!matchingEntry) return
 
     void selectEntry(matchingEntry)
-  }, [files, lastOpenedFilePath, selectedEntry, sidebarMode])
+  }, [files, rememberedSelectedEntryPath, selectedEntry, sidebarMode])
 
   useEffect(() => {
     let isCancelled = false
@@ -1229,7 +1277,7 @@ export default function Editor({ projectId, onBack }) {
     await selectEntry(matchingEntry)
   }
 
-  async function handleSidebarLocationJump(location) {
+  async function handleSidebarLocationJump(location, snippet = '') {
     if (!location?.path || !Array.isArray(location?.start)) return
 
     const matchingEntry = files.find((entry) => entry.path === location.path)
@@ -1241,6 +1289,7 @@ export default function Editor({ projectId, onBack }) {
       startCharacter: location.start[1],
       endLine: location.end?.[0] ?? location.start[0],
       endCharacter: location.end?.[1] ?? location.start[1],
+      lineSnippet: snippet,
     }
     setJumpNonce((current) => current + 1)
 
@@ -1335,23 +1384,55 @@ export default function Editor({ projectId, onBack }) {
         return
       }
 
-      const selectionStart = matchesPreviewJump
+      let selectionStart = matchesPreviewJump
         ? getSelectionOffset(content, pendingCursorJump.startLine, pendingCursorJump.startCharacter)
         : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.start)
-      const selectionEnd = matchesPreviewJump
+      let selectionEnd = matchesPreviewJump
         ? getSelectionOffset(content, pendingCursorJump.endLine, pendingCursorJump.endCharacter)
         : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.end)
+
+      if (
+        matchesPreviewJump
+        && selectionEnd === selectionStart
+        && typeof pendingCursorJump.startLine === 'number'
+      ) {
+        const lines = content.split('\n')
+        const lineIndex = pendingCursorJump.startLine
+        const lineText = lines[lineIndex] || ''
+        const rawSnippet = `${pendingCursorJump.lineSnippet || ''}`.trim()
+        const snippetStart = rawSnippet ? lineText.indexOf(rawSnippet) : -1
+
+        if (snippetStart >= 0) {
+          const lineOffset = getSelectionOffset(content, lineIndex, 0)
+          selectionStart = lineOffset + snippetStart
+          selectionEnd = lineOffset + snippetStart + rawSnippet.length
+        } else {
+          selectionStart = getSelectionOffset(content, lineIndex, 0)
+          selectionEnd = getSelectionOffset(content, lineIndex, lineText.length)
+        }
+      }
 
       textarea.focus()
       textarea.setSelectionRange(selectionStart, selectionEnd)
 
       const lineHeight = editorLineHeight
       const lineNumber = matchesPreviewJump ? pendingCursorJump.startLine + 1 : pendingCursorJump.lineNumber
-      const scrollTop = Math.max((lineNumber - 3) * lineHeight, 0)
-      textarea.scrollTop = scrollTop
-      if (gutterRef.current) {
-        gutterRef.current.scrollTop = scrollTop
+      const gutterLineNode = gutterRef.current?.children?.[Math.max(lineNumber - 1, 0)] || null
+      const targetScrollTop = Math.max(
+        gutterLineNode
+          ? gutterLineNode.offsetTop - (lineHeight * 2)
+          : (lineNumber - 3) * lineHeight,
+        0,
+      )
+      const applyLogicalLineScroll = () => {
+        textarea.scrollTop = targetScrollTop
+        if (gutterRef.current) {
+          gutterRef.current.scrollTop = targetScrollTop
+        }
       }
+
+      applyLogicalLineScroll()
+      window.requestAnimationFrame(applyLogicalLineScroll)
 
       previewApiRef.current?.revealCursor({
         path: currentFile.path,
@@ -1603,19 +1684,103 @@ export default function Editor({ projectId, onBack }) {
     }
   }, [isReferenceMenuOpen, files, currentFile?.id, content])
 
-  const lineCount = useMemo(
-    () => Math.max(content.split('\n').length, 1),
-    [content],
+  const logicalLines = useMemo(
+    () => deferredContent.split('\n'),
+    [deferredContent],
   )
   const fontOptions = useMemo(() => buildFontOptions(availableFonts), [availableFonts])
   const fontSelection = useMemo(
     () => parseFontSelection(content, fontOptions),
     [content, fontOptions],
   )
-  const lineNumbers = useMemo(
-    () => Array.from({ length: lineCount }, (_, index) => index + 1),
-    [lineCount],
+  const lineRows = useMemo(
+    () => wrappedLineLayout.length > 0
+      ? wrappedLineLayout
+      : logicalLines.map((_, index) => ({
+        number: index + 1,
+        height: editorLineHeight,
+      })),
+    [editorLineHeight, logicalLines, wrappedLineLayout],
   )
+
+  useEffect(() => {
+    const textarea = textareaRef.current
+    if (!textarea || selectedEntry?.kind !== 'file' || selectedEntry?.is_binary) return undefined
+
+    const updateMeasureWidth = () => {
+      const computed = window.getComputedStyle(textarea)
+      const nextWidth = Math.max(
+        textarea.clientWidth
+          - Number.parseFloat(computed.paddingLeft || '0')
+          - Number.parseFloat(computed.paddingRight || '0'),
+        0,
+      )
+
+      setTextareaMeasureWidth((current) => (current === nextWidth ? current : nextWidth))
+    }
+
+    updateMeasureWidth()
+
+    const observer = new ResizeObserver(() => {
+      updateMeasureWidth()
+    })
+
+    observer.observe(textarea)
+    return () => observer.disconnect()
+  }, [editorZoom, selectedEntry])
+
+  useEffect(() => {
+    const measureRoot = lineMeasureRef.current
+    const textarea = textareaRef.current
+
+    if (
+      !measureRoot
+      || !textarea
+      || textareaMeasureWidth <= 0
+      || selectedEntry?.kind !== 'file'
+      || selectedEntry?.is_binary
+    ) {
+      setWrappedLineLayout([])
+      return
+    }
+
+    const computed = window.getComputedStyle(textarea)
+    measureRoot.style.width = `${textareaMeasureWidth}px`
+    measureRoot.replaceChildren()
+
+    const fragment = document.createDocumentFragment()
+
+    logicalLines.forEach((line) => {
+      const row = document.createElement('div')
+      row.style.width = `${textareaMeasureWidth}px`
+      row.style.boxSizing = 'border-box'
+      row.style.fontFamily = computed.fontFamily
+      row.style.fontSize = computed.fontSize
+      row.style.lineHeight = computed.lineHeight
+      row.style.letterSpacing = computed.letterSpacing
+      row.style.whiteSpace = 'pre-wrap'
+      row.style.wordBreak = 'normal'
+      row.style.overflowWrap = 'break-word'
+      row.style.tabSize = computed.tabSize
+      row.textContent = line.length > 0 ? line : ' '
+      fragment.appendChild(row)
+    })
+
+    measureRoot.appendChild(fragment)
+
+    const nextLayout = Array.from(measureRoot.children).map((child, index) => {
+      const measuredHeight = Math.max(child.getBoundingClientRect().height, editorLineHeight)
+      const visualLineCount = Math.max(Math.ceil(measuredHeight / editorLineHeight), 1)
+
+      return {
+        number: index + 1,
+        height: visualLineCount * editorLineHeight,
+      }
+    })
+
+    measureRoot.replaceChildren()
+    setWrappedLineLayout(nextLayout)
+  }, [editorLineHeight, logicalLines, selectedEntry, textareaMeasureWidth])
 
   const activePreviewEntry = useMemo(
     () => findPreferredTypEntry(files, activePreviewPath),
@@ -1632,6 +1797,7 @@ export default function Editor({ projectId, onBack }) {
   const previewEntryName = activePreviewEntry?.name || 'No preview'
   const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
+  const shouldShowTypPreview = Boolean(selectedEntry && isTypEntry(selectedEntry))
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
   const diagnostics = useMemo(
     () => normalizeDiagnostics(previewStatus, projectId),
@@ -1642,6 +1808,12 @@ export default function Editor({ projectId, onBack }) {
       && !`${diagnostic.severity || ''}`.toLowerCase().includes('info')).length,
     [diagnostics],
   )
+  const blockingDiagnostics = useMemo(
+    () => diagnostics.filter((diagnostic) => !`${diagnostic.severity || ''}`.toLowerCase().includes('warn')
+      && !`${diagnostic.severity || ''}`.toLowerCase().includes('info')),
+    [diagnostics],
+  )
+  const shouldPauseTypPreview = shouldShowTypPreview && blockingDiagnostics.length > 0
   const outlineItems = useMemo(
     () => normalizeOutlineItems(previewOutline, projectId),
     [previewOutline, projectId],
@@ -1797,7 +1969,17 @@ export default function Editor({ projectId, onBack }) {
 
   const renderPreviewViewport = () => (
     <div ref={setPreviewWheelElement} style={styles.previewFrame}>
-      {activePreviewEntry ? (
+      {shouldPauseTypPreview ? (
+        <div style={styles.previewPausedState}>
+          <div style={styles.previewPausedTitle}>Preview paused</div>
+          <div style={styles.previewPausedText}>
+            {`"${previewEntryName}" has compiler errors. Fix them and the preview will resume automatically.`}
+          </div>
+          {blockingDiagnostics[0]?.locationLabel ? (
+            <div style={styles.previewPausedMeta}>{blockingDiagnostics[0].locationLabel}</div>
+          ) : null}
+        </div>
+      ) : activePreviewEntry ? (
         <TinymistPreview
           ref={previewApiRef}
           key={`${projectId}-${activePreviewEntry.path}-${isPreviewDetached ? 'floating' : 'embedded'}`}
@@ -1917,7 +2099,11 @@ export default function Editor({ projectId, onBack }) {
           <DiagnosticsSidebar
             diagnostics={diagnostics}
             onClose={() => setSidebarMode('')}
-            onSelectDiagnostic={(diagnostic) => void handleSidebarLocationJump(diagnostic.location)}
+            onSelectDiagnostic={(diagnostic) => void handleSidebarLocationJump(
+              diagnostic.location,
+              diagnostic.snippet,
+            )}
+            rawStatus={previewStatus}
             statusKind={previewStatus?.kind}
           />
         ) : null}
@@ -1932,7 +2118,12 @@ export default function Editor({ projectId, onBack }) {
           />
 
           <div style={styles.contentRow}>
-            <section style={{ ...styles.editorColumn, ...(isPreviewDetached ? styles.editorColumnExpanded : null) }}>
+            <section
+              style={{
+                ...styles.editorColumn,
+                ...(!shouldShowTypPreview || isPreviewDetached ? styles.editorColumnExpanded : null),
+              }}
+            >
               <div style={styles.panelToolbar}>
                 <div style={styles.panelTools}>
                   <button onClick={resetEditorZoom} style={styles.previewChip} title="Reset editor zoom" type="button">⟲</button>
@@ -2124,17 +2315,17 @@ export default function Editor({ projectId, onBack }) {
                     }}
                   >
                     <div ref={gutterRef} style={styles.lineGutter}>
-                      {lineNumbers.map((lineNumber) => (
+                      {lineRows.map((lineRow) => (
                         <div
-                          key={lineNumber}
+                          key={lineRow.number}
                           style={{
                             ...styles.lineNumber,
-                            height: `${editorLineHeight}px`,
+                            height: `${lineRow.height}px`,
                             lineHeight: `${editorLineHeight}px`,
                             fontSize: `${lineNumberFontSize}px`,
                           }}
                         >
-                          {lineNumber}
+                          {lineRow.number}
                         </div>
                       ))}
                     </div>
@@ -2155,12 +2346,13 @@ export default function Editor({ projectId, onBack }) {
                       }}
                       value={content}
                     />
+                    <div aria-hidden="true" ref={lineMeasureRef} style={styles.lineMeasure} />
                   </div>
                 )}
               </div>
             </section>
 
-            {!isPreviewDetached ? (
+            {shouldShowTypPreview && !isPreviewDetached ? (
               <section style={styles.previewColumn}>
                 <div style={styles.panelToolbar}>
                   {renderPreviewTools()}
@@ -2173,7 +2365,7 @@ export default function Editor({ projectId, onBack }) {
           </div>
         </div>
 
-        {isPreviewDetached ? (
+        {shouldShowTypPreview && isPreviewDetached ? (
           <div
             style={{
               ...styles.floatingPreviewWindow,
@@ -2627,6 +2819,7 @@ const styles = {
     display: 'grid',
     gridTemplateColumns: '52px 1fr',
     background: '#fbfbfc',
+    position: 'relative',
   },
   lineGutter: {
     overflow: 'hidden',
@@ -2642,6 +2835,9 @@ const styles = {
     fontSize: '13px',
     lineHeight: '24px',
     fontFamily: '"IBM Plex Mono", "SFMono-Regular", monospace',
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'flex-end',
   },
   textarea: {
     width: '100%',
@@ -2656,6 +2852,13 @@ const styles = {
     lineHeight: '24px',
     fontFamily: '"IBM Plex Mono", "SFMono-Regular", monospace',
     tabSize: 2,
+  },
+  lineMeasure: {
+    position: 'absolute',
+    top: 0,
+    left: '-99999px',
+    visibility: 'hidden',
+    pointerEvents: 'none',
   },
   centerPlaceholder: {
     height: '100%',
@@ -2687,6 +2890,33 @@ const styles = {
     color: '#666a73',
     fontSize: '14px',
     letterSpacing: '0.02em',
+  },
+  previewPausedState: {
+    height: '100%',
+    width: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '10px',
+    padding: '28px',
+    textAlign: 'center',
+    color: '#475569',
+  },
+  previewPausedTitle: {
+    fontSize: '18px',
+    fontWeight: '800',
+    color: '#b91c1c',
+  },
+  previewPausedText: {
+    maxWidth: '420px',
+    fontSize: '14px',
+    lineHeight: '1.6',
+  },
+  previewPausedMeta: {
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#7f1d1d',
   },
   floatingPreviewWindow: {
     position: 'fixed',

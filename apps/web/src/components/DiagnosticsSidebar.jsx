@@ -44,6 +44,7 @@ export default function DiagnosticsSidebar({
   diagnostics,
   onClose,
   onSelectDiagnostic,
+  rawStatus,
   statusKind,
 }) {
   const compilerSummary = diagnostics.length > 0
@@ -102,6 +103,15 @@ export default function DiagnosticsSidebar({
                   {diagnostic.locationLabel ? (
                     <div style={styles.diagnosticMeta}>{diagnostic.locationLabel}</div>
                   ) : null}
+                  {diagnostic.notes?.length ? (
+                    <div style={styles.diagnosticNotes}>
+                      {diagnostic.notes.map((note) => (
+                        <div key={note} style={styles.diagnosticNote}>
+                          {note}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </button>
               )
             })
@@ -123,6 +133,17 @@ export default function DiagnosticsSidebar({
           </div>
           <div style={styles.emptyCard}>Great.</div>
         </section>
+
+        {rawStatus ? (
+          <section style={styles.section}>
+            <details style={styles.debugPanel}>
+              <summary style={styles.debugSummary}>Raw Preview Status</summary>
+              <pre style={styles.debugPre}>
+                {JSON.stringify(rawStatus, null, 2)}
+              </pre>
+            </details>
+          </section>
+        ) : null}
       </div>
     </aside>
   )
@@ -256,5 +277,44 @@ const styles = {
     marginTop: '8px',
     fontSize: '12px',
     color: '#6b7280',
+  },
+  diagnosticNotes: {
+    marginTop: '10px',
+    display: 'grid',
+    gap: '6px',
+  },
+  diagnosticNote: {
+    fontSize: '12px',
+    lineHeight: '1.5',
+    color: '#6b7280',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+  },
+  debugPanel: {
+    padding: '10px 12px',
+    borderRadius: '12px',
+    background: '#ffffff',
+    border: '1px solid #d6dbe4',
+  },
+  debugSummary: {
+    cursor: 'pointer',
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#334155',
+    userSelect: 'none',
+  },
+  debugPre: {
+    margin: '10px 0 0',
+    padding: '10px',
+    borderRadius: '10px',
+    background: '#f8fafc',
+    border: '1px solid #e2e8f0',
+    color: '#334155',
+    fontSize: '11px',
+    lineHeight: '1.5',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+    overflowX: 'auto',
+    fontFamily: '"IBM Plex Mono", "SFMono-Regular", monospace',
   },
 }
