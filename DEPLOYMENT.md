@@ -18,7 +18,7 @@ DB_NAME=typst_editor
 
 ### 2. 启动服务
 ```bash
-docker compose up -d
+./compose-smart.sh up -d
 ```
 
 ### 3. 访问应用
@@ -98,11 +98,11 @@ docker compose down
 ### 重建服务
 ```bash
 # 重建并启动
-docker compose up -d --build
+./compose-smart.sh up -d --build
 
 # 重建特定服务
-docker compose build compiler
-docker compose up -d compiler
+./compose-smart.sh build compiler
+./compose-smart.sh up -d compiler
 ```
 
 ### 清理数据
@@ -154,8 +154,24 @@ docker compose ps
 docker compose logs
 
 # 重建镜像
-docker compose build --no-cache
-docker compose up -d
+./compose-smart.sh build --no-cache
+./compose-smart.sh up -d
+```
+
+## 智能换源
+
+`./compose-smart.sh` 会根据宿主机环境自动切换镜像源：
+
+- `DOCKER_SOURCE_MODE=auto`：自动判断，国内环境优先使用镜像源
+- `DOCKER_SOURCE_MODE=cn`：强制使用国内镜像参数
+- `DOCKER_SOURCE_MODE=global`：强制使用官方源
+
+常用命令：
+
+```bash
+./compose-smart.sh --print-env
+DOCKER_SOURCE_MODE=cn ./compose-smart.sh up -d --build
+DOCKER_SOURCE_MODE=global ./compose-smart.sh up -d --build
 ```
 
 ## 性能优化

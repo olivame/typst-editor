@@ -13,7 +13,19 @@ cp .env.example .env
 2. 构建并启动
 
 ```bash
-docker compose -f compose.yaml -f compose.dev.yaml up --build
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml up --build
+```
+
+如果只想先构建镜像：
+
+```bash
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml build
+```
+
+如果已经构建完成，需要用新镜像重建并重启服务：
+
+```bash
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml up -d --force-recreate
 ```
 
 3. 访问服务
@@ -63,7 +75,43 @@ docker compose -f compose.yaml -f compose.dev.yaml up --build
 如果要在另一台机器上稳定复现，建议只依赖这条命令：
 
 ```bash
-docker compose -f compose.yaml -f compose.dev.yaml up --build
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml up --build
 ```
 
 不要依赖宿主机手动安装 Node/Python 依赖；依赖锁文件和 Dockerfile 已经纳入项目。
+
+## 智能换源
+
+仓库根目录提供了 `./compose-smart.sh`：
+
+- `DOCKER_SOURCE_MODE=auto` 时，会根据宿主机时区和 locale 自动判断是否启用国内镜像参数
+- 国内模式下会自动切换 Docker Hub、npm、PyPI 和 Debian apt
+- 海外或默认环境会继续使用官方源
+
+如果自动判断不符合预期，可以手动覆盖：
+
+```bash
+DOCKER_SOURCE_MODE=cn ./compose-smart.sh up -d --build
+DOCKER_SOURCE_MODE=global ./compose-smart.sh up -d --build
+./compose-smart.sh --print-env
+```
+
+## 常用命令
+
+开发环境构建：
+
+```bash
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml build
+```
+
+开发环境构建并启动：
+
+```bash
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml up --build
+```
+
+构建后按新镜像重建并重启：
+
+```bash
+./compose-smart.sh -f compose.yaml -f compose.dev.yaml up -d --force-recreate
+```

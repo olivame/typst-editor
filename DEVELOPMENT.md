@@ -83,7 +83,12 @@ Web (3000) <-> API (8000) <-> Compiler (8001)
 
 ### 4. 容器未使用新镜像
 - **问题**: `docker compose restart` 不会更新镜像
-- **解决**: 使用 `docker compose up -d` 重新创建容器
+- **解决**: 使用 `./compose-smart.sh up -d` 重新创建容器
+
+### 5. 新机器拉取国外源过慢
+- **问题**: Docker Hub / PyPI / npm / Debian apt 在国内网络可能很慢
+- **解决**: 使用根目录的 `./compose-smart.sh`
+- **说明**: `DOCKER_SOURCE_MODE=auto` 会按宿主机环境自动切换到国内镜像参数，也可以手动设置为 `cn` 或 `global`
 
 ## 目录结构
 ```
