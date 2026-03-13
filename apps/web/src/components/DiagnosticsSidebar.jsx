@@ -49,10 +49,6 @@ export default function DiagnosticsSidebar({
       <div style={styles.header}>
         <div style={styles.headerTop}>
           <div style={styles.title}>Improve</div>
-          <div style={styles.viewToggle}>
-            <span style={{ ...styles.toggleChip, ...styles.toggleChipActive }}>☰</span>
-            <span style={styles.toggleChip}>☷</span>
-          </div>
           <button onClick={onClose} style={styles.closeButton} type="button">×</button>
         </div>
       </div>
@@ -165,29 +161,6 @@ const styles = {
     appearance: 'none',
     WebkitAppearance: 'none',
     flexShrink: 0,
-  },
-  viewToggle: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '6px',
-    padding: '4px',
-    borderRadius: '10px',
-    border: '1px solid #d1d5db',
-    background: '#ffffff',
-  },
-  toggleChip: {
-    width: '24px',
-    height: '24px',
-    borderRadius: '7px',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    color: '#94a3b8',
-    fontSize: '12px',
-  },
-  toggleChipActive: {
-    background: '#eff6ff',
-    color: '#2563eb',
   },
   body: {
     flex: 1,

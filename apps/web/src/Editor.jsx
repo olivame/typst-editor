@@ -39,11 +39,35 @@ function ListToolGlyph({ kind }) {
   )
 }
 
+function DiagnosticsRailGlyph() {
+  return (
+    <span style={styles.diagnosticsRailGlyph} aria-hidden="true">
+      <svg viewBox="0 0 24 24" style={styles.diagnosticsRailGlyphSvg}>
+        <path
+          d="M8 3.5H16L21 12L16 20.5H8L3 12Z"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinejoin="round"
+        />
+        <path
+          d="M12 8V12.5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+        <circle cx="12" cy="16.2" r="1.1" fill="currentColor" />
+      </svg>
+    </span>
+  )
+}
+
 const RAIL_ITEMS = [
   { id: 'files', label: '≡', title: 'Files' },
   { id: 'search', label: '⌕', title: 'Search' },
   { id: 'outline', label: '☷', title: 'Outline' },
-  { id: 'errors', label: '!', title: 'Diagnostics' },
+  { id: 'errors', label: <DiagnosticsRailGlyph />, title: 'Diagnostics' },
   { id: 'settings', label: '⚙', title: 'Settings' },
 ]
 
@@ -90,6 +114,7 @@ const PREVIEW_ZOOM_FACTORS = [
   1.1, 1.3, 1.5, 1.7, 1.9, 2.1, 2.4, 2.7,
   3, 3.3, 3.7, 4.1, 4.6, 5.1, 5.7, 6.3, 7, 7.7, 8.5, 9.4, 10,
 ]
+const PYTHON_CODE_BLOCK_TEMPLATE = '```python\n\n```'
 
 function findNearestPreviewZoom(value) {
   return PREVIEW_ZOOM_FACTORS.reduce((nearest, factor) => (
@@ -1364,6 +1389,11 @@ export default function Editor({ projectId, onBack }) {
     () => normalizeDiagnostics(previewStatus, projectId),
     [previewStatus, projectId],
   )
+  const errorCount = useMemo(
+    () => diagnostics.filter((diagnostic) => !`${diagnostic.severity || ''}`.toLowerCase().includes('warn')
+      && !`${diagnostic.severity || ''}`.toLowerCase().includes('info')).length,
+    [diagnostics],
+  )
   const outlineItems = useMemo(
     () => normalizeOutlineItems(previewOutline, projectId),
     [previewOutline, projectId],
@@ -1462,8 +1492,14 @@ export default function Editor({ projectId, onBack }) {
         return
       case 'code':
         applyEditorTransformation(
-          (source, selectionStart, selectionEnd) => insertTemplate(source, selectionStart, selectionEnd, '``', 1),
-          'Inserted code markers',
+          (source, selectionStart, selectionEnd) => insertTemplate(
+            source,
+            selectionStart,
+            selectionEnd,
+            PYTHON_CODE_BLOCK_TEMPLATE,
+            '```python\n'.length,
+          ),
+          'Inserted Python code block',
         )
         return
       case 'reference':
@@ -1557,8 +1593,8 @@ export default function Editor({ projectId, onBack }) {
                 title={item.title}
               >
                 {item.label}
-                {item.id === 'errors' && diagnostics.length > 0 ? (
-                  <span style={styles.railBadge}>{diagnostics.length > 9 ? '9+' : diagnostics.length}</span>
+                {item.id === 'errors' && errorCount > 0 ? (
+                  <span style={styles.railBadge}>{errorCount > 99 ? '99+' : errorCount}</span>
                 ) : null}
               </div>
             ))}
@@ -1853,10 +1889,23 @@ const styles = {
     justifyContent: 'center',
     userSelect: 'none',
   },
+  diagnosticsRailGlyph: {
+    width: '20px',
+    height: '20px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    lineHeight: 0,
+  },
+  diagnosticsRailGlyphSvg: {
+    width: '20px',
+    height: '20px',
+    display: 'block',
+  },
   railBadge: {
     position: 'absolute',
-    top: '-4px',
-    right: '-5px',
+    top: '-5px',
+    right: '-7px',
     minWidth: '16px',
     height: '16px',
     padding: '0 4px',
