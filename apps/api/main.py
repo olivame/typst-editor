@@ -208,6 +208,12 @@ def normalize_entrypoint_path(raw_path: str):
     return normalized
 
 
+def is_template_typ_path(path: str):
+    parts = path.lower().split('/')
+    filename = parts[-1] if parts else ''
+    return filename == 'template.typ' or 'template' in parts or 'templates' in parts
+
+
 def resolve_project_entrypoint(entries: list[models.File], raw_path: str):
     typ_entries = [
         entry
@@ -255,6 +261,13 @@ def resolve_project_entrypoint(entries: list[models.File], raw_path: str):
         )
         if nested_matches:
             return entry_by_path[nested_matches[0]]
+
+    non_template_paths = sorted(
+        [path for path in candidate_paths if not is_template_typ_path(path)],
+        key=lambda path: (path.count('/'), path),
+    )
+    if non_template_paths:
+        return entry_by_path[non_template_paths[0]]
 
     best_path = sorted(candidate_paths, key=lambda path: (path.count('/'), path))[0]
     return entry_by_path[best_path]

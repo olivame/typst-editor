@@ -29,6 +29,12 @@ def list_available_fonts():
     ]
 
 
+def is_template_typ_path(path):
+    parts = path.lower().split('/')
+    filename = parts[-1] if parts else ''
+    return filename == 'template.typ' or 'template' in parts or 'templates' in parts
+
+
 def resolve_entrypoint(project_id, raw_path):
     project_dir = Path(f'/workspace/projects/{project_id}')
     normalized_raw = (raw_path or '').strip().replace('\\', '/')
@@ -72,6 +78,13 @@ def resolve_entrypoint(project_id, raw_path):
     )
     if nested_main:
         return nested_main[0]
+
+    non_template_paths = sorted(
+        [path for path in typ_files if not is_template_typ_path(path)],
+        key=lambda path: (path.count('/'), path),
+    )
+    if non_template_paths:
+        return non_template_paths[0]
 
     return sorted(typ_files, key=lambda path: (path.count('/'), path))[0]
 

@@ -730,12 +730,30 @@ function isTypEntry(entry) {
   )
 }
 
+function sortTypEntries(entries) {
+  return [...entries].sort((left, right) => {
+    const depthDifference = left.path.split('/').length - right.path.split('/').length
+    if (depthDifference !== 0) return depthDifference
+    return left.path.localeCompare(right.path)
+  })
+}
+
+function isTemplateTypEntry(entry) {
+  const pathSegments = `${entry?.path || ''}`.toLowerCase().split('/')
+  const filename = pathSegments[pathSegments.length - 1] || ''
+  return filename === 'template.typ'
+    || pathSegments.includes('template')
+    || pathSegments.includes('templates')
+}
+
 function findPreferredTypEntry(entries, preferredPath = '') {
-  const typEntries = entries.filter((entry) => isTypEntry(entry))
+  const typEntries = sortTypEntries(entries.filter((entry) => isTypEntry(entry)))
   if (typEntries.length === 0) return null
 
   return typEntries.find((entry) => entry.path === preferredPath)
     || typEntries.find((entry) => entry.path === 'main.typ')
+    || typEntries.find((entry) => entry.path.endsWith('/main.typ'))
+    || typEntries.find((entry) => !isTemplateTypEntry(entry))
     || typEntries[0]
 }
 
@@ -1026,7 +1044,7 @@ export default function Editor({ projectId, onBack }) {
 
     const nextSelectedEntry = nextFiles.find((entry) => (
       entry.path === (preferredPath || selectedEntry?.path || rememberedSelectedEntryPath)
-    ))
+    )) || findPreferredTypEntry(nextFiles)
 
     if (!nextSelectedEntry) {
       setSelectedEntry(null)
@@ -1058,31 +1076,37 @@ export default function Editor({ projectId, onBack }) {
 
       setFiles(nextFiles)
 
-      const rememberedEntry = rememberedSelectedEntryPath
-        ? nextFiles.find((entry) => entry.path === rememberedSelectedEntryPath) || null
-        : null
-
-      if (!rememberedEntry) {
+      const initialEntry = findPreferredTypEntry(nextFiles)
+      if (!initialEntry) {
         setSelectedEntry(null)
         setCurrentFile(null)
         setContent('')
-        const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, activePreviewPath)
-        setActivePreviewPath(fallbackPreviewEntry?.path || '')
+        setActivePreviewPath('')
         return
       }
 
-      const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, rememberedEntry.path)
+      const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, initialEntry.path)
       setActivePreviewPath(fallbackPreviewEntry?.path || '')
 
-      setSelectedEntry(rememberedEntry)
+      setSelectedEntry(initialEntry)
+      setSelectedEntryPathByProject((current) => (
+        current[projectId] === initialEntry.path
+          ? current
+          : { ...current, [projectId]: initialEntry.path }
+      ))
+      setLastOpenedFilePathByProject((current) => (
+        current[projectId] === initialEntry.path
+          ? current
+          : { ...current, [projectId]: initialEntry.path }
+      ))
 
-      if (rememberedEntry.kind === 'folder' || rememberedEntry.is_binary) {
+      if (initialEntry.kind === 'folder' || initialEntry.is_binary) {
         setCurrentFile(null)
         setContent('')
         return
       }
 
-      const data = await getFileContent(rememberedEntry.id)
+      const data = await getFileContent(initialEntry.id)
       if (isCancelled) return
 
       setCurrentFile(data)

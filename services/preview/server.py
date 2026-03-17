@@ -79,6 +79,12 @@ def make_session_key(project_id: int, entrypoint: str) -> str:
     return f"{project_id}:{entrypoint}"
 
 
+def is_template_typ_path(path: str) -> bool:
+    parts = path.lower().split("/")
+    filename = parts[-1] if parts else ""
+    return filename == "template.typ" or "template" in parts or "templates" in parts
+
+
 def resolve_entrypoint_in_project(project_dir: Path, raw_path: str) -> str:
     normalized_raw = (raw_path or "").strip().replace("\\", "/")
     search_candidates = []
@@ -122,6 +128,13 @@ def resolve_entrypoint_in_project(project_dir: Path, raw_path: str) -> str:
     )
     if nested_main:
         return nested_main[0]
+
+    non_template_paths = sorted(
+        [path for path in typ_files if not is_template_typ_path(path)],
+        key=lambda path: (path.count("/"), path),
+    )
+    if non_template_paths:
+        return non_template_paths[0]
 
     return sorted(typ_files, key=lambda path: (path.count("/"), path))[0]
 
