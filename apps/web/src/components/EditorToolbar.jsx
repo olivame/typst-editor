@@ -1,20 +1,89 @@
-const MENU_ITEMS = ['Typst', 'File', 'Edit', 'View', 'Help']
+import { useEffect, useRef, useState } from 'react'
 
 export default function EditorToolbar({
   compileResult,
   currentPath,
+  menuSections,
   onBack,
   onDownload,
   onSavePreview,
 }) {
+  const shellRef = useRef(null)
+  const [openMenuLabel, setOpenMenuLabel] = useState('')
+
+  useEffect(() => {
+    const handlePointerDown = (event) => {
+      if (!shellRef.current?.contains(event.target)) {
+        setOpenMenuLabel('')
+      }
+    }
+
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setOpenMenuLabel('')
+      }
+    }
+
+    window.addEventListener('mousedown', handlePointerDown)
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('mousedown', handlePointerDown)
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [])
+
   return (
-    <div style={styles.shell}>
+    <div ref={shellRef} style={styles.shell}>
       <div style={styles.left}>
-        <button onClick={onBack} style={styles.backButton}>Projects</button>
+        <button onClick={onBack} style={styles.backButton} type="button">Projects</button>
         <div style={styles.menuGroup}>
-          {MENU_ITEMS.map((item) => (
-            <button key={item} style={styles.menuButton}>{item}</button>
-          ))}
+          {menuSections.map((section) => {
+            const isOpen = openMenuLabel === section.label
+
+            return (
+              <div key={section.label} style={styles.menuShell}>
+                <button
+                  onClick={() => setOpenMenuLabel((current) => (current === section.label ? '' : section.label))}
+                  style={{
+                    ...styles.menuButton,
+                    ...(isOpen ? styles.menuButtonActive : null),
+                  }}
+                  type="button"
+                >
+                  {section.label}
+                </button>
+
+                {isOpen ? (
+                  <div style={styles.menuPanel}>
+                    {section.items.map((item, index) => {
+                      if (item.type === 'separator') {
+                        return <div key={`${section.label}-separator-${index}`} style={styles.menuSeparator} />
+                      }
+
+                      return (
+                        <button
+                          key={`${section.label}-${item.label}`}
+                          disabled={item.disabled}
+                          onClick={() => {
+                            setOpenMenuLabel('')
+                            item.onSelect?.()
+                          }}
+                          style={{
+                            ...styles.menuItem,
+                            ...(item.disabled ? styles.menuItemDisabled : null),
+                          }}
+                          type="button"
+                        >
+                          <span style={styles.menuItemLabel}>{item.label}</span>
+                          {item.shortcut ? <span style={styles.menuShortcut}>{item.shortcut}</span> : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            )
+          })}
         </div>
       </div>
 
@@ -24,10 +93,10 @@ export default function EditorToolbar({
 
       <div style={styles.right}>
         {compileResult ? <span style={styles.statusPill}>{compileResult}</span> : null}
-        <button onClick={onSavePreview} style={styles.iconButton} title="Save and preview">
+        <button onClick={onSavePreview} style={styles.iconButton} title="Save and preview" type="button">
           💾
         </button>
-        <button onClick={onDownload} style={styles.iconButton} title="Download PDF">
+        <button onClick={onDownload} style={styles.iconButton} title="Download PDF" type="button">
           ⬇
         </button>
       </div>
@@ -45,6 +114,8 @@ const styles = {
     padding: '0 18px',
     borderBottom: '1px solid #d8d8de',
     background: '#ececee',
+    position: 'relative',
+    zIndex: 4,
   },
   left: {
     display: 'flex',
@@ -82,15 +153,72 @@ const styles = {
     gap: '2px',
     flexWrap: 'wrap',
   },
+  menuShell: {
+    position: 'relative',
+  },
   menuButton: {
     height: '30px',
     padding: '0 10px',
     border: 'none',
+    borderRadius: '7px',
     background: 'transparent',
     color: '#50515b',
     cursor: 'pointer',
     fontSize: '13px',
     fontWeight: '600',
+  },
+  menuButtonActive: {
+    background: '#ffffff',
+    color: '#23262e',
+    boxShadow: 'inset 0 0 0 1px #d5d8de',
+  },
+  menuPanel: {
+    position: 'absolute',
+    top: '36px',
+    left: 0,
+    minWidth: '220px',
+    padding: '8px',
+    borderRadius: '12px',
+    border: '1px solid #d5d8de',
+    background: '#fcfcfd',
+    boxShadow: '0 14px 40px rgba(15, 23, 42, 0.14)',
+    display: 'grid',
+    gap: '4px',
+  },
+  menuItem: {
+    minHeight: '34px',
+    padding: '8px 10px',
+    border: 'none',
+    borderRadius: '8px',
+    background: 'transparent',
+    color: '#2c3240',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '16px',
+    textAlign: 'left',
+    fontSize: '13px',
+    fontWeight: '600',
+  },
+  menuItemDisabled: {
+    color: '#9ba3af',
+    cursor: 'not-allowed',
+  },
+  menuItemLabel: {
+    whiteSpace: 'nowrap',
+  },
+  menuShortcut: {
+    color: '#768092',
+    fontSize: '11px',
+    fontWeight: '700',
+    letterSpacing: '0.03em',
+    whiteSpace: 'nowrap',
+  },
+  menuSeparator: {
+    height: '1px',
+    margin: '4px 2px',
+    background: '#e4e7ec',
   },
   projectTitle: {
     maxWidth: '420px',

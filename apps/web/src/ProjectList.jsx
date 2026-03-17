@@ -107,7 +107,7 @@ function formatProjectDate(value) {
   return `${diffDays} days ago`
 }
 
-export default function ProjectList({ onOpenProject }) {
+export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }) {
   const actionMenuTriggerRefs = useRef({})
   const headerCheckboxRef = useRef(null)
   const [projects, setProjects] = useState([])
@@ -240,6 +240,15 @@ export default function ProjectList({ onOpenProject }) {
     if (tags.some((tag) => tag.id === selectedTagId)) return
     setSelectedTagId(null)
   }, [selectedTagId, tags])
+
+  useEffect(() => {
+    if (newProjectIntentNonce <= 0) return
+
+    const defaultTemplate = TEMPLATE_OPTIONS.find((template) => template.enabled)
+    if (!defaultTemplate) return
+
+    openTemplateModal(defaultTemplate)
+  }, [newProjectIntentNonce])
 
   const openTemplateModal = (template) => {
     if (!template.enabled) return

@@ -159,6 +159,10 @@ function getParentPath(path) {
   return path.split('/').slice(0, -1).join('/')
 }
 
+function joinPath(parentPath, childName) {
+  return parentPath ? `${parentPath}/${childName}` : childName
+}
+
 function normalizePreviewFilePath(filepath, projectId) {
   const projectMarker = `/workspace/projects/${projectId}/`
   if (filepath.includes(projectMarker)) {
@@ -919,7 +923,7 @@ function FontPicker({
   )
 }
 
-export default function Editor({ projectId, onBack }) {
+export default function Editor({ onBack, onRequestNewProject, projectId }) {
   const gutterRef = useRef(null)
   const textareaRef = useRef(null)
   const lineMeasureRef = useRef(null)
@@ -928,6 +932,7 @@ export default function Editor({ projectId, onBack }) {
   const pendingEditorSelectionRef = useRef(null)
   const dragStateRef = useRef(null)
   const previewApiRef = useRef(null)
+  const uploadInputRef = useRef(null)
   const fontButtonRef = useRef(null)
   const fontMenuRef = useRef(null)
   const referenceButtonRef = useRef(null)
@@ -943,6 +948,7 @@ export default function Editor({ projectId, onBack }) {
   const [lastOpenedFilePathByProject, setLastOpenedFilePathByProject] = useState({})
   const [editorZoom, setEditorZoom] = useState(1)
   const [previewZoom, setPreviewZoom] = useState(1)
+  const [isPreviewVisible, setIsPreviewVisible] = useState(true)
   const [isPreviewDetached, setIsPreviewDetached] = useState(false)
   const [editorWheelElement, setEditorWheelElement] = useState(null)
   const [previewWheelElement, setPreviewWheelElement] = useState(null)
@@ -961,6 +967,7 @@ export default function Editor({ projectId, onBack }) {
   const [previewOutline, setPreviewOutline] = useState([])
   const [wrappedLineLayout, setWrappedLineLayout] = useState([])
   const [textareaMeasureWidth, setTextareaMeasureWidth] = useState(0)
+  const [isWordWrapEnabled, setIsWordWrapEnabled] = useState(true)
   const fileTreeCollapsedFolders = fileTreeCollapsedStateByProject[projectId] || {}
   const rememberedSelectedEntryPath = selectedEntryPathByProject[projectId] || ''
   const lastOpenedFilePath = lastOpenedFilePathByProject[projectId] || ''
@@ -1502,6 +1509,265 @@ export default function Editor({ projectId, onBack }) {
     }
   }
 
+  function focusEditor() {
+    textareaRef.current?.focus()
+  }
+
+  function triggerUploadDialog() {
+    uploadInputRef.current?.click()
+  }
+
+  async function handleToolbarUploadChange(event) {
+    const uploadFiles = Array.from(event.target.files || [])
+    event.target.value = ''
+
+    if (uploadFiles.length === 0) return
+
+    try {
+      await handleUploadFiles(uploadFiles, {
+        parentPath: selectedEntry?.kind === 'folder' ? selectedEntry.path : getParentPath(selectedEntry?.path || ''),
+        relativePaths: [],
+      })
+    } catch (error) {
+      showStatus(error.message || 'Failed to upload files', 2500)
+    }
+  }
+
+  async function promptCreateEntry(kind) {
+    const nextName = window.prompt(
+      kind === 'file' ? 'New file path' : 'New folder path',
+      kind === 'file' ? 'main.typ' : 'section',
+    )
+    if (nextName == null) return
+
+    const trimmedName = nextName.trim()
+    if (!trimmedName) {
+      showStatus('Name is required', 2000)
+      return
+    }
+
+    const basePath = selectedEntry?.kind === 'folder'
+      ? selectedEntry.path
+      : getParentPath(selectedEntry?.path || '')
+    const nextPath = trimmedName.includes('/') ? trimmedName : joinPath(basePath, trimmedName)
+
+    try {
+      if (kind === 'file') {
+        await handleCreateFile(nextPath)
+      } else {
+        await handleCreateFolder(nextPath)
+      }
+    } catch (error) {
+      showStatus(error.message || `Failed to create ${kind}`, 2500)
+    }
+  }
+
+  async function promptRenameSelectedEntry() {
+    if (!selectedEntry) {
+      showStatus('No file or folder selected', 2000)
+      return
+    }
+
+    const nextName = window.prompt('Rename to', selectedEntry.name)
+    if (nextName == null) return
+
+    const trimmedName = nextName.trim()
+    if (!trimmedName) {
+      showStatus('Name is required', 2000)
+      return
+    }
+
+    try {
+      await handleRenameEntry(selectedEntry, joinPath(getParentPath(selectedEntry.path), trimmedName))
+    } catch (error) {
+      showStatus(error.message || 'Failed to rename entry', 2500)
+    }
+  }
+
+  async function promptDeleteSelectedEntry() {
+    if (!selectedEntry) {
+      showStatus('No file or folder selected', 2000)
+      return
+    }
+
+    const confirmed = window.confirm(
+      selectedEntry.kind === 'folder'
+        ? `Delete folder "${selectedEntry.path}" and all nested files?`
+        : `Delete file "${selectedEntry.path}"?`,
+    )
+    if (!confirmed) return
+
+    try {
+      await handleDeleteEntry(selectedEntry)
+    } catch (error) {
+      showStatus(error.message || 'Failed to delete entry', 2500)
+    }
+  }
+
+  function selectTextRange(start, end) {
+    const textarea = textareaRef.current
+    if (!textarea) return
+
+    textarea.focus()
+    textarea.setSelectionRange(start, end)
+    const lineNumber = textarea.value.slice(0, start).split('\n').length
+    const targetScrollTop = Math.max((lineNumber - 3) * editorLineHeight, 0)
+    textarea.scrollTop = targetScrollTop
+    if (gutterRef.current) {
+      gutterRef.current.scrollTop = targetScrollTop
+    }
+  }
+
+  function handleFindInDocument() {
+    if (!isEditableDocument || !textareaRef.current) {
+      showStatus('Select an editable file first', 2000)
+      return
+    }
+
+    const query = window.prompt('Find text')
+    if (!query) return
+
+    const textarea = textareaRef.current
+    const selectionAnchor = textarea.selectionEnd
+    const source = textarea.value
+    const nextIndex = source.indexOf(query, selectionAnchor)
+    const wrappedIndex = nextIndex === -1 ? source.indexOf(query) : nextIndex
+
+    if (wrappedIndex === -1) {
+      showStatus(`No matches for "${query}"`, 2000)
+      return
+    }
+
+    selectTextRange(wrappedIndex, wrappedIndex + query.length)
+    showStatus(`Found "${query}"`, 1500)
+  }
+
+  function handleReplaceInDocument() {
+    if (!isEditableDocument) {
+      showStatus('Select an editable file first', 2000)
+      return
+    }
+
+    const query = window.prompt('Replace text')
+    if (!query) return
+
+    const replacement = window.prompt('Replace with', '')
+    if (replacement == null) return
+
+    const occurrences = content.split(query).length - 1
+    if (occurrences <= 0) {
+      showStatus(`No matches for "${query}"`, 2000)
+      return
+    }
+
+    setContent(content.split(query).join(replacement))
+    showStatus(`Replaced ${occurrences} occurrence${occurrences === 1 ? '' : 's'}`, 2000)
+  }
+
+  function handleSelectAllInDocument() {
+    if (!textareaRef.current) return
+    focusEditor()
+    textareaRef.current.setSelectionRange(0, textareaRef.current.value.length)
+  }
+
+  async function handleClipboardAction(action) {
+    if (!isEditableDocument || !textareaRef.current) {
+      showStatus('Select an editable file first', 2000)
+      return
+    }
+
+    const textarea = textareaRef.current
+    const selectionStart = textarea.selectionStart
+    const selectionEnd = textarea.selectionEnd
+    const selectedText = selectionStart === selectionEnd
+      ? textarea.value
+      : textarea.value.slice(selectionStart, selectionEnd)
+
+    try {
+      if (action === 'copy' || action === 'cut') {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(selectedText)
+        } else {
+          focusEditor()
+          document.execCommand('copy')
+        }
+      }
+
+      if (action === 'cut') {
+        if (selectionStart !== selectionEnd) {
+          setContent(
+            `${textarea.value.slice(0, selectionStart)}${textarea.value.slice(selectionEnd)}`,
+          )
+          pendingEditorSelectionRef.current = {
+            start: selectionStart,
+            end: selectionStart,
+            scrollTop: textarea.scrollTop,
+          }
+        }
+      }
+
+      if (action === 'paste') {
+        let nextText = ''
+        if (navigator.clipboard?.readText) {
+          nextText = await navigator.clipboard.readText()
+        } else {
+          focusEditor()
+          document.execCommand('paste')
+          return
+        }
+
+        const nextContent = `${textarea.value.slice(0, selectionStart)}${nextText}${textarea.value.slice(selectionEnd)}`
+        setContent(nextContent)
+        pendingEditorSelectionRef.current = {
+          start: selectionStart + nextText.length,
+          end: selectionStart + nextText.length,
+          scrollTop: textarea.scrollTop,
+        }
+      }
+
+      showStatus(
+        action === 'copy' ? 'Copied selection' : action === 'cut' ? 'Cut selection' : 'Pasted from clipboard',
+        1500,
+      )
+    } catch (error) {
+      showStatus(error.message || `Failed to ${action}`, 2500)
+    }
+  }
+
+  function handleHistoryAction(action) {
+    focusEditor()
+    if (!document.execCommand(action)) {
+      showStatus(`Browser does not support ${action}`, 2000)
+    }
+  }
+
+  function openDocumentation() {
+    window.open('https://typst.app/docs/', '_blank', 'noopener,noreferrer')
+  }
+
+  function showKeyboardShortcuts() {
+    window.alert(
+      [
+        'Keyboard shortcuts',
+        '',
+        'Cmd/Ctrl+S  Save',
+        'Double click  Jump preview to cursor',
+        'Cmd/Ctrl+Wheel  Zoom editor or preview',
+        'Menu > Edit  Find, replace, clipboard actions',
+      ].join('\n'),
+    )
+  }
+
+  function showAboutDialog() {
+    window.alert(
+      [
+        'Typst Editor',
+        '',
+        'Project-aware Typst editor with file tree, preview, diagnostics, outline, and PDF export.',
+      ].join('\n'),
+    )
+  }
+
   function changePreviewZoom(delta) {
     setPreviewZoom((current) => getAdjacentPreviewZoom(current, delta))
   }
@@ -1719,13 +1985,13 @@ export default function Editor({ projectId, onBack }) {
     [content, fontOptions],
   )
   const lineRows = useMemo(
-    () => wrappedLineLayout.length > 0
+    () => isWordWrapEnabled && wrappedLineLayout.length > 0
       ? wrappedLineLayout
       : logicalLines.map((_, index) => ({
         number: index + 1,
         height: editorLineHeight,
       })),
-    [editorLineHeight, logicalLines, wrappedLineLayout],
+    [editorLineHeight, isWordWrapEnabled, logicalLines, wrappedLineLayout],
   )
 
   useEffect(() => {
@@ -1761,6 +2027,7 @@ export default function Editor({ projectId, onBack }) {
     if (
       !measureRoot
       || !textarea
+      || !isWordWrapEnabled
       || textareaMeasureWidth <= 0
       || selectedEntry?.kind !== 'file'
       || selectedEntry?.is_binary
@@ -1805,7 +2072,7 @@ export default function Editor({ projectId, onBack }) {
 
     measureRoot.replaceChildren()
     setWrappedLineLayout(nextLayout)
-  }, [editorLineHeight, logicalLines, selectedEntry, textareaMeasureWidth])
+  }, [editorLineHeight, isWordWrapEnabled, logicalLines, selectedEntry, textareaMeasureWidth])
 
   const activePreviewEntry = useMemo(
     () => findPreferredTypEntry(files, activePreviewPath),
@@ -1822,7 +2089,7 @@ export default function Editor({ projectId, onBack }) {
   const previewEntryName = activePreviewEntry?.name || 'No preview'
   const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
-  const shouldShowTypPreview = Boolean(selectedEntry && isTypEntry(selectedEntry))
+  const shouldShowTypPreview = isPreviewVisible && Boolean(selectedEntry && isTypEntry(selectedEntry))
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
   const diagnostics = useMemo(
     () => normalizeDiagnostics(previewStatus, projectId),
@@ -1854,6 +2121,16 @@ export default function Editor({ projectId, onBack }) {
 
   const togglePreviewDetach = () => {
     setIsPreviewDetached((current) => !current)
+  }
+
+  const togglePreviewVisibility = () => {
+    setIsPreviewVisible((current) => {
+      const nextValue = !current
+      if (!nextValue) {
+        setIsPreviewDetached(false)
+      }
+      return nextValue
+    })
   }
 
   const startFloatingPreviewDrag = (event) => {
@@ -2050,6 +2327,89 @@ export default function Editor({ projectId, onBack }) {
     setIsReferenceMenuOpen((current) => !current)
   }
 
+  const menuSections = [
+    {
+      label: 'Typst',
+      items: [
+        { label: 'New Project', disabled: typeof onRequestNewProject !== 'function', onSelect: onRequestNewProject },
+        { label: 'Project List', onSelect: onBack },
+        { type: 'separator' },
+        { label: 'Export PDF', onSelect: () => void handleDownload() },
+        { label: 'Fonts', onSelect: toggleFontMenu },
+      ],
+    },
+    {
+      label: 'File',
+      items: [
+        { label: 'New File', onSelect: () => void promptCreateEntry('file') },
+        { label: 'New Folder', onSelect: () => void promptCreateEntry('folder') },
+        { label: 'Upload Files', onSelect: triggerUploadDialog },
+        { type: 'separator' },
+        { label: 'Rename', disabled: !selectedEntry, onSelect: () => void promptRenameSelectedEntry() },
+        { label: 'Delete', disabled: !selectedEntry, onSelect: () => void promptDeleteSelectedEntry() },
+        { type: 'separator' },
+        { label: 'Save', shortcut: 'Ctrl+S', disabled: !currentFile, onSelect: () => void saveAndPreview() },
+        {
+          label: 'Download File',
+          disabled: !(selectedEntry?.kind === 'file'),
+          onSelect: () => selectedEntry && handleDownloadEntry(selectedEntry),
+        },
+        { label: 'Download PDF', disabled: !activePreviewEntry, onSelect: () => void handleDownload() },
+      ],
+    },
+    {
+      label: 'Edit',
+      items: [
+        { label: 'Undo', shortcut: 'Ctrl+Z', disabled: !isEditableDocument, onSelect: () => handleHistoryAction('undo') },
+        { label: 'Redo', shortcut: 'Ctrl+Y', disabled: !isEditableDocument, onSelect: () => handleHistoryAction('redo') },
+        { type: 'separator' },
+        { label: 'Cut', disabled: !isEditableDocument, onSelect: () => void handleClipboardAction('cut') },
+        { label: 'Copy', disabled: !isEditableDocument, onSelect: () => void handleClipboardAction('copy') },
+        { label: 'Paste', disabled: !isEditableDocument, onSelect: () => void handleClipboardAction('paste') },
+        { type: 'separator' },
+        { label: 'Find', shortcut: 'Ctrl+F', disabled: !isEditableDocument, onSelect: handleFindInDocument },
+        { label: 'Replace', shortcut: 'Ctrl+H', disabled: !isEditableDocument, onSelect: handleReplaceInDocument },
+        { label: 'Insert Citation', disabled: !isEditableDocument, onSelect: toggleReferenceMenu },
+        { label: 'Select All', shortcut: 'Ctrl+A', disabled: !isEditableDocument, onSelect: handleSelectAllInDocument },
+      ],
+    },
+    {
+      label: 'View',
+      items: [
+        { label: 'Files', onSelect: () => setSidebarMode('files') },
+        { label: 'Search', onSelect: () => setSidebarMode('search') },
+        { label: 'Outline', onSelect: () => setSidebarMode('outline') },
+        { label: 'Diagnostics', onSelect: () => setSidebarMode('errors') },
+        { type: 'separator' },
+        {
+          label: isPreviewVisible ? 'Hide Preview' : 'Show Preview',
+          onSelect: togglePreviewVisibility,
+        },
+        {
+          label: isPreviewDetached ? 'Dock Preview' : 'Detach Preview',
+          disabled: !shouldShowTypPreview,
+          onSelect: togglePreviewDetach,
+        },
+        { type: 'separator' },
+        { label: 'Zoom In', onSelect: () => changeEditorZoom(1) },
+        { label: 'Zoom Out', onSelect: () => changeEditorZoom(-1) },
+        { label: 'Reset Zoom', onSelect: resetEditorZoom },
+        {
+          label: isWordWrapEnabled ? 'Disable Word Wrap' : 'Enable Word Wrap',
+          onSelect: () => setIsWordWrapEnabled((current) => !current),
+        },
+      ],
+    },
+    {
+      label: 'Help',
+      items: [
+        { label: 'Keyboard Shortcuts', onSelect: showKeyboardShortcuts },
+        { label: 'Open Documentation', onSelect: openDocumentation },
+        { label: 'About', onSelect: showAboutDialog },
+      ],
+    },
+  ]
+
   return (
     <div style={styles.appShell}>
       <div style={styles.workspace}>
@@ -2137,9 +2497,19 @@ export default function Editor({ projectId, onBack }) {
           <EditorToolbar
             compileResult={statusMessage}
             currentPath={currentPathLabel}
+            menuSections={menuSections}
             onBack={onBack}
             onDownload={handleDownload}
             onSavePreview={saveAndPreview}
+          />
+          <input
+            ref={uploadInputRef}
+            hidden
+            multiple
+            onChange={(event) => {
+              void handleToolbarUploadChange(event)
+            }}
+            type="file"
           />
 
           <div style={styles.contentRow}>
@@ -2368,8 +2738,11 @@ export default function Editor({ projectId, onBack }) {
                         ...styles.textarea,
                         fontSize: `${editorFontSize}px`,
                         lineHeight: `${editorLineHeight}px`,
+                        whiteSpace: isWordWrapEnabled ? 'pre-wrap' : 'pre',
+                        overflowWrap: isWordWrapEnabled ? 'break-word' : 'normal',
                       }}
                       value={content}
+                      wrap={isWordWrapEnabled ? 'soft' : 'off'}
                     />
                     <div aria-hidden="true" ref={lineMeasureRef} style={styles.lineMeasure} />
                   </div>
