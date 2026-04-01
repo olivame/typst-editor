@@ -1,10 +1,17 @@
 import json
 import mimetypes
 import shutil
+import base64
+import contextlib
+import hashlib
+import hmac
+import os
+import secrets
 from pathlib import Path, PurePosixPath
+from datetime import datetime, timedelta, timezone
 
 import requests
-from fastapi import Depends, FastAPI, File as FastAPIFile, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File as FastAPIFile, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -20,17 +27,53 @@ DEFAULT_MAIN_CONTENT = '= Hello Typst\n\nThis is a new document.'
 TEXT_ENTRY_KIND = 'file'
 FOLDER_ENTRY_KIND = 'folder'
 ALLOWED_PROJECT_STATUSES = {'active', 'archived', 'trashed'}
+SESSION_TTL_DAYS = 30
+ROOT_ADMIN_EMAILS = {
+    current.strip().lower()
+    for current in os.getenv('ROOT_ADMIN_EMAILS', '').split(',')
+    if current.strip()
+}
 
 models.Base.metadata.create_all(bind=engine)
 
 with engine.begin() as connection:
     inspector = inspect(connection)
 
+    user_columns = {column['name'] for column in inspector.get_columns('users')} if 'users' in inspector.get_table_names() else set()
+    if 'is_root' not in user_columns and 'users' in inspector.get_table_names():
+        connection.execute(
+            text("ALTER TABLE users ADD COLUMN is_root BOOLEAN NOT NULL DEFAULT FALSE")
+        )
+    if 'users' in inspector.get_table_names():
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET is_root = TRUE
+                WHERE id = (
+                    SELECT id
+                    FROM users
+                    ORDER BY created_at ASC NULLS FIRST, id ASC
+                    LIMIT 1
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM users WHERE is_root = TRUE
+                )
+                """
+            )
+        )
+
     project_columns = {column['name'] for column in inspector.get_columns('projects')}
     if 'status' not in project_columns:
         connection.execute(
             text("ALTER TABLE projects ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active'")
         )
+    if 'workspace_id' not in project_columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN workspace_id INTEGER"))
+    if 'created_by_id' not in project_columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN created_by_id INTEGER"))
+    if 'description' not in project_columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''"))
 
     file_columns = {column['name'] for column in inspector.get_columns('files')}
     if 'path' not in file_columns:
@@ -66,6 +109,28 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 class ProjectCreate(BaseModel):
     name: str
+    description: str = ''
+
+
+class ProjectMemberCreateRequest(BaseModel):
+    user_id: int | None = None
+    email: str | None = None
+    role: str = 'editor'
+
+
+class ProjectMemberUpdateRequest(BaseModel):
+    role: str
+
+
+class UserRegisterRequest(BaseModel):
+    email: str
+    password: str
+    display_name: str
+
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 class FileCreate(BaseModel):
@@ -100,6 +165,77 @@ class ProjectCompileRequest(BaseModel):
     entrypoint: str = ''
 
 
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def normalize_email(email: str):
+    normalized = (email or '').strip().lower()
+    if not normalized or '@' not in normalized:
+        raise HTTPException(status_code=400, detail='Invalid email')
+    return normalized
+
+
+def is_root_admin(user: models.User | None):
+    if user is None:
+        return False
+    if bool(getattr(user, 'is_root', False)):
+        return True
+    return normalize_email(user.email) in ROOT_ADMIN_EMAILS
+
+
+def normalize_display_name(value: str):
+    normalized = (value or '').strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail='Display name is required')
+    if len(normalized) > 255:
+        raise HTTPException(status_code=400, detail='Display name is too long')
+    return normalized
+
+
+def normalize_project_role(role: str):
+    normalized = (role or '').strip().lower()
+    if normalized not in models.PROJECT_ROLES:
+        raise HTTPException(status_code=400, detail='Invalid project role')
+    return normalized
+
+
+def hash_password(password: str):
+    raw_password = password or ''
+    if len(raw_password) < 8:
+        raise HTTPException(status_code=400, detail='Password must be at least 8 characters')
+
+    salt = secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac('sha256', raw_password.encode('utf-8'), salt, 100_000)
+    return f'pbkdf2_sha256$100000${base64.b64encode(salt).decode()}${base64.b64encode(derived).decode()}'
+
+
+def verify_password(password: str, password_hash: str):
+    try:
+        algorithm, raw_iterations, raw_salt, raw_hash = password_hash.split('$', 3)
+    except ValueError:
+        return False
+
+    if algorithm != 'pbkdf2_sha256':
+        return False
+
+    salt = base64.b64decode(raw_salt.encode())
+    expected_hash = base64.b64decode(raw_hash.encode())
+    derived = hashlib.pbkdf2_hmac('sha256', (password or '').encode('utf-8'), salt, int(raw_iterations))
+    return hmac.compare_digest(derived, expected_hash)
+
+
+def hash_session_token(token: str):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def build_auth_payload(user: models.User, token: str):
+    return {
+        'token': token,
+        'user': serialize_user(user),
+    }
+
+
 def get_available_fonts_from_compiler():
     try:
         response = requests.get(
@@ -119,10 +255,18 @@ def get_available_fonts_from_compiler():
 
 
 def serialize_project(project: models.Project):
+    owner = project.created_by
     return {
         'id': project.id,
+        'created_by_id': project.created_by_id,
+        'created_by': {
+            'id': owner.id,
+            'email': owner.email,
+            'display_name': owner.display_name,
+        } if owner else None,
         'name': project.name,
         'status': project.status,
+        'description': project.description,
         'created_at': project.created_at,
         'tags': [
             {
@@ -131,6 +275,30 @@ def serialize_project(project: models.Project):
             }
             for tag in sorted(project.tags, key=lambda current_tag: current_tag.name.lower())
         ],
+    }
+
+
+def serialize_user(user: models.User):
+    return {
+        'id': user.id,
+        'email': user.email,
+        'display_name': user.display_name,
+        'is_active': user.is_active,
+        'is_root_admin': is_root_admin(user),
+        'created_at': user.created_at,
+    }
+
+
+def serialize_project_member(member: models.ProjectMember):
+    return {
+        'id': member.id,
+        'project_id': member.project_id,
+        'user_id': member.user_id,
+        'role': member.role,
+        'status': member.status,
+        'joined_at': member.joined_at,
+        'created_at': member.created_at,
+        'user': serialize_user(member.user) if member.user else None,
     }
 
 
@@ -180,6 +348,79 @@ def search_project_entries(entries: list[models.File], query: str):
             })
 
     return results
+
+
+def create_session(db: Session, user: models.User):
+    raw_token = secrets.token_urlsafe(32)
+    session = models.UserSession(
+        user_id=user.id,
+        token_hash=hash_session_token(raw_token),
+        expires_at=utcnow() + timedelta(days=SESSION_TTL_DAYS),
+        created_at=utcnow(),
+        last_used_at=utcnow(),
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(user)
+    return build_auth_payload(user, raw_token)
+
+
+def get_current_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    if not authorization:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    scheme, _, token = authorization.partition(' ')
+    if scheme.lower() != 'bearer' or not token.strip():
+        raise HTTPException(status_code=401, detail='Invalid authorization header')
+
+    token_hash = hash_session_token(token.strip())
+    session = (
+        db.query(models.UserSession)
+        .filter(models.UserSession.token_hash == token_hash)
+        .first()
+    )
+    if not session or session.expires_at < utcnow():
+        raise HTTPException(status_code=401, detail='Session expired or invalid')
+
+    user = db.query(models.User).filter(models.User.id == session.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail='User is inactive')
+
+    session.last_used_at = utcnow()
+    db.commit()
+    return user
+
+
+def get_optional_current_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    if not authorization:
+        return None
+
+    scheme, _, token = authorization.partition(' ')
+    if scheme.lower() != 'bearer' or not token.strip():
+        return None
+
+    token_hash = hash_session_token(token.strip())
+    session = (
+        db.query(models.UserSession)
+        .filter(models.UserSession.token_hash == token_hash)
+        .first()
+    )
+    if not session or session.expires_at < utcnow():
+        return None
+
+    user = db.query(models.User).filter(models.User.id == session.user_id).first()
+    if not user or not user.is_active:
+        return None
+
+    session.last_used_at = utcnow()
+    db.commit()
+    return user
 
 
 def normalize_relative_path(raw_path: str):
@@ -302,6 +543,109 @@ def get_project_or_404(db: Session, project_id: int):
     if not project:
         raise HTTPException(status_code=404, detail='Project not found')
     return project
+
+
+def get_project_membership(
+    db: Session,
+    project_id: int,
+    user_id: int,
+    *,
+    active_only: bool = True,
+):
+    query = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == user_id,
+        )
+    )
+    if active_only:
+        query = query.filter(models.ProjectMember.status == 'active')
+    return query.first()
+
+
+def get_project_membership_or_404(db: Session, project_id: int, user_id: int):
+    membership = get_project_membership(db, project_id, user_id)
+    if not membership:
+        raise HTTPException(status_code=403, detail='Project access denied')
+    return membership
+
+
+def require_project_role(membership: models.ProjectMember, allowed_roles: set[str]):
+    if membership.role not in allowed_roles:
+        raise HTTPException(status_code=403, detail='Insufficient project permissions')
+
+
+def is_shared_project(project: models.Project):
+    return project.created_by_id is None
+
+
+def ensure_project_access(
+    db: Session,
+    project: models.Project,
+    current_user: models.User | None,
+    allowed_roles: set[str] | None = None,
+):
+    if is_root_admin(current_user):
+        return None
+
+    if current_user is None:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    if is_shared_project(project):
+        if not allowed_roles:
+            return None
+
+        shared_roles = {'editor', 'commenter', 'viewer'}
+        if allowed_roles.isdisjoint(shared_roles):
+            raise HTTPException(status_code=403, detail='Shared project requires a maintainer')
+        return None
+
+    membership = get_project_membership(db, project.id, current_user.id)
+    if membership is None:
+        raise HTTPException(status_code=403, detail='Project access denied')
+
+    if allowed_roles:
+        require_project_role(membership, allowed_roles)
+
+    return membership
+
+
+def ensure_project_membership(db: Session, project: models.Project):
+    if project.created_by_id is None:
+        return
+
+    existing_membership = get_project_membership(
+        db,
+        project.id,
+        project.created_by_id,
+        active_only=False,
+    )
+    if existing_membership:
+        if existing_membership.status != 'active':
+            existing_membership.status = 'active'
+        existing_membership.joined_at = existing_membership.joined_at or utcnow()
+        existing_membership.role = 'maintainer'
+        db.commit()
+        return
+
+    db.add(
+        models.ProjectMember(
+            project_id=project.id,
+            user_id=project.created_by_id,
+            role='maintainer',
+            status='active',
+            invited_by_id=project.created_by_id,
+            joined_at=utcnow(),
+        )
+    )
+    db.commit()
+
+
+with Session(engine) as db:
+    legacy_projects = db.query(models.Project).filter(models.Project.created_by_id.is_not(None)).all()
+    for legacy_project in legacy_projects:
+        ensure_project_membership(db, legacy_project)
 
 
 def get_entry_or_404(db: Session, file_id: int):
@@ -492,10 +836,206 @@ def health():
     return {'status': 'ok'}
 
 
+@app.post('/auth/register')
+def register_user(payload: UserRegisterRequest, db: Session = Depends(get_db)):
+    normalized_email = normalize_email(payload.email)
+    existing_user = db.query(models.User).filter(models.User.email == normalized_email).first()
+    if existing_user:
+        raise HTTPException(status_code=409, detail='Email already exists')
+
+    user = models.User(
+        email=normalized_email,
+        password_hash=hash_password(payload.password),
+        display_name=normalize_display_name(payload.display_name),
+        is_active=True,
+        is_root=db.query(models.User).count() == 0,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return create_session(db, user)
+
+
+@app.post('/auth/login')
+def login_user(payload: UserLoginRequest, db: Session = Depends(get_db)):
+    normalized_email = normalize_email(payload.email)
+    user = db.query(models.User).filter(models.User.email == normalized_email).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail='Invalid credentials')
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail='User is inactive')
+
+    return create_session(db, user)
+
+
+@app.post('/auth/logout')
+def logout_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    if not authorization:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    scheme, _, token = authorization.partition(' ')
+    if scheme.lower() != 'bearer' or not token.strip():
+        raise HTTPException(status_code=401, detail='Invalid authorization header')
+
+    session = (
+        db.query(models.UserSession)
+        .filter(models.UserSession.token_hash == hash_session_token(token.strip()))
+        .first()
+    )
+    if session:
+        db.delete(session)
+        db.commit()
+
+    return {'status': 'success'}
+
+
+@app.get('/auth/me')
+def get_me(current_user: models.User = Depends(get_current_user)):
+    return {'user': serialize_user(current_user)}
+
+
+@app.get('/projects/{project_id}/members')
+def list_project_members(
+    project_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
+    members = (
+        db.query(models.ProjectMember)
+        .filter(models.ProjectMember.project_id == project_id)
+        .order_by(models.ProjectMember.created_at.asc())
+        .all()
+    )
+    return [serialize_project_member(member) for member in members]
+
+
+@app.post('/projects/{project_id}/members')
+def add_project_member(
+    project_id: int,
+    payload: ProjectMemberCreateRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    requester_membership = ensure_project_access(db, project, current_user, {'maintainer'})
+    role = normalize_project_role(payload.role)
+
+    if payload.user_id is not None:
+        user = db.query(models.User).filter(models.User.id == payload.user_id).first()
+    elif payload.email:
+        normalized_email = normalize_email(payload.email)
+        user = db.query(models.User).filter(models.User.email == normalized_email).first()
+    else:
+        raise HTTPException(status_code=400, detail='user_id or email is required')
+
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    membership = get_project_membership(db, project_id, user.id, active_only=False)
+    if membership:
+        membership.role = role
+        membership.status = 'active'
+        membership.joined_at = membership.joined_at or utcnow()
+        membership.invited_by_id = requester_membership.user_id if requester_membership else current_user.id
+    else:
+        membership = models.ProjectMember(
+            project_id=project_id,
+            user_id=user.id,
+            role=role,
+            status='active',
+            invited_by_id=requester_membership.user_id if requester_membership else current_user.id,
+            joined_at=utcnow(),
+        )
+        db.add(membership)
+
+    db.commit()
+    db.refresh(membership)
+    return serialize_project_member(membership)
+
+
+@app.patch('/projects/{project_id}/members/{member_id}')
+def update_project_member(
+    project_id: int,
+    member_id: int,
+    payload: ProjectMemberUpdateRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer'})
+    membership = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.id == member_id,
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=404, detail='Project member not found')
+
+    membership.role = normalize_project_role(payload.role)
+    db.commit()
+    db.refresh(membership)
+    return serialize_project_member(membership)
+
+
+@app.delete('/projects/{project_id}/members/{member_id}')
+def delete_project_member(
+    project_id: int,
+    member_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer'})
+    membership = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.id == member_id,
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=404, detail='Project member not found')
+    if not is_root_admin(current_user) and membership.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail='Maintainer cannot remove themselves')
+
+    db.delete(membership)
+    db.commit()
+    return {'status': 'success', 'id': member_id}
+
+
 @app.post('/projects')
-def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
-    db_project = models.Project(name=project.name.strip(), status='active')
+def create_project(
+    project: ProjectCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    db_project = models.Project(
+        name=project.name.strip(),
+        status='active',
+        created_by_id=current_user.id,
+        description=(project.description or '').strip(),
+    )
     db.add(db_project)
+    db.flush()
+    db.add(
+        models.ProjectMember(
+            project_id=db_project.id,
+            user_id=current_user.id,
+            role='maintainer',
+            status='active',
+            invited_by_id=current_user.id,
+            joined_at=utcnow(),
+        )
+    )
     db.commit()
     db.refresh(db_project)
 
@@ -506,9 +1046,26 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
 
 
 @app.get('/projects')
-def list_projects(db: Session = Depends(get_db)):
+def list_projects(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     projects = db.query(models.Project).order_by(models.Project.created_at.desc()).all()
-    return [serialize_project(project) for project in projects]
+
+    if is_root_admin(current_user):
+        return [serialize_project(project) for project in projects]
+
+    visible_projects = []
+    for project in projects:
+        if is_shared_project(project):
+            visible_projects.append(project)
+            continue
+
+        project_membership = get_project_membership(db, project.id, current_user.id)
+        if project_membership:
+            visible_projects.append(project)
+
+    return [serialize_project(project) for project in visible_projects]
 
 
 @app.get('/tags')
@@ -544,15 +1101,33 @@ def delete_tag(tag_id: int, db: Session = Depends(get_db)):
 
 
 @app.post('/projects/{project_id}/copy')
-def copy_project(project_id: int, db: Session = Depends(get_db)):
+def copy_project(
+    project_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
 
     copied_project = models.Project(
         name=make_unique_project_name(db, f'{project.name} Copy'),
         status='active',
+        created_by_id=current_user.id,
+        description=project.description,
     )
     db.add(copied_project)
     copied_project.tags = list(project.tags)
+    db.flush()
+    db.add(
+        models.ProjectMember(
+            project_id=copied_project.id,
+            user_id=current_user.id,
+            role='maintainer',
+            status='active',
+            invited_by_id=current_user.id,
+            joined_at=utcnow(),
+        )
+    )
     db.commit()
     db.refresh(copied_project)
 
@@ -587,9 +1162,11 @@ def copy_project(project_id: int, db: Session = Depends(get_db)):
 def update_project_status(
     project_id: int,
     status_update: ProjectStatusUpdate,
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer'})
 
     if status_update.status not in ALLOWED_PROJECT_STATUSES:
         raise HTTPException(status_code=400, detail='Invalid project status')
@@ -605,9 +1182,11 @@ def update_project_status(
 def update_project_tags(
     project_id: int,
     payload: ProjectTagsUpdate,
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
     tag_ids = list(dict.fromkeys(payload.tag_ids or []))
     tags = []
     if tag_ids:
@@ -622,8 +1201,13 @@ def update_project_tags(
 
 
 @app.delete('/projects/{project_id}')
-def delete_project(project_id: int, db: Session = Depends(get_db)):
+def delete_project(
+    project_id: int,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
     project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer'})
 
     project.tags = []
     db.delete(project)
@@ -637,8 +1221,13 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get('/projects/{project_id}/files')
-def list_files(project_id: int, db: Session = Depends(get_db)):
-    get_project_or_404(db, project_id)
+def list_files(
+    project_id: int,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
     entries = (
         db.query(models.File)
         .filter(models.File.project_id == project_id)
@@ -652,24 +1241,38 @@ def list_files(project_id: int, db: Session = Depends(get_db)):
 def search_project_files(
     project_id: int,
     q: str = Query('', alias='q'),
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    get_project_or_404(db, project_id)
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     return search_project_entries(entries, q)
 
 
 @app.post('/projects/{project_id}/files')
-def create_file(project_id: int, payload: FileCreate, db: Session = Depends(get_db)):
-    get_project_or_404(db, project_id)
+def create_file(
+    project_id: int,
+    payload: FileCreate,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
     relative_path = normalize_relative_path(payload.path)
     entry = create_text_file_entry(db, project_id, relative_path, '')
     return serialize_entry(entry)
 
 
 @app.post('/projects/{project_id}/folders')
-def create_folder(project_id: int, payload: FolderCreate, db: Session = Depends(get_db)):
-    get_project_or_404(db, project_id)
+def create_folder(
+    project_id: int,
+    payload: FolderCreate,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
     relative_path = normalize_relative_path(payload.path)
 
     entries_by_path = get_project_entries_map(db, project_id)
@@ -699,9 +1302,11 @@ def upload_files(
     files: list[UploadFile] = FastAPIFile(...),
     parent_path: str = Form(''),
     relative_paths: str = Form(''),
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    get_project_or_404(db, project_id)
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
 
     normalized_parent = normalize_parent_path(parent_path)
     provided_relative_paths = []
@@ -765,8 +1370,13 @@ def upload_files(
 
 
 @app.get('/files/{file_id}/content')
-def get_file_content(file_id: int, db: Session = Depends(get_db)):
+def get_file_content(
+    file_id: int,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
     entry = get_entry_or_404(db, file_id)
+    ensure_project_access(db, entry.project, current_user)
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have editable content')
 
@@ -781,8 +1391,14 @@ def get_file_content(file_id: int, db: Session = Depends(get_db)):
 
 
 @app.put('/files/{file_id}/content')
-def update_file_content(file_id: int, file_update: FileUpdate, db: Session = Depends(get_db)):
+def update_file_content(
+    file_id: int,
+    file_update: FileUpdate,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
     entry = get_entry_or_404(db, file_id)
+    ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have editable content')
     if entry.is_binary:
@@ -799,8 +1415,14 @@ def update_file_content(file_id: int, file_update: FileUpdate, db: Session = Dep
 
 
 @app.patch('/files/{file_id}')
-def rename_file_entry(file_id: int, payload: FilePathUpdate, db: Session = Depends(get_db)):
+def rename_file_entry(
+    file_id: int,
+    payload: FilePathUpdate,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
     entry = get_entry_or_404(db, file_id)
+    ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     next_path = normalize_relative_path(payload.path)
     old_path = entry.path
 
@@ -855,8 +1477,13 @@ def rename_file_entry(file_id: int, payload: FilePathUpdate, db: Session = Depen
 
 
 @app.delete('/files/{file_id}')
-def delete_file_entry(file_id: int, db: Session = Depends(get_db)):
+def delete_file_entry(
+    file_id: int,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
     entry = get_entry_or_404(db, file_id)
+    ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     project_id = entry.project_id
     disk_path = get_entry_disk_path(project_id, entry.path)
 
@@ -886,9 +1513,11 @@ def delete_file_entry(file_id: int, db: Session = Depends(get_db)):
 def get_file_raw(
     file_id: int,
     download: bool = Query(False),
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     entry = get_entry_or_404(db, file_id)
+    ensure_project_access(db, entry.project, current_user)
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have raw content')
 
@@ -909,9 +1538,11 @@ def get_file_raw(
 def compile_project(
     project_id: int,
     payload: ProjectCompileRequest,
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    get_project_or_404(db, project_id)
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor', 'commenter', 'viewer'})
 
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     entry = resolve_project_entrypoint(entries, payload.entrypoint)
@@ -936,8 +1567,14 @@ def list_available_fonts():
 
 
 @app.get('/projects/{project_id}/pdf')
-def get_pdf(project_id: int, entrypoint: str = Query('main.typ'), db: Session = Depends(get_db)):
-    get_project_or_404(db, project_id)
+def get_pdf(
+    project_id: int,
+    entrypoint: str = Query('main.typ'),
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     entry = resolve_project_entrypoint(entries, entrypoint)
     pdf_path = get_project_dir(project_id) / Path(entry.path).with_suffix('.pdf')
@@ -950,9 +1587,11 @@ def get_pdf(project_id: int, entrypoint: str = Query('main.typ'), db: Session = 
 def download_pdf(
     project_id: int,
     entrypoint: str = Query('main.typ'),
+    current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    get_project_or_404(db, project_id)
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     entry = resolve_project_entrypoint(entries, entrypoint)
     normalized_entrypoint = entry.path

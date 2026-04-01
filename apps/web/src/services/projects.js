@@ -1,119 +1,200 @@
 import { API_URL } from '../config/api'
 import { PREVIEW_URL } from '../config/preview'
 
+const AUTH_TOKEN_STORAGE_KEY = 'typst-editor-auth-token'
+
+function createHttpError(response, rawMessage, fallbackMessage = '') {
+  let normalizedMessage = rawMessage || fallbackMessage || `Request failed with status ${response.status}`
+
+  if (rawMessage) {
+    try {
+      const payload = JSON.parse(rawMessage)
+      normalizedMessage = payload.detail || payload.message || normalizedMessage
+    } catch {
+      normalizedMessage = rawMessage || normalizedMessage
+    }
+  }
+
+  const error = new Error(normalizedMessage)
+  error.status = response.status
+  error.response = response
+  return error
+}
+
+function getAuthHeaders(headers = {}) {
+  const token = getAuthToken()
+  if (!token) return headers
+
+  return {
+    ...headers,
+    Authorization: `Bearer ${token}`,
+  }
+}
+
 async function parseJsonResponse(response) {
   if (!response.ok) {
     const message = await response.text()
-    throw new Error(message || `Request failed with status ${response.status}`)
+    throw createHttpError(response, message)
   }
 
+  if (response.status === 204) return null
   return response.json()
 }
 
-export async function listProjects() {
-  const response = await fetch(`${API_URL}/projects`)
+async function apiFetch(path, options = {}) {
+  const response = await fetch(`${API_URL}${path}`, {
+    ...options,
+    headers: getAuthHeaders(options.headers || {}),
+  })
   return parseJsonResponse(response)
 }
 
-export async function createProject(name) {
-  const response = await fetch(`${API_URL}/projects`, {
+export function getAuthToken() {
+  if (typeof window === 'undefined') return ''
+  return window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || ''
+}
+
+export function setAuthToken(token) {
+  if (typeof window === 'undefined') return
+  if (token) {
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token)
+  } else {
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY)
+  }
+}
+
+export async function registerUser(payload) {
+  return apiFetch('/auth/register', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(payload),
   })
+}
 
-  return parseJsonResponse(response)
+export async function loginUser(payload) {
+  return apiFetch('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function logoutUser() {
+  return apiFetch('/auth/logout', {
+    method: 'POST',
+  })
+}
+
+export async function getCurrentUser() {
+  return apiFetch('/auth/me')
+}
+
+export async function listProjects() {
+  return apiFetch('/projects')
+}
+
+export async function createProject(name, description = '') {
+  return apiFetch('/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, description }),
+  })
+}
+
+export async function listProjectMembers(projectId) {
+  return apiFetch(`/projects/${projectId}/members`)
+}
+
+export async function addProjectMember(projectId, payload) {
+  return apiFetch(`/projects/${projectId}/members`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateProjectMember(projectId, memberId, payload) {
+  return apiFetch(`/projects/${projectId}/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteProjectMember(projectId, memberId) {
+  return apiFetch(`/projects/${projectId}/members/${memberId}`, {
+    method: 'DELETE',
+  })
 }
 
 export async function listTags() {
-  const response = await fetch(`${API_URL}/tags`)
-  return parseJsonResponse(response)
+  return apiFetch('/tags')
 }
 
 export async function createTag(name) {
-  const response = await fetch(`${API_URL}/tags`, {
+  return apiFetch('/tags', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function deleteTag(tagId) {
-  const response = await fetch(`${API_URL}/tags/${tagId}`, {
+  return apiFetch(`/tags/${tagId}`, {
     method: 'DELETE',
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function copyProject(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/copy`, {
+  return apiFetch(`/projects/${projectId}/copy`, {
     method: 'POST',
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function deleteProject(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}`, {
+  return apiFetch(`/projects/${projectId}`, {
     method: 'DELETE',
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function updateProjectStatus(projectId, status) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/status`, {
+  return apiFetch(`/projects/${projectId}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ status }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function updateProjectTags(projectId, tagIds) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/tags`, {
+  return apiFetch(`/projects/${projectId}/tags`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tag_ids: tagIds }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function listProjectFiles(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/files`)
-  return parseJsonResponse(response)
+  return apiFetch(`/projects/${projectId}/files`)
 }
 
 export async function searchProjectFiles(projectId, query) {
-  const response = await fetch(
-    `${API_URL}/projects/${projectId}/search?q=${encodeURIComponent(query)}`,
-  )
-  return parseJsonResponse(response)
+  return apiFetch(`/projects/${projectId}/search?q=${encodeURIComponent(query)}`)
 }
 
 export async function createProjectFile(projectId, path) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/files`, {
+  return apiFetch(`/projects/${projectId}/files`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function createProjectFolder(projectId, path) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/folders`, {
+  return apiFetch(`/projects/${projectId}/folders`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function uploadProjectFiles(projectId, files, options = {}) {
@@ -131,6 +212,7 @@ export async function uploadProjectFiles(projectId, files, options = {}) {
 
   const response = await fetch(`${API_URL}/projects/${projectId}/uploads`, {
     method: 'POST',
+    headers: getAuthHeaders(),
     body: formData,
   })
 
@@ -138,51 +220,41 @@ export async function uploadProjectFiles(projectId, files, options = {}) {
 }
 
 export async function getFileContent(fileId) {
-  const response = await fetch(`${API_URL}/files/${fileId}/content`)
-  return parseJsonResponse(response)
+  return apiFetch(`/files/${fileId}/content`)
 }
 
 export async function updateFileContent(fileId, content) {
-  const response = await fetch(`${API_URL}/files/${fileId}/content`, {
+  return apiFetch(`/files/${fileId}/content`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function renameProjectEntry(fileId, path) {
-  const response = await fetch(`${API_URL}/files/${fileId}`, {
+  return apiFetch(`/files/${fileId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function deleteProjectEntry(fileId) {
-  const response = await fetch(`${API_URL}/files/${fileId}`, {
+  return apiFetch(`/files/${fileId}`, {
     method: 'DELETE',
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function compileProject(projectId, options = {}) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/compile`, {
+  return apiFetch(`/projects/${projectId}/compile`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entrypoint: options.entrypoint || '' }),
   })
-
-  return parseJsonResponse(response)
 }
 
 export async function listAvailableFonts() {
-  const response = await fetch(`${API_URL}/fonts`)
-  return parseJsonResponse(response)
+  return apiFetch('/fonts')
 }
 
 export function getProjectPreviewUrl(projectId, options = {}) {
@@ -206,7 +278,9 @@ export async function getProjectPreviewStatus(projectId, options = {}) {
   if (options.entrypoint) {
     url.searchParams.set('entrypoint', options.entrypoint)
   }
-  const response = await fetch(url)
+  const response = await fetch(url, {
+    headers: getAuthHeaders(),
+  })
   return parseJsonResponse(response)
 }
 
@@ -215,15 +289,12 @@ export async function downloadProjectPdf(projectId, options = {}) {
   if (options.entrypoint) {
     url.searchParams.set('entrypoint', options.entrypoint)
   }
-  const response = await fetch(url)
+  const response = await fetch(url, {
+    headers: getAuthHeaders(),
+  })
   if (!response.ok) {
     const message = await response.text()
-    try {
-      const payload = JSON.parse(message)
-      throw new Error(payload.detail || 'Failed to export PDF')
-    } catch {
-      throw new Error(message || 'Failed to export PDF')
-    }
+    throw createHttpError(response, message, 'Failed to export PDF')
   }
 
   const blob = await response.blob()

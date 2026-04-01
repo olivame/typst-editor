@@ -923,7 +923,13 @@ function FontPicker({
   )
 }
 
-export default function Editor({ onBack, onRequestNewProject, projectId }) {
+export default function Editor({
+  onAccessDenied,
+  onAuthFailure,
+  onBack,
+  onRequestNewProject,
+  projectId,
+}) {
   const gutterRef = useRef(null)
   const textareaRef = useRef(null)
   const lineMeasureRef = useRef(null)
@@ -937,6 +943,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
   const fontMenuRef = useRef(null)
   const referenceButtonRef = useRef(null)
   const referenceMenuRef = useRef(null)
+  const accessFailureHandledRef = useRef(false)
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [currentFile, setCurrentFile] = useState(null)
@@ -977,6 +984,28 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
   const lineNumberFontSize = Math.round(13 * editorZoom * 10) / 10
   const gutterWidth = Math.max(52, Math.round(52 * editorZoom))
 
+  useEffect(() => {
+    accessFailureHandledRef.current = false
+  }, [projectId])
+
+  function handleAccessFailure(error, fallbackMessage = '') {
+    if (!error || accessFailureHandledRef.current) return false
+
+    if (error.status === 401) {
+      accessFailureHandledRef.current = true
+      onAuthFailure?.(error.message || fallbackMessage || '登录状态已失效，请重新登录。')
+      return true
+    }
+
+    if (error.status === 403) {
+      accessFailureHandledRef.current = true
+      onAccessDenied?.(error.message || fallbackMessage || '你当前无权访问这个项目。')
+      return true
+    }
+
+    return false
+  }
+
   const updateFileTreeCollapsedFolders = (updater) => {
     setFileTreeCollapsedStateByProject((current) => {
       const projectState = current[projectId] || {}
@@ -1015,109 +1044,125 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
   }
 
   async function selectEntry(entry) {
-    setSelectedEntry(entry)
-    setSelectedEntryPathByProject((current) => (
-      current[projectId] === entry.path
-        ? current
-        : { ...current, [projectId]: entry.path }
-    ))
-
-    if (isTypEntry(entry)) {
-      setActivePreviewPath(entry.path)
-    }
-
-    if (entry?.kind === 'file' && !entry?.is_binary) {
-      setLastOpenedFilePathByProject((current) => (
+    try {
+      setSelectedEntry(entry)
+      setSelectedEntryPathByProject((current) => (
         current[projectId] === entry.path
           ? current
           : { ...current, [projectId]: entry.path }
       ))
-    }
 
-    if (entry.kind === 'folder' || entry.is_binary) {
-      setCurrentFile(null)
-      setContent('')
-      return
-    }
+      if (isTypEntry(entry)) {
+        setActivePreviewPath(entry.path)
+      }
 
-    const data = await getFileContent(entry.id)
-    setCurrentFile(data)
-    setContent(data.content)
+      if (entry?.kind === 'file' && !entry?.is_binary) {
+        setLastOpenedFilePathByProject((current) => (
+          current[projectId] === entry.path
+            ? current
+            : { ...current, [projectId]: entry.path }
+        ))
+      }
+
+      if (entry.kind === 'folder' || entry.is_binary) {
+        setCurrentFile(null)
+        setContent('')
+        return
+      }
+
+      const data = await getFileContent(entry.id)
+      setCurrentFile(data)
+      setContent(data.content)
+    } catch (error) {
+      if (handleAccessFailure(error, '无法打开当前文件。')) return
+      throw error
+    }
   }
 
   async function refreshFiles(preferredPath = '') {
-    const nextFiles = await listProjectFiles(projectId)
-    setFiles(nextFiles)
+    try {
+      const nextFiles = await listProjectFiles(projectId)
+      setFiles(nextFiles)
 
-    const nextSelectedEntry = nextFiles.find((entry) => (
-      entry.path === (preferredPath || selectedEntry?.path || rememberedSelectedEntryPath)
-    )) || findPreferredTypEntry(nextFiles)
+      const nextSelectedEntry = nextFiles.find((entry) => (
+        entry.path === (preferredPath || selectedEntry?.path || rememberedSelectedEntryPath)
+      )) || findPreferredTypEntry(nextFiles)
 
-    if (!nextSelectedEntry) {
-      setSelectedEntry(null)
-      setCurrentFile(null)
-      setContent('')
-      setSelectedEntryPathByProject((current) => (
-        current[projectId]
-          ? { ...current, [projectId]: '' }
-          : current
-      ))
-      return
+      if (!nextSelectedEntry) {
+        setSelectedEntry(null)
+        setCurrentFile(null)
+        setContent('')
+        setSelectedEntryPathByProject((current) => (
+          current[projectId]
+            ? { ...current, [projectId]: '' }
+            : current
+        ))
+        return
+      }
+
+      const nextPreviewEntry = findPreferredTypEntry(
+        nextFiles,
+        preferredPath || activePreviewPath || nextSelectedEntry.path,
+      )
+      setActivePreviewPath(nextPreviewEntry?.path || '')
+
+      await selectEntry(nextSelectedEntry)
+    } catch (error) {
+      if (handleAccessFailure(error, '无法读取项目文件列表。')) return
+      throw error
     }
-
-    const nextPreviewEntry = findPreferredTypEntry(
-      nextFiles,
-      preferredPath || activePreviewPath || nextSelectedEntry.path,
-    )
-    setActivePreviewPath(nextPreviewEntry?.path || '')
-
-    await selectEntry(nextSelectedEntry)
   }
 
   useEffect(() => {
     let isCancelled = false
 
     async function loadInitialFiles() {
-      const nextFiles = await listProjectFiles(projectId)
-      if (isCancelled) return
+      try {
+        const nextFiles = await listProjectFiles(projectId)
+        if (isCancelled) return
 
-      setFiles(nextFiles)
+        setFiles(nextFiles)
 
-      const initialEntry = findPreferredTypEntry(nextFiles)
-      if (!initialEntry) {
-        setSelectedEntry(null)
-        setCurrentFile(null)
-        setContent('')
-        setActivePreviewPath('')
-        return
+        const initialEntry = findPreferredTypEntry(nextFiles)
+        if (!initialEntry) {
+          setSelectedEntry(null)
+          setCurrentFile(null)
+          setContent('')
+          setActivePreviewPath('')
+          return
+        }
+
+        const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, initialEntry.path)
+        setActivePreviewPath(fallbackPreviewEntry?.path || '')
+
+        setSelectedEntry(initialEntry)
+        setSelectedEntryPathByProject((current) => (
+          current[projectId] === initialEntry.path
+            ? current
+            : { ...current, [projectId]: initialEntry.path }
+        ))
+        setLastOpenedFilePathByProject((current) => (
+          current[projectId] === initialEntry.path
+            ? current
+            : { ...current, [projectId]: initialEntry.path }
+        ))
+
+        if (initialEntry.kind === 'folder' || initialEntry.is_binary) {
+          setCurrentFile(null)
+          setContent('')
+          return
+        }
+
+        const data = await getFileContent(initialEntry.id)
+        if (isCancelled) return
+
+        setCurrentFile(data)
+        setContent(data.content)
+      } catch (error) {
+        if (isCancelled) return
+        if (handleAccessFailure(error, '无法打开当前项目。')) return
+        showStatus(error.message || 'Failed to load project files')
       }
-
-      const fallbackPreviewEntry = findPreferredTypEntry(nextFiles, initialEntry.path)
-      setActivePreviewPath(fallbackPreviewEntry?.path || '')
-
-      setSelectedEntry(initialEntry)
-      setSelectedEntryPathByProject((current) => (
-        current[projectId] === initialEntry.path
-          ? current
-          : { ...current, [projectId]: initialEntry.path }
-      ))
-      setLastOpenedFilePathByProject((current) => (
-        current[projectId] === initialEntry.path
-          ? current
-          : { ...current, [projectId]: initialEntry.path }
-      ))
-
-      if (initialEntry.kind === 'folder' || initialEntry.is_binary) {
-        setCurrentFile(null)
-        setContent('')
-        return
-      }
-
-      const data = await getFileContent(initialEntry.id)
-      if (isCancelled) return
-
-      setCurrentFile(data)
-      setContent(data.content)
     }
 
     void loadInitialFiles()
@@ -1182,8 +1227,9 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
 
         setPreviewStatus(payload?.status && typeof payload.status === 'object' ? payload.status : { kind: 'Idle' })
         setPreviewOutline(Array.isArray(payload?.outline) ? payload.outline : [])
-      } catch {
+      } catch (error) {
         if (isCancelled) return
+        if (handleAccessFailure(error, '无法获取预览状态。')) return
 
         setPreviewStatus({ kind: 'Unavailable' })
         setPreviewOutline([])
@@ -1209,6 +1255,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
       setCurrentFile((current) => (current ? { ...current, content } : current))
       showStatus('Saved', 3000)
     } catch (error) {
+      if (handleAccessFailure(error, '保存失败，请重新登录后重试。')) return
       showStatus(error.message || 'Failed to save')
     }
   }
@@ -1505,6 +1552,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
       })
       showStatus(`Exported ${activePreviewEntry.name}`, 3000)
     } catch (error) {
+      if (handleAccessFailure(error, '导出失败，请检查项目权限。')) return
       showStatus(error.message || 'Failed to export PDF')
     }
   }
@@ -1529,6 +1577,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
         relativePaths: [],
       })
     } catch (error) {
+      if (handleAccessFailure(error, '上传失败，请检查项目权限。')) return
       showStatus(error.message || 'Failed to upload files', 2500)
     }
   }
@@ -1558,6 +1607,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
         await handleCreateFolder(nextPath)
       }
     } catch (error) {
+      if (handleAccessFailure(error, `Failed to create ${kind}`)) return
       showStatus(error.message || `Failed to create ${kind}`, 2500)
     }
   }
@@ -1580,6 +1630,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
     try {
       await handleRenameEntry(selectedEntry, joinPath(getParentPath(selectedEntry.path), trimmedName))
     } catch (error) {
+      if (handleAccessFailure(error, 'Failed to rename entry')) return
       showStatus(error.message || 'Failed to rename entry', 2500)
     }
   }
@@ -1600,6 +1651,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
     try {
       await handleDeleteEntry(selectedEntry)
     } catch (error) {
+      if (handleAccessFailure(error, 'Failed to delete entry')) return
       showStatus(error.message || 'Failed to delete entry', 2500)
     }
   }
@@ -1730,6 +1782,7 @@ export default function Editor({ onBack, onRequestNewProject, projectId }) {
         1500,
       )
     } catch (error) {
+      if (handleAccessFailure(error, `Failed to ${action}`)) return
       showStatus(error.message || `Failed to ${action}`, 2500)
     }
   }

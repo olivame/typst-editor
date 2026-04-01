@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  addProjectMember as addProjectMemberRequest,
   createProject as createProjectRequest,
   createTag as createTagRequest,
   copyProject as copyProjectRequest,
   deleteProject as deleteProjectRequest,
+  deleteProjectMember as deleteProjectMemberRequest,
   deleteTag as deleteTagRequest,
   listProjectFiles,
+  listProjectMembers,
   listProjects,
   listTags,
+  updateProjectMember as updateProjectMemberRequest,
   updateProjectTags as updateProjectTagsRequest,
   updateProjectStatus as updateProjectStatusRequest,
   updateFileContent,
@@ -107,7 +111,24 @@ function formatProjectDate(value) {
   return `${diffDays} days ago`
 }
 
-export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }) {
+function isOwnedByCurrentUser(project, currentUser) {
+  if (project?.created_by_id == null || currentUser?.id == null) return false
+  return String(project.created_by_id) === String(currentUser.id)
+}
+
+function getProjectOwnerLabel(project) {
+  const owner = project?.created_by
+  if (!owner || project?.created_by_id == null) return 'Shared'
+  return owner.display_name || owner.email || `User ${project.created_by_id}`
+}
+
+export default function ProjectList({
+  currentUser,
+  externalMessage = '',
+  newProjectIntentNonce = 0,
+  onLogout,
+  onOpenProject,
+}) {
   const actionMenuTriggerRefs = useRef({})
   const headerCheckboxRef = useRef(null)
   const [projects, setProjects] = useState([])
@@ -131,6 +152,10 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
   const [editingProjectTags, setEditingProjectTags] = useState(null)
   const [draftTagIds, setDraftTagIds] = useState([])
   const [isSavingProjectTags, setIsSavingProjectTags] = useState(false)
+  const [managingProjectMembers, setManagingProjectMembers] = useState(null)
+  const [projectMembers, setProjectMembers] = useState([])
+  const [memberEmailDraft, setMemberEmailDraft] = useState('')
+  const [isManagingMembersBusy, setIsManagingMembersBusy] = useState(false)
 
   useEffect(() => {
     Promise.all([listProjects(), listTags()])
@@ -139,7 +164,7 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
         setTags(loadedTags)
       })
       .catch((error) => setErrorMessage(error.message || 'Failed to load projects'))
-  }, [])
+  }, [currentUser?.id])
 
   useEffect(() => {
     const handleWindowClick = () => setOpenActionMenuProjectId(null)
@@ -166,6 +191,8 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
   const filteredProjects = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase()
     const viewProjects = projects.filter((project) => {
+      if (selectedView === 'your') return isOwnedByCurrentUser(project, currentUser)
+      if (selectedView === 'shared') return !isOwnedByCurrentUser(project, currentUser)
       if (selectedView === 'archived') return project.status === 'archived'
       if (selectedView === 'trashed') return project.status === 'trashed'
       return project.status !== 'trashed' && project.status !== 'archived'
@@ -179,7 +206,7 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
     return visibleProjects.filter((project) =>
       project.name.toLowerCase().includes(normalizedQuery),
     )
-  }, [projects, searchQuery, selectedTagId, selectedView])
+  }, [currentUser?.id, projects, searchQuery, selectedTagId, selectedView])
 
   const viewTitle = useMemo(() => {
     const currentItem = SIDEBAR_ITEMS.find((item) => item.id === selectedView)
@@ -273,18 +300,27 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
 
     try {
       const project = await createProjectRequest(trimmedName)
+      const normalizedProject = {
+        ...project,
+        created_by_id: project?.created_by_id ?? currentUser?.id ?? null,
+        created_by: project?.created_by || (currentUser ? {
+          id: currentUser.id,
+          email: currentUser.email,
+          display_name: currentUser.display_name,
+        } : null),
+      }
 
       if (selectedTemplate.content) {
-        const files = await listProjectFiles(project.id)
+        const files = await listProjectFiles(normalizedProject.id)
         if (files.length > 0) {
           await updateFileContent(files[0].id, selectedTemplate.content)
         }
       }
 
-      setProjects((currentProjects) => [project, ...currentProjects])
+      setProjects((currentProjects) => [normalizedProject, ...currentProjects])
       setErrorMessage('')
       closeTemplateModal()
-      onOpenProject(project.id)
+      onOpenProject(normalizedProject.id)
     } catch (error) {
       setErrorMessage(error.message || 'Failed to create project')
       setIsCreatingProject(false)
@@ -308,6 +344,30 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
     setEditingProjectTags(null)
     setDraftTagIds([])
     setIsSavingProjectTags(false)
+  }
+
+  const openProjectMembersModal = async (project) => {
+    setManagingProjectMembers(project)
+    setMemberEmailDraft('')
+    setIsManagingMembersBusy(true)
+    try {
+      const membersPayload = await listProjectMembers(project.id)
+      setProjectMembers(Array.isArray(membersPayload) ? membersPayload : [])
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to load project members')
+      setManagingProjectMembers(null)
+    } finally {
+      setIsManagingMembersBusy(false)
+      setOpenActionMenuProjectId(null)
+    }
+  }
+
+  const closeProjectMembersModal = () => {
+    setManagingProjectMembers(null)
+    setProjectMembers([])
+    setMemberEmailDraft('')
+    setIsManagingMembersBusy(false)
   }
 
   const createTag = async () => {
@@ -368,6 +428,58 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
     }
   }
 
+  const handleAddProjectMember = async () => {
+    if (!managingProjectMembers || !memberEmailDraft.trim() || isManagingMembersBusy) return
+    setIsManagingMembersBusy(true)
+    try {
+      const nextMember = await addProjectMemberRequest(managingProjectMembers.id, {
+        email: memberEmailDraft.trim(),
+        role: 'editor',
+      })
+      setProjectMembers((current) => {
+        const existingIndex = current.findIndex((member) => member.id === nextMember.id)
+        if (existingIndex === -1) return [...current, nextMember]
+        const next = [...current]
+        next[existingIndex] = nextMember
+        return next
+      })
+      setMemberEmailDraft('')
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to add project member')
+    } finally {
+      setIsManagingMembersBusy(false)
+    }
+  }
+
+  const handleUpdateProjectMemberRole = async (member, role) => {
+    if (!managingProjectMembers || isManagingMembersBusy) return
+    setIsManagingMembersBusy(true)
+    try {
+      const updated = await updateProjectMemberRequest(managingProjectMembers.id, member.id, { role })
+      setProjectMembers((current) => current.map((item) => (item.id === updated.id ? updated : item)))
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to update member role')
+    } finally {
+      setIsManagingMembersBusy(false)
+    }
+  }
+
+  const handleDeleteProjectMember = async (member) => {
+    if (!managingProjectMembers || isManagingMembersBusy) return
+    setIsManagingMembersBusy(true)
+    try {
+      await deleteProjectMemberRequest(managingProjectMembers.id, member.id)
+      setProjectMembers((current) => current.filter((item) => item.id !== member.id))
+      setErrorMessage('')
+    } catch (error) {
+      setErrorMessage(error.message || 'Failed to remove project member')
+    } finally {
+      setIsManagingMembersBusy(false)
+    }
+  }
+
   const copyProject = async (project) => {
     if (activeProjectAction) return
 
@@ -375,7 +487,16 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
     setActiveProjectAction(`copy-${project.id}`)
     try {
       const copiedProject = await copyProjectRequest(project.id)
-      setProjects((currentProjects) => [copiedProject, ...currentProjects])
+      const normalizedProject = {
+        ...copiedProject,
+        created_by_id: copiedProject?.created_by_id ?? currentUser?.id ?? null,
+        created_by: copiedProject?.created_by || (currentUser ? {
+          id: currentUser.id,
+          email: currentUser.email,
+          display_name: currentUser.display_name,
+        } : null),
+      }
+      setProjects((currentProjects) => [normalizedProject, ...currentProjects])
       setErrorMessage('')
     } catch (error) {
       setErrorMessage(error.message || 'Failed to copy project')
@@ -597,6 +718,9 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
     if (selectedView === 'archived') {
       return (
         <>
+          <button type="button" style={styles.actionMenuItem} onClick={() => void openProjectMembersModal(project)}>
+            Members
+          </button>
           <button type="button" style={styles.actionMenuItem} onClick={() => openProjectTagsModal(project)}>
             Tags
           </button>
@@ -614,6 +738,9 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
       <>
         <button type="button" style={styles.actionMenuItem} onClick={() => copyProject(project)}>
           {activeProjectAction === `copy-${project.id}` ? 'Copying...' : 'Copy'}
+        </button>
+        <button type="button" style={styles.actionMenuItem} onClick={() => void openProjectMembersModal(project)}>
+          Members
         </button>
         <button type="button" style={styles.actionMenuItem} onClick={() => openProjectTagsModal(project)}>
           Tags
@@ -738,7 +865,15 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
           <div style={styles.pageTitle}>
             {selectedTag ? `${viewTitle} · ${selectedTag.name}` : viewTitle}
           </div>
-          <button type="button" style={styles.accountButton}>Admin ▾</button>
+          <div style={styles.accountGroup}>
+              <div style={styles.accountMeta}>
+                <div style={styles.accountName}>{currentUser?.display_name || currentUser?.email || 'User'}</div>
+                <div style={styles.accountRole}>
+                {currentUser?.is_root_admin ? 'Root admin' : 'Project member'}
+                </div>
+              </div>
+            <button onClick={onLogout} type="button" style={styles.accountButton}>Logout</button>
+          </div>
         </div>
 
         <section style={styles.tableCard}>
@@ -828,7 +963,9 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
             </div>
           )}
 
-          {errorMessage && <div style={styles.errorBanner}>{errorMessage}</div>}
+          {(externalMessage || errorMessage) ? (
+            <div style={styles.errorBanner}>{externalMessage || errorMessage}</div>
+          ) : null}
 
           <div style={styles.table}>
             <div style={{ ...styles.tableRow, ...styles.tableHead }}>
@@ -848,64 +985,68 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
               <div style={{ ...styles.tableCell, ...styles.actionsCell }}>Actions</div>
             </div>
 
-            {filteredProjects.map((project) => (
-              <div
-                key={project.id}
-                style={{
-                  ...styles.tableRow,
-                  ...(selectedProjectIdSet.has(project.id) ? styles.tableRowSelected : null),
-                }}
-              >
-                <div style={{ ...styles.tableCell, ...styles.checkboxCell }}>
-                  <input
-                    aria-label={`Select project ${project.name}`}
-                    checked={selectedProjectIdSet.has(project.id)}
-                    onChange={() => toggleProjectSelection(project.id)}
-                    style={styles.checkboxInput}
-                    type="checkbox"
-                  />
-                </div>
-                <button
-                  type="button"
-                  onClick={() => onOpenProject(project.id)}
-                  style={{ ...styles.tableCell, ...styles.titleButton }}
+            <div style={styles.tableBody}>
+              {filteredProjects.map((project) => (
+                <div
+                  key={project.id}
+                  style={{
+                    ...styles.tableRow,
+                    ...(selectedProjectIdSet.has(project.id) ? styles.tableRowSelected : null),
+                  }}
                 >
-                  <div style={styles.projectTitleStack}>
-                    <span>{project.name}</span>
-                    {project.tags?.length ? (
-                      <span style={styles.projectTagRow}>
-                        {project.tags.map((tag) => (
-                          <span key={tag.id} style={styles.projectTagChip}>{tag.name}</span>
-                        ))}
-                      </span>
-                    ) : null}
+                  <div style={{ ...styles.tableCell, ...styles.checkboxCell }}>
+                    <input
+                      aria-label={`Select project ${project.name}`}
+                      checked={selectedProjectIdSet.has(project.id)}
+                      onChange={() => toggleProjectSelection(project.id)}
+                      style={styles.checkboxInput}
+                      type="checkbox"
+                    />
                   </div>
-                </button>
-                <div style={{ ...styles.tableCell, ...styles.ownerCell }}>You</div>
-                <div style={{ ...styles.tableCell, ...styles.modifiedCell }}>
-                  {formatProjectDate(project.created_at)} by You
-                </div>
-                <div style={{ ...styles.tableCell, ...styles.actionsCell }}>
-                  <div style={styles.actionMenuWrap}>
-                    <button
-                      type="button"
-                      ref={(element) => {
-                        actionMenuTriggerRefs.current[project.id] = element
-                      }}
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        setOpenActionMenuProjectId((currentId) =>
-                          currentId === project.id ? null : project.id,
-                        )
-                      }}
-                      style={styles.actionMenuTrigger}
-                    >
-                      ⋯
-                    </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenProject(project.id)}
+                    style={{ ...styles.tableCell, ...styles.titleButton }}
+                  >
+                    <div style={styles.projectTitleStack}>
+                      <span>{project.name}</span>
+                      {project.tags?.length ? (
+                        <span style={styles.projectTagRow}>
+                          {project.tags.map((tag) => (
+                            <span key={tag.id} style={styles.projectTagChip}>{tag.name}</span>
+                          ))}
+                        </span>
+                      ) : null}
+                    </div>
+                  </button>
+                  <div style={{ ...styles.tableCell, ...styles.ownerCell }}>
+                    {getProjectOwnerLabel(project)}
+                  </div>
+                  <div style={{ ...styles.tableCell, ...styles.modifiedCell }}>
+                    {formatProjectDate(project.created_at)} by {getProjectOwnerLabel(project)}
+                  </div>
+                  <div style={{ ...styles.tableCell, ...styles.actionsCell }}>
+                    <div style={styles.actionMenuWrap}>
+                      <button
+                        type="button"
+                        ref={(element) => {
+                          actionMenuTriggerRefs.current[project.id] = element
+                        }}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setOpenActionMenuProjectId((currentId) =>
+                            currentId === project.id ? null : project.id,
+                          )
+                        }}
+                        style={styles.actionMenuTrigger}
+                      >
+                        ⋯
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
 
           <div style={styles.tableFooter}>
@@ -1060,6 +1201,80 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
         </div>
       )}
 
+      {managingProjectMembers && (
+        <div style={styles.modalOverlay} onClick={closeProjectMembersModal}>
+          <div style={styles.tagModal} onClick={(event) => event.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div style={styles.modalTitle}>Project members</div>
+              <button type="button" style={styles.modalClose} onClick={closeProjectMembersModal}>×</button>
+            </div>
+            <div style={styles.modalBody}>
+              <div style={styles.modalLabel}>{managingProjectMembers.name}</div>
+
+              <div style={styles.memberInviteRow}>
+                <input
+                  onChange={(event) => setMemberEmailDraft(event.target.value)}
+                  placeholder="Add project member by email"
+                  style={styles.modalInput}
+                  value={memberEmailDraft}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      void handleAddProjectMember()
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleAddProjectMember()}
+                  style={styles.memberInviteButton}
+                >
+                  Add
+                </button>
+              </div>
+
+              <div style={styles.memberList}>
+                {projectMembers.map((member) => (
+                  <div key={member.id} style={styles.memberRow}>
+                    <div style={styles.memberIdentity}>
+                      <div style={styles.memberName}>{member.user?.display_name || member.user?.email || `User ${member.user_id}`}</div>
+                      <div style={styles.memberMeta}>{member.user?.email || `user:${member.user_id}`}</div>
+                    </div>
+                    <select
+                      onChange={(event) => {
+                        void handleUpdateProjectMemberRole(member, event.target.value)
+                      }}
+                      style={styles.memberRoleSelect}
+                      value={member.role}
+                    >
+                      <option value="maintainer">maintainer</option>
+                      <option value="editor">editor</option>
+                      <option value="commenter">commenter</option>
+                      <option value="viewer">viewer</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteProjectMember(member)}
+                      style={styles.memberRemoveButton}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {isManagingMembersBusy ? (
+                <div style={styles.emptyTagHint}>Updating members...</div>
+              ) : null}
+            </div>
+            <div style={styles.modalFooter}>
+              <button type="button" onClick={closeProjectMembersModal} style={styles.modalSecondaryButton}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {confirmationModal && (
         <div style={styles.modalOverlay} onClick={() => setConfirmationModal(null)}>
           <div style={styles.confirmationModal} onClick={(event) => event.stopPropagation()}>
@@ -1108,10 +1323,11 @@ export default function ProjectList({ newProjectIntentNonce = 0, onOpenProject }
 
 const styles = {
   page: {
-    minHeight: '100vh',
+    height: '100vh',
     display: 'flex',
     background: '#f3f5f7',
     color: '#1f2937',
+    overflow: 'hidden',
   },
   sidebar: {
     width: '240px',
@@ -1121,6 +1337,7 @@ const styles = {
     display: 'flex',
     flexDirection: 'column',
     gap: '18px',
+    overflowY: 'auto',
   },
   brand: {
     display: 'flex',
@@ -1308,6 +1525,8 @@ const styles = {
     flexDirection: 'column',
     gap: '18px',
     minWidth: 0,
+    minHeight: 0,
+    overflowY: 'auto',
   },
   topbar: {
     display: 'flex',
@@ -1320,11 +1539,34 @@ const styles = {
     color: '#334155',
   },
   accountButton: {
-    border: 'none',
-    background: 'transparent',
-    color: '#475569',
-    fontSize: '15px',
+    height: '40px',
+    padding: '0 14px',
+    borderRadius: '999px',
+    border: '1px solid #cbd5e1',
+    background: '#ffffff',
+    color: '#334155',
+    fontSize: '14px',
+    fontWeight: '700',
     cursor: 'pointer',
+  },
+  accountGroup: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+  },
+  accountMeta: {
+    display: 'grid',
+    justifyItems: 'end',
+    gap: '2px',
+  },
+  accountName: {
+    fontSize: '14px',
+    fontWeight: '800',
+    color: '#334155',
+  },
+  accountRole: {
+    fontSize: '12px',
+    color: '#64748b',
   },
   tableCard: {
     background: '#fff',
@@ -1332,6 +1574,10 @@ const styles = {
     borderRadius: '18px',
     overflow: 'hidden',
     boxShadow: '0 12px 30px rgba(148, 163, 184, 0.14)',
+    display: 'flex',
+    flexDirection: 'column',
+    flex: 1,
+    minHeight: 0,
   },
   searchRow: {
     padding: '18px 20px 10px',
@@ -1413,6 +1659,14 @@ const styles = {
   table: {
     display: 'flex',
     flexDirection: 'column',
+    flex: 1,
+    minHeight: 0,
+  },
+  tableBody: {
+    display: 'flex',
+    flexDirection: 'column',
+    overflowY: 'auto',
+    minHeight: 0,
   },
   tableRow: {
     display: 'grid',
@@ -1634,6 +1888,99 @@ const styles = {
     gap: '10px',
     fontSize: '15px',
     color: '#334155',
+  },
+  memberInviteRow: {
+    display: 'grid',
+    gridTemplateColumns: '1fr auto',
+    gap: '10px',
+    marginBottom: '14px',
+  },
+  memberInviteButton: {
+    border: 'none',
+    borderRadius: '10px',
+    background: '#284b63',
+    color: '#fff',
+    fontWeight: '700',
+    padding: '0 16px',
+    cursor: 'pointer',
+  },
+  memberAddList: {
+    display: 'grid',
+    gap: '8px',
+    marginBottom: '16px',
+  },
+  memberAddItem: {
+    border: '1px solid #d8dee6',
+    borderRadius: '10px',
+    background: '#f8fafc',
+    color: '#334155',
+    padding: '10px 12px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    cursor: 'pointer',
+    fontSize: '14px',
+    fontWeight: '600',
+  },
+  memberRoleBadge: {
+    minWidth: '42px',
+    height: '24px',
+    borderRadius: '999px',
+    background: '#deecfb',
+    color: '#1e4d7b',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '12px',
+    fontWeight: '800',
+  },
+  memberList: {
+    display: 'grid',
+    gap: '10px',
+  },
+  memberRow: {
+    display: 'grid',
+    gridTemplateColumns: '1fr auto auto',
+    gap: '10px',
+    alignItems: 'center',
+    padding: '12px',
+    borderRadius: '12px',
+    border: '1px solid #dde4ea',
+    background: '#fbfdff',
+  },
+  memberIdentity: {
+    minWidth: 0,
+  },
+  memberName: {
+    fontSize: '14px',
+    fontWeight: '700',
+    color: '#1f2937',
+  },
+  memberMeta: {
+    fontSize: '12px',
+    color: '#64748b',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  memberRoleSelect: {
+    height: '36px',
+    borderRadius: '10px',
+    border: '1px solid #cbd5e1',
+    background: '#fff',
+    color: '#334155',
+    padding: '0 10px',
+    fontSize: '13px',
+  },
+  memberRemoveButton: {
+    height: '36px',
+    borderRadius: '10px',
+    border: '1px solid #efc1bb',
+    background: '#fff5f4',
+    color: '#a63b2b',
+    fontWeight: '700',
+    padding: '0 12px',
+    cursor: 'pointer',
   },
   emptyTagHint: {
     fontSize: '14px',
