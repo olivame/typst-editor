@@ -9,11 +9,13 @@ services:
     depends_on:
       - api
       - preview
+      - realtime
     ports:
       - "3000:3000"
     environment:
       - VITE_API_URL=${VITE_API_URL:-}
       - VITE_PREVIEW_URL=${VITE_PREVIEW_URL:-}
+      - VITE_REALTIME_URL=${VITE_REALTIME_URL:-}
     networks:
       - app-net
 
@@ -40,6 +42,8 @@ services:
       - DB_NAME=${DB_NAME}
       - COMPILER_URL=${COMPILER_URL:-http://compiler:8001}
       - COMPILER_TIMEOUT_SECONDS=${COMPILER_TIMEOUT_SECONDS:-10}
+      - REALTIME_URL=${REALTIME_URL:-http://realtime:8003}
+      - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
       - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
     ports:
@@ -99,6 +103,24 @@ services:
       - "8002:8002"
     volumes:
       - ./storage/projects:/workspace/projects
+    networks:
+      - app-net
+
+  realtime:
+    build:
+      context: ./services/realtime
+      dockerfile: Dockerfile
+      args:
+        - NODE_BASE_IMAGE=${NODE_BASE_IMAGE:-node:22-alpine}
+        - NPM_REGISTRY=${NPM_REGISTRY:-}
+    depends_on:
+      - api
+    environment:
+      - REALTIME_PORT=${REALTIME_PORT:-8003}
+      - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
+      - API_INTERNAL_URL=http://api:8000
+    ports:
+      - "8003:8003"
     networks:
       - app-net
 

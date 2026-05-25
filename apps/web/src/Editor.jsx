@@ -1,4 +1,5 @@
-import { useDeferredValue, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
+import CollaborativeEditor from './components/editor/CollaborativeEditor'
 import DiagnosticsSidebar from './components/DiagnosticsSidebar'
 import EditorToolbar from './components/EditorToolbar'
 import FileAssetPreview from './components/FileAssetPreview'
@@ -930,9 +931,7 @@ export default function Editor({
   onRequestNewProject,
   projectId,
 }) {
-  const gutterRef = useRef(null)
-  const textareaRef = useRef(null)
-  const lineMeasureRef = useRef(null)
+  const editorRef = useRef(null)
   const statusTimerRef = useRef(null)
   const pendingCursorJumpRef = useRef(null)
   const pendingEditorSelectionRef = useRef(null)
@@ -952,7 +951,6 @@ export default function Editor({
   const [sidebarMode, setSidebarMode] = useState('files')
   const [fileTreeCollapsedStateByProject, setFileTreeCollapsedStateByProject] = useState({})
   const [selectedEntryPathByProject, setSelectedEntryPathByProject] = useState({})
-  const [lastOpenedFilePathByProject, setLastOpenedFilePathByProject] = useState({})
   const [editorZoom, setEditorZoom] = useState(1)
   const [previewZoom, setPreviewZoom] = useState(1)
   const [isPreviewVisible, setIsPreviewVisible] = useState(true)
@@ -972,17 +970,11 @@ export default function Editor({
   const [activePreviewPath, setActivePreviewPath] = useState('main.typ')
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
-  const [wrappedLineLayout, setWrappedLineLayout] = useState([])
-  const [textareaMeasureWidth, setTextareaMeasureWidth] = useState(0)
   const [isWordWrapEnabled, setIsWordWrapEnabled] = useState(true)
   const fileTreeCollapsedFolders = fileTreeCollapsedStateByProject[projectId] || {}
   const rememberedSelectedEntryPath = selectedEntryPathByProject[projectId] || ''
-  const lastOpenedFilePath = lastOpenedFilePathByProject[projectId] || ''
-  const deferredContent = useDeferredValue(content)
   const editorFontSize = Math.round(15 * editorZoom * 10) / 10
   const editorLineHeight = Math.round(24 * editorZoom * 10) / 10
-  const lineNumberFontSize = Math.round(13 * editorZoom * 10) / 10
-  const gutterWidth = Math.max(52, Math.round(52 * editorZoom))
 
   useEffect(() => {
     accessFailureHandledRef.current = false
@@ -1054,14 +1046,6 @@ export default function Editor({
 
       if (isTypEntry(entry)) {
         setActivePreviewPath(entry.path)
-      }
-
-      if (entry?.kind === 'file' && !entry?.is_binary) {
-        setLastOpenedFilePathByProject((current) => (
-          current[projectId] === entry.path
-            ? current
-            : { ...current, [projectId]: entry.path }
-        ))
       }
 
       if (entry.kind === 'folder' || entry.is_binary) {
@@ -1141,11 +1125,6 @@ export default function Editor({
             ? current
             : { ...current, [projectId]: initialEntry.path }
         ))
-        setLastOpenedFilePathByProject((current) => (
-          current[projectId] === initialEntry.path
-            ? current
-            : { ...current, [projectId]: initialEntry.path }
-        ))
 
         if (initialEntry.kind === 'folder' || initialEntry.is_binary) {
           setCurrentFile(null)
@@ -1186,7 +1165,13 @@ export default function Editor({
 
     if (!matchingEntry) return
 
-    void selectEntry(matchingEntry)
+    const rafId = window.requestAnimationFrame(() => {
+      void selectEntry(matchingEntry)
+    })
+
+    return () => {
+      window.cancelAnimationFrame(rafId)
+    }
   }, [files, rememberedSelectedEntryPath, selectedEntry, sidebarMode])
 
   useEffect(() => {
@@ -1428,13 +1413,11 @@ export default function Editor({
     }
   }
 
-  function handleEditorDoubleClick() {
-    const textarea = textareaRef.current
-    if (!textarea || !currentFile) return
+  function handleEditorDoubleClick(cursor) {
+    if (typeof cursor !== 'number' || !currentFile) return
 
-    const cursor = textarea.selectionStart
-    const lineStart = textarea.value.lastIndexOf('\n', Math.max(cursor - 1, 0)) + 1
-    const lineNumber = textarea.value.slice(0, cursor).split('\n').length - 1
+    const lineStart = content.lastIndexOf('\n', Math.max(cursor - 1, 0)) + 1
+    const lineNumber = content.slice(0, cursor).split('\n').length - 1
     const character = cursor - lineStart
     previewApiRef.current?.revealCursor({
       path: currentFile.path,
@@ -1446,11 +1429,10 @@ export default function Editor({
   useEffect(() => {
     const pendingCursorJump = pendingCursorJumpRef.current
     const pendingEditorSelection = pendingEditorSelectionRef.current
-    if ((!pendingCursorJump && !pendingEditorSelection) || !currentFile || !textareaRef.current) {
+    const editor = editorRef.current
+    if ((!pendingCursorJump && !pendingEditorSelection) || !currentFile || !editor) {
       return
     }
-
-    const textarea = textareaRef.current
 
     if (pendingCursorJump) {
       const matchesSearchJump =
@@ -1490,27 +1472,20 @@ export default function Editor({
         }
       }
 
-      textarea.focus()
-      textarea.setSelectionRange(selectionStart, selectionEnd)
-
       const lineHeight = editorLineHeight
       const lineNumber = matchesPreviewJump ? pendingCursorJump.startLine + 1 : pendingCursorJump.lineNumber
-      const gutterLineNode = gutterRef.current?.children?.[Math.max(lineNumber - 1, 0)] || null
       const targetScrollTop = Math.max(
-        gutterLineNode
-          ? gutterLineNode.offsetTop - (lineHeight * 2)
-          : (lineNumber - 3) * lineHeight,
+        (lineNumber - 3) * lineHeight,
         0,
       )
-      const applyLogicalLineScroll = () => {
-        textarea.scrollTop = targetScrollTop
-        if (gutterRef.current) {
-          gutterRef.current.scrollTop = targetScrollTop
-        }
-      }
-
-      applyLogicalLineScroll()
-      window.requestAnimationFrame(applyLogicalLineScroll)
+      editor.setSelectionRange(selectionStart, selectionEnd, {
+        reveal: true,
+        center: true,
+      })
+      editor.setScrollTop(targetScrollTop)
+      window.requestAnimationFrame(() => {
+        editorRef.current?.setScrollTop(targetScrollTop)
+      })
 
       previewApiRef.current?.revealCursor({
         path: currentFile.path,
@@ -1522,14 +1497,9 @@ export default function Editor({
       return
     }
 
-    textarea.focus()
-    textarea.setSelectionRange(pendingEditorSelection.start, pendingEditorSelection.end)
-    if (typeof pendingEditorSelection.scrollTop === 'number') {
-      textarea.scrollTop = pendingEditorSelection.scrollTop
-      if (gutterRef.current) {
-        gutterRef.current.scrollTop = pendingEditorSelection.scrollTop
-      }
-    }
+    editor.setSelectionRange(pendingEditorSelection.start, pendingEditorSelection.end, {
+      scrollTop: pendingEditorSelection.scrollTop,
+    })
     pendingEditorSelectionRef.current = null
   }, [content, currentFile, editorLineHeight, jumpNonce])
 
@@ -1558,7 +1528,7 @@ export default function Editor({
   }
 
   function focusEditor() {
-    textareaRef.current?.focus()
+    editorRef.current?.focus()
   }
 
   function triggerUploadDialog() {
@@ -1657,21 +1627,17 @@ export default function Editor({
   }
 
   function selectTextRange(start, end) {
-    const textarea = textareaRef.current
-    if (!textarea) return
+    const editor = editorRef.current
+    if (!editor) return
 
-    textarea.focus()
-    textarea.setSelectionRange(start, end)
-    const lineNumber = textarea.value.slice(0, start).split('\n').length
+    const lineNumber = content.slice(0, start).split('\n').length
     const targetScrollTop = Math.max((lineNumber - 3) * editorLineHeight, 0)
-    textarea.scrollTop = targetScrollTop
-    if (gutterRef.current) {
-      gutterRef.current.scrollTop = targetScrollTop
-    }
+    editor.setSelectionRange(start, end, { reveal: true, center: true })
+    editor.setScrollTop(targetScrollTop)
   }
 
   function handleFindInDocument() {
-    if (!isEditableDocument || !textareaRef.current) {
+    if (!isEditableDocument || !editorRef.current) {
       showStatus('Select an editable file first', 2000)
       return
     }
@@ -1679,9 +1645,9 @@ export default function Editor({
     const query = window.prompt('Find text')
     if (!query) return
 
-    const textarea = textareaRef.current
-    const selectionAnchor = textarea.selectionEnd
-    const source = textarea.value
+    const selection = editorRef.current.getSelectionRange()
+    const selectionAnchor = selection.end
+    const source = content
     const nextIndex = source.indexOf(query, selectionAnchor)
     const wrappedIndex = nextIndex === -1 ? source.indexOf(query) : nextIndex
 
@@ -1717,23 +1683,22 @@ export default function Editor({
   }
 
   function handleSelectAllInDocument() {
-    if (!textareaRef.current) return
-    focusEditor()
-    textareaRef.current.setSelectionRange(0, textareaRef.current.value.length)
+    if (!editorRef.current) return
+    editorRef.current.selectAll()
   }
 
   async function handleClipboardAction(action) {
-    if (!isEditableDocument || !textareaRef.current) {
+    if (!isEditableDocument || !editorRef.current) {
       showStatus('Select an editable file first', 2000)
       return
     }
 
-    const textarea = textareaRef.current
-    const selectionStart = textarea.selectionStart
-    const selectionEnd = textarea.selectionEnd
+    const editor = editorRef.current
+    const { start: selectionStart, end: selectionEnd } = editor.getSelectionRange()
+    const source = content
     const selectedText = selectionStart === selectionEnd
-      ? textarea.value
-      : textarea.value.slice(selectionStart, selectionEnd)
+      ? source
+      : source.slice(selectionStart, selectionEnd)
 
     try {
       if (action === 'copy' || action === 'cut') {
@@ -1748,12 +1713,12 @@ export default function Editor({
       if (action === 'cut') {
         if (selectionStart !== selectionEnd) {
           setContent(
-            `${textarea.value.slice(0, selectionStart)}${textarea.value.slice(selectionEnd)}`,
+            `${source.slice(0, selectionStart)}${source.slice(selectionEnd)}`,
           )
           pendingEditorSelectionRef.current = {
             start: selectionStart,
             end: selectionStart,
-            scrollTop: textarea.scrollTop,
+            scrollTop: editor.getScrollTop(),
           }
         }
       }
@@ -1768,12 +1733,12 @@ export default function Editor({
           return
         }
 
-        const nextContent = `${textarea.value.slice(0, selectionStart)}${nextText}${textarea.value.slice(selectionEnd)}`
+        const nextContent = `${source.slice(0, selectionStart)}${nextText}${source.slice(selectionEnd)}`
         setContent(nextContent)
         pendingEditorSelectionRef.current = {
           start: selectionStart + nextText.length,
           end: selectionStart + nextText.length,
-          scrollTop: textarea.scrollTop,
+          scrollTop: editor.getScrollTop(),
         }
       }
 
@@ -1788,8 +1753,12 @@ export default function Editor({
   }
 
   function handleHistoryAction(action) {
+    const editor = editorRef.current
+    if (!editor) return
+
     focusEditor()
-    if (!document.execCommand(action)) {
+    const didRun = action === 'undo' ? editor.undo() : editor.redo()
+    if (!didRun) {
       showStatus(`Browser does not support ${action}`, 2000)
     }
   }
@@ -2028,109 +1997,13 @@ export default function Editor({
     }
   }, [isReferenceMenuOpen, files, currentFile?.id, content])
 
-  const logicalLines = useMemo(
-    () => deferredContent.split('\n'),
-    [deferredContent],
-  )
   const fontOptions = useMemo(() => buildFontOptions(availableFonts), [availableFonts])
   const fontSelection = useMemo(
     () => parseFontSelection(content, fontOptions),
     [content, fontOptions],
   )
-  const lineRows = useMemo(
-    () => isWordWrapEnabled && wrappedLineLayout.length > 0
-      ? wrappedLineLayout
-      : logicalLines.map((_, index) => ({
-        number: index + 1,
-        height: editorLineHeight,
-      })),
-    [editorLineHeight, isWordWrapEnabled, logicalLines, wrappedLineLayout],
-  )
 
-  useEffect(() => {
-    const textarea = textareaRef.current
-    if (!textarea || selectedEntry?.kind !== 'file' || selectedEntry?.is_binary) return undefined
-
-    const updateMeasureWidth = () => {
-      const computed = window.getComputedStyle(textarea)
-      const nextWidth = Math.max(
-        textarea.clientWidth
-          - Number.parseFloat(computed.paddingLeft || '0')
-          - Number.parseFloat(computed.paddingRight || '0'),
-        0,
-      )
-
-      setTextareaMeasureWidth((current) => (current === nextWidth ? current : nextWidth))
-    }
-
-    updateMeasureWidth()
-
-    const observer = new ResizeObserver(() => {
-      updateMeasureWidth()
-    })
-
-    observer.observe(textarea)
-    return () => observer.disconnect()
-  }, [editorZoom, selectedEntry])
-
-  useEffect(() => {
-    const measureRoot = lineMeasureRef.current
-    const textarea = textareaRef.current
-
-    if (
-      !measureRoot
-      || !textarea
-      || !isWordWrapEnabled
-      || textareaMeasureWidth <= 0
-      || selectedEntry?.kind !== 'file'
-      || selectedEntry?.is_binary
-    ) {
-      setWrappedLineLayout([])
-      return
-    }
-
-    const computed = window.getComputedStyle(textarea)
-    measureRoot.style.width = `${textareaMeasureWidth}px`
-    measureRoot.replaceChildren()
-
-    const fragment = document.createDocumentFragment()
-
-    logicalLines.forEach((line) => {
-      const row = document.createElement('div')
-      row.style.width = `${textareaMeasureWidth}px`
-      row.style.boxSizing = 'border-box'
-      row.style.fontFamily = computed.fontFamily
-      row.style.fontSize = computed.fontSize
-      row.style.lineHeight = computed.lineHeight
-      row.style.letterSpacing = computed.letterSpacing
-      row.style.whiteSpace = 'pre-wrap'
-      row.style.wordBreak = 'normal'
-      row.style.overflowWrap = 'break-word'
-      row.style.tabSize = computed.tabSize
-      row.textContent = line.length > 0 ? line : ' '
-      fragment.appendChild(row)
-    })
-
-    measureRoot.appendChild(fragment)
-
-    const nextLayout = Array.from(measureRoot.children).map((child, index) => {
-      const measuredHeight = Math.max(child.getBoundingClientRect().height, editorLineHeight)
-      const visualLineCount = Math.max(Math.ceil(measuredHeight / editorLineHeight), 1)
-
-      return {
-        number: index + 1,
-        height: visualLineCount * editorLineHeight,
-      }
-    })
-
-    measureRoot.replaceChildren()
-    setWrappedLineLayout(nextLayout)
-  }, [editorLineHeight, isWordWrapEnabled, logicalLines, selectedEntry, textareaMeasureWidth])
-
-  const activePreviewEntry = useMemo(
-    () => findPreferredTypEntry(files, activePreviewPath),
-    [activePreviewPath, files],
-  )
+  const activePreviewEntry = findPreferredTypEntry(files, activePreviewPath)
   const previewUrl = activePreviewEntry
     ? getProjectPreviewUrl(projectId, { entrypoint: activePreviewEntry.path })
     : ''
@@ -2226,18 +2099,17 @@ export default function Editor({
   }
 
   const applyEditorTransformation = (transformer, statusText) => {
-    if (!isEditableDocument || !textareaRef.current) return
+    if (!isEditableDocument || !editorRef.current) return
 
-    const textarea = textareaRef.current
-    const selectionStart = textarea.selectionStart
-    const selectionEnd = textarea.selectionEnd
+    const editor = editorRef.current
+    const { start: selectionStart, end: selectionEnd } = editor.getSelectionRange()
     const nextState = transformer(content, selectionStart, selectionEnd)
     if (!nextState) return
 
     pendingEditorSelectionRef.current = {
       start: nextState.selectionStart,
       end: nextState.selectionEnd,
-      scrollTop: textarea.scrollTop,
+      scrollTop: editor.getScrollTop(),
     }
     setContent(nextState.content)
     if (statusText) {
@@ -2743,7 +2615,7 @@ export default function Editor({
                 <div style={styles.panelMeta}>{currentEntryName}</div>
               </div>
 
-              <div ref={setEditorWheelElement} style={styles.editorSurface}>
+              <div style={styles.editorSurface}>
                 {selectedEntry?.kind === 'folder' ? (
                   <div style={styles.centerPlaceholder}>
                     Folder selected. New files and uploads will be created in
@@ -2756,48 +2628,20 @@ export default function Editor({
                     zoom={editorZoom}
                   />
                 ) : (
-                  <div
-                    style={{
-                      ...styles.codeFrame,
-                      gridTemplateColumns: `${gutterWidth}px 1fr`,
-                    }}
-                  >
-                    <div ref={gutterRef} style={styles.lineGutter}>
-                      {lineRows.map((lineRow) => (
-                        <div
-                          key={lineRow.number}
-                          style={{
-                            ...styles.lineNumber,
-                            height: `${lineRow.height}px`,
-                            lineHeight: `${editorLineHeight}px`,
-                            fontSize: `${lineNumberFontSize}px`,
-                          }}
-                        >
-                          {lineRow.number}
-                        </div>
-                      ))}
-                    </div>
-                    <textarea
-                      ref={textareaRef}
-                      onChange={(event) => setContent(event.target.value)}
+                  <div style={styles.codeFrame}>
+                    <CollaborativeEditor
+                      ref={editorRef}
+                      fontSize={editorFontSize}
+                      lineHeight={editorLineHeight}
+                      onChange={setContent}
                       onDoubleClick={handleEditorDoubleClick}
-                      onScroll={(event) => {
-                        if (gutterRef.current) {
-                          gutterRef.current.scrollTop = event.currentTarget.scrollTop
-                        }
+                      onMount={({ scrollElement }) => {
+                        setEditorWheelElement(scrollElement)
                       }}
-                      spellCheck={false}
-                      style={{
-                        ...styles.textarea,
-                        fontSize: `${editorFontSize}px`,
-                        lineHeight: `${editorLineHeight}px`,
-                        whiteSpace: isWordWrapEnabled ? 'pre-wrap' : 'pre',
-                        overflowWrap: isWordWrapEnabled ? 'break-word' : 'normal',
-                      }}
+                      readOnly={!isEditableDocument}
                       value={content}
-                      wrap={isWordWrapEnabled ? 'soft' : 'off'}
+                      wordWrap={isWordWrapEnabled}
                     />
-                    <div aria-hidden="true" ref={lineMeasureRef} style={styles.lineMeasure} />
                   </div>
                 )}
               </div>
@@ -3267,49 +3111,9 @@ const styles = {
   },
   codeFrame: {
     height: '100%',
-    display: 'grid',
-    gridTemplateColumns: '52px 1fr',
+    display: 'block',
     background: '#fbfbfc',
     position: 'relative',
-  },
-  lineGutter: {
-    overflow: 'hidden',
-    background: '#f1f2f5',
-    borderRight: '1px solid #e2e4ea',
-    padding: '14px 0',
-    textAlign: 'right',
-  },
-  lineNumber: {
-    height: '24px',
-    padding: '0 12px 0 0',
-    color: '#b1b6c2',
-    fontSize: '13px',
-    lineHeight: '24px',
-    fontFamily: '"IBM Plex Mono", "SFMono-Regular", monospace',
-    display: 'flex',
-    alignItems: 'flex-start',
-    justifyContent: 'flex-end',
-  },
-  textarea: {
-    width: '100%',
-    height: '100%',
-    border: 'none',
-    resize: 'none',
-    outline: 'none',
-    background: '#fbfbfc',
-    color: '#2b2f37',
-    padding: '14px 18px',
-    fontSize: '15px',
-    lineHeight: '24px',
-    fontFamily: '"IBM Plex Mono", "SFMono-Regular", monospace',
-    tabSize: 2,
-  },
-  lineMeasure: {
-    position: 'absolute',
-    top: 0,
-    left: '-99999px',
-    visibility: 'hidden',
-    pointerEvents: 'none',
   },
   centerPlaceholder: {
     height: '100%',

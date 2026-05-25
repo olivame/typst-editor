@@ -26,9 +26,16 @@ services:
     volumes:
       - ./services/compiler/server.py:/workspace/server.py
 
+  realtime:
+    volumes:
+      - ./services/realtime:/usr/src/app
+      - realtime-node-modules:/usr/src/app/node_modules
+    command: ["npm", "run", "dev"]
+
   db:
     ports:
       - "5433:5432"  # 如果本机已有 5432，避免冲突；没有的话可以改回 5432:5432
 
 volumes:
   web-node-modules:
+  realtime-node-modules:

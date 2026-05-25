@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { env } from 'node:process'
 
-const apiProxyTarget = process.env.API_PROXY_TARGET || process.env.VITE_API_URL || 'http://api:8000'
-const previewProxyTarget = process.env.PREVIEW_PROXY_TARGET || process.env.VITE_PREVIEW_URL || 'http://preview:8002'
+const apiProxyTarget = env.API_PROXY_TARGET || env.VITE_API_URL || 'http://api:8000'
+const previewProxyTarget = env.PREVIEW_PROXY_TARGET || env.VITE_PREVIEW_URL || 'http://preview:8002'
 
 // https://vite.dev/config/
 export default defineConfig({

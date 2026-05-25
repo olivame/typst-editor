@@ -20,7 +20,14 @@ from sqlalchemy.orm import Session
 
 import models
 from database import engine, get_db
-from settings import COMPILER_TIMEOUT_SECONDS, COMPILER_URL, CORS_ALLOW_ORIGINS, WORKSPACE_DIR
+from settings import (
+    COMPILER_TIMEOUT_SECONDS,
+    COMPILER_URL,
+    CORS_ALLOW_ORIGINS,
+    REALTIME_SECRET,
+    REALTIME_URL,
+    WORKSPACE_DIR,
+)
 
 
 DEFAULT_MAIN_CONTENT = '= Hello Typst\n\nThis is a new document.'
@@ -163,6 +170,16 @@ class ProjectTagsUpdate(BaseModel):
 
 class ProjectCompileRequest(BaseModel):
     entrypoint: str = ''
+
+
+class RealtimeRoomResolveRequest(BaseModel):
+    file_id: int
+
+
+class RealtimeFlushFileRequest(BaseModel):
+    file_id: int
+    content: str
+    updated_by_id: int | None = None
 
 
 def utcnow():
@@ -831,6 +848,55 @@ def ensure_disk_entry(project_id: int, entry: models.File):
     return disk_path
 
 
+def build_file_room_key(project_id: int, file_id: int):
+    return f'project:{project_id}:file:{file_id}'
+
+
+def can_edit_project_file(
+    db: Session,
+    project: models.Project,
+    current_user: models.User | None,
+):
+    try:
+        ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
+        return True
+    except HTTPException as exc:
+        if exc.status_code in {401, 403}:
+            return False
+        raise
+
+
+def require_realtime_secret(x_realtime_secret: str | None = Header(default=None)):
+    if not x_realtime_secret or x_realtime_secret != REALTIME_SECRET:
+        raise HTTPException(status_code=401, detail='Invalid realtime secret')
+
+
+def serialize_realtime_session(
+    db: Session,
+    entry: models.File,
+    current_user: models.User,
+):
+    ensure_project_access(db, entry.project, current_user)
+
+    return {
+        'protocol_version': 1,
+        'room_key': build_file_room_key(entry.project_id, entry.id),
+        'realtime_url': REALTIME_URL,
+        'file': {
+            'id': entry.id,
+            'project_id': entry.project_id,
+            'path': entry.path,
+            'name': entry.name,
+            'kind': entry.kind,
+            'is_binary': entry.is_binary,
+        },
+        'user': serialize_user(current_user),
+        'permissions': {
+            'can_edit': can_edit_project_file(db, entry.project, current_user),
+        },
+    }
+
+
 @app.get('/health')
 def health():
     return {'status': 'ok'}
@@ -1390,6 +1456,21 @@ def get_file_content(
     }
 
 
+@app.get('/files/{file_id}/realtime-session')
+def get_file_realtime_session(
+    file_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    entry = get_entry_or_404(db, file_id)
+    if entry.kind == FOLDER_ENTRY_KIND:
+        raise HTTPException(status_code=400, detail='Folders do not have realtime sessions')
+    if entry.is_binary:
+        raise HTTPException(status_code=400, detail='Binary files do not have realtime sessions')
+
+    return serialize_realtime_session(db, entry, current_user)
+
+
 @app.put('/files/{file_id}/content')
 def update_file_content(
     file_id: int,
@@ -1532,6 +1613,52 @@ def get_file_raw(
         filename=entry.name,
         content_disposition_type='attachment' if download else 'inline',
     )
+
+
+@app.post('/internal/realtime/resolve-file-room')
+def resolve_realtime_file_room(
+    payload: RealtimeRoomResolveRequest,
+    current_user: models.User = Depends(get_current_user),
+    _: None = Depends(require_realtime_secret),
+    db: Session = Depends(get_db),
+):
+    entry = get_entry_or_404(db, payload.file_id)
+    if entry.kind == FOLDER_ENTRY_KIND:
+        raise HTTPException(status_code=400, detail='Folders do not have realtime rooms')
+    if entry.is_binary:
+        raise HTTPException(status_code=400, detail='Binary files do not have realtime rooms')
+
+    return serialize_realtime_session(db, entry, current_user)
+
+
+@app.post('/internal/realtime/flush-file')
+def flush_realtime_file(
+    payload: RealtimeFlushFileRequest,
+    _: None = Depends(require_realtime_secret),
+    db: Session = Depends(get_db),
+):
+    entry = get_entry_or_404(db, payload.file_id)
+    if entry.kind == FOLDER_ENTRY_KIND:
+        raise HTTPException(status_code=400, detail='Folders do not have editable content')
+    if entry.is_binary:
+        raise HTTPException(status_code=400, detail='Binary files cannot be flushed as text')
+
+    entry.content = payload.content
+    db.commit()
+    db.refresh(entry)
+
+    disk_path = get_entry_disk_path(entry.project_id, entry.path)
+    disk_path.parent.mkdir(parents=True, exist_ok=True)
+    disk_path.write_text(entry.content, encoding='utf-8')
+
+    return {
+        'status': 'flushed',
+        'file_id': entry.id,
+        'project_id': entry.project_id,
+        'path': entry.path,
+        'updated_by_id': payload.updated_by_id,
+        'updated_at': entry.updated_at,
+    }
 
 
 @app.post('/projects/{project_id}/compile')
