@@ -2,6 +2,7 @@ import { API_URL } from '../config/api'
 import { PREVIEW_URL } from '../config/preview'
 
 const AUTH_TOKEN_STORAGE_KEY = 'typst-editor-auth-token'
+const PREVIEW_CLIENT_ID_STORAGE_KEY = 'typst-editor-preview-client-id'
 
 function createHttpError(response, rawMessage, fallbackMessage = '') {
   let normalizedMessage = rawMessage || fallbackMessage || `Request failed with status ${response.status}`
@@ -61,6 +62,25 @@ export function setAuthToken(token) {
   } else {
     window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY)
   }
+}
+
+function createPreviewClientId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+
+  return `preview-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+export function getPreviewClientId() {
+  if (typeof window === 'undefined') return 'server'
+
+  const existingClientId = window.sessionStorage.getItem(PREVIEW_CLIENT_ID_STORAGE_KEY)
+  if (existingClientId) return existingClientId
+
+  const nextClientId = createPreviewClientId()
+  window.sessionStorage.setItem(PREVIEW_CLIENT_ID_STORAGE_KEY, nextClientId)
+  return nextClientId
 }
 
 export async function registerUser(payload) {
@@ -223,6 +243,10 @@ export async function getFileContent(fileId) {
   return apiFetch(`/files/${fileId}/content`)
 }
 
+export async function getFileRealtimeSession(fileId) {
+  return apiFetch(`/files/${fileId}/realtime-session`)
+}
+
 export async function updateFileContent(fileId, content) {
   return apiFetch(`/files/${fileId}/content`, {
     method: 'PUT',
@@ -262,6 +286,7 @@ export function getProjectPreviewUrl(projectId, options = {}) {
   if (options.entrypoint) {
     url.searchParams.set('entrypoint', options.entrypoint)
   }
+  url.searchParams.set('client_id', options.clientId || getPreviewClientId())
   return url.toString()
 }
 
@@ -278,6 +303,7 @@ export async function getProjectPreviewStatus(projectId, options = {}) {
   if (options.entrypoint) {
     url.searchParams.set('entrypoint', options.entrypoint)
   }
+  url.searchParams.set('client_id', options.clientId || getPreviewClientId())
   const response = await fetch(url, {
     headers: getAuthHeaders(),
   })

@@ -4,6 +4,7 @@ import { env } from 'node:process'
 
 const apiProxyTarget = env.API_PROXY_TARGET || env.VITE_API_URL || 'http://api:8000'
 const previewProxyTarget = env.PREVIEW_PROXY_TARGET || env.VITE_PREVIEW_URL || 'http://preview:8002'
+const realtimeProxyTarget = env.REALTIME_PROXY_TARGET || env.VITE_REALTIME_URL || 'ws://realtime:8003'
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -23,6 +24,11 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
         rewrite: (path) => path.replace(/^\/preview/, ''),
+      },
+      '/realtime': {
+        target: realtimeProxyTarget,
+        changeOrigin: true,
+        ws: true,
       },
     },
   },

@@ -1,6 +1,6 @@
 # Realtime Service
 
-这个目录先提供实时协作服务的部署骨架和接口边界，当前阶段还不承载真正的多人同步。
+这个目录承载文件级实时协作服务，当前阶段已经支持同一文件的多人文本同步和落盘 flush。
 
 ## 目标边界
 
@@ -38,9 +38,17 @@
 
 ## 当前状态
 
-当前 `server.js` 只是占位服务：
+当前 `server.js` 已经实现：
 
-- `/health` 可用
-- `/collaboration` 会建立连接后返回 placeholder 消息并主动关闭
+- 基于 Yjs sync protocol 的房间同步
+- 文件级 room：`project:{project_id}:file:{file_id}`
+- 握手阶段通过 API 解析 `file_id + Bearer token`
+- 文档变更后的 debounce flush
+- 房间无人时的 disconnect flush 和空闲清理
 
-下一阶段再把它替换成真正的 Yjs/WebSocket 房间服务。
+当前还没有实现：
+
+- 持久化的 Yjs update 日志
+- 修订历史
+- presence UI
+- 评论和远端光标渲染

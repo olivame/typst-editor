@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import tempfile
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
 
@@ -555,6 +556,25 @@ def get_entry_disk_path(project_id: int, relative_path: str):
     return get_project_dir(project_id) / Path(relative_path)
 
 
+def write_text_file_atomically(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_path)
+
+
 def get_project_or_404(db: Session, project_id: int):
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
     if not project:
@@ -800,7 +820,7 @@ def sync_project_workspace(project_id: int, entries: list[models.File]):
         if entry.is_binary:
             continue
 
-        disk_path.write_text(entry.content or '', encoding='utf-8')
+        write_text_file_atomically(disk_path, entry.content or '')
 
 
 def create_text_file_entry(
@@ -826,8 +846,7 @@ def create_text_file_entry(
     db.refresh(entry)
 
     disk_path = get_entry_disk_path(project_id, relative_path)
-    disk_path.parent.mkdir(parents=True, exist_ok=True)
-    disk_path.write_text(content, encoding='utf-8')
+    write_text_file_atomically(disk_path, content)
 
     return entry
 
@@ -843,7 +862,7 @@ def ensure_disk_entry(project_id: int, entry: models.File):
 
     disk_path.parent.mkdir(parents=True, exist_ok=True)
     if not entry.is_binary:
-        disk_path.write_text(entry.content or '', encoding='utf-8')
+        write_text_file_atomically(disk_path, entry.content or '')
 
     return disk_path
 
@@ -889,6 +908,8 @@ def serialize_realtime_session(
             'name': entry.name,
             'kind': entry.kind,
             'is_binary': entry.is_binary,
+            'content': '' if entry.is_binary else (entry.content or ''),
+            'updated_at': entry.updated_at,
         },
         'user': serialize_user(current_user),
         'permissions': {
@@ -1489,8 +1510,7 @@ def update_file_content(
     db.commit()
 
     disk_path = get_entry_disk_path(entry.project_id, entry.path)
-    disk_path.parent.mkdir(parents=True, exist_ok=True)
-    disk_path.write_text(entry.content, encoding='utf-8')
+    write_text_file_atomically(disk_path, entry.content)
 
     return serialize_entry(entry)
 
@@ -1648,8 +1668,7 @@ def flush_realtime_file(
     db.refresh(entry)
 
     disk_path = get_entry_disk_path(entry.project_id, entry.path)
-    disk_path.parent.mkdir(parents=True, exist_ok=True)
-    disk_path.write_text(entry.content, encoding='utf-8')
+    write_text_file_atomically(disk_path, entry.content)
 
     return {
         'status': 'flushed',

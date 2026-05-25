@@ -7,13 +7,16 @@ import FileSidebar from './components/FileSidebar'
 import OutlineSidebar from './components/OutlineSidebar'
 import SearchSidebar from './components/SearchSidebar'
 import TinymistPreview from './components/TinymistPreview'
+import { REALTIME_URL } from './config/realtime'
 import {
   createProjectFile,
   createProjectFolder,
   deleteProjectEntry,
   downloadProjectFile,
   downloadProjectPdf,
+  getAuthToken,
   getFileContent,
+  getFileRealtimeSession,
   getProjectFileUrl,
   getProjectPreviewStatus,
   getProjectPreviewUrl,
@@ -134,6 +137,19 @@ function getAdjacentPreviewZoom(current, direction) {
     return PREVIEW_ZOOM_FACTORS[Math.max(currentIndex - 1, 0)]
   }
   return nearest
+}
+
+function formatRealtimeConnectionLabel(status) {
+  switch (`${status || ''}`.toLowerCase()) {
+    case 'connected':
+      return 'Realtime connected'
+    case 'connecting':
+      return 'Realtime connecting'
+    case 'disconnected':
+      return 'Realtime disconnected'
+    default:
+      return 'Realtime idle'
+  }
 }
 
 function areFolderStatesEqual(left, right) {
@@ -946,6 +962,8 @@ export default function Editor({
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [currentFile, setCurrentFile] = useState(null)
+  const [realtimeSession, setRealtimeSession] = useState(null)
+  const [realtimeConnectionStatus, setRealtimeConnectionStatus] = useState('idle')
   const [content, setContent] = useState('')
   const [statusMessage, setStatusMessage] = useState('')
   const [sidebarMode, setSidebarMode] = useState('files')
@@ -1035,6 +1053,13 @@ export default function Editor({
     }
   }
 
+  function getCurrentEditorContent() {
+    const editorValue = editorRef.current?.getValue()
+    if (typeof editorValue !== 'string') return content
+    if (realtimeSession && realtimeConnectionStatus !== 'connected') return content
+    return editorValue
+  }
+
   async function selectEntry(entry) {
     try {
       setSelectedEntry(entry)
@@ -1050,12 +1075,21 @@ export default function Editor({
 
       if (entry.kind === 'folder' || entry.is_binary) {
         setCurrentFile(null)
+        setRealtimeSession(null)
+        setRealtimeConnectionStatus('idle')
         setContent('')
         return
       }
 
-      const data = await getFileContent(entry.id)
+      setRealtimeSession(null)
+      setRealtimeConnectionStatus('connecting')
+      const [data, session] = await Promise.all([
+        getFileContent(entry.id),
+        getFileRealtimeSession(entry.id),
+      ])
       setCurrentFile(data)
+      setRealtimeSession({ ...session, realtime_url: REALTIME_URL })
+      setRealtimeConnectionStatus('connecting')
       setContent(data.content)
     } catch (error) {
       if (handleAccessFailure(error, '无法打开当前文件。')) return
@@ -1075,6 +1109,8 @@ export default function Editor({
       if (!nextSelectedEntry) {
         setSelectedEntry(null)
         setCurrentFile(null)
+        setRealtimeSession(null)
+        setRealtimeConnectionStatus('idle')
         setContent('')
         setSelectedEntryPathByProject((current) => (
           current[projectId]
@@ -1111,6 +1147,8 @@ export default function Editor({
         if (!initialEntry) {
           setSelectedEntry(null)
           setCurrentFile(null)
+          setRealtimeSession(null)
+          setRealtimeConnectionStatus('idle')
           setContent('')
           setActivePreviewPath('')
           return
@@ -1128,14 +1166,23 @@ export default function Editor({
 
         if (initialEntry.kind === 'folder' || initialEntry.is_binary) {
           setCurrentFile(null)
+          setRealtimeSession(null)
+          setRealtimeConnectionStatus('idle')
           setContent('')
           return
         }
 
-        const data = await getFileContent(initialEntry.id)
+        setRealtimeSession(null)
+        setRealtimeConnectionStatus('connecting')
+        const [data, session] = await Promise.all([
+          getFileContent(initialEntry.id),
+          getFileRealtimeSession(initialEntry.id),
+        ])
         if (isCancelled) return
 
         setCurrentFile(data)
+        setRealtimeSession({ ...session, realtime_url: REALTIME_URL })
+        setRealtimeConnectionStatus('connecting')
         setContent(data.content)
       } catch (error) {
         if (isCancelled) return
@@ -1235,9 +1282,11 @@ export default function Editor({
   async function saveAndPreview() {
     if (!currentFile) return
     try {
+      const nextContent = getCurrentEditorContent()
       showStatus('Saving...')
-      await updateFileContent(currentFile.id, content)
-      setCurrentFile((current) => (current ? { ...current, content } : current))
+      await updateFileContent(currentFile.id, nextContent)
+      setContent(nextContent)
+      setCurrentFile((current) => (current ? { ...current, content: nextContent } : current))
       showStatus('Saved', 3000)
     } catch (error) {
       if (handleAccessFailure(error, '保存失败，请重新登录后重试。')) return
@@ -1511,8 +1560,10 @@ export default function Editor({
 
     try {
       if (currentFile?.path === activePreviewEntry.path && !selectedEntry?.is_binary) {
-        await updateFileContent(currentFile.id, content)
-        setCurrentFile((current) => (current ? { ...current, content } : current))
+        const nextContent = getCurrentEditorContent()
+        await updateFileContent(currentFile.id, nextContent)
+        setContent(nextContent)
+        setCurrentFile((current) => (current ? { ...current, content: nextContent } : current))
       }
 
       showStatus(`Exporting ${activePreviewEntry.name}...`)
@@ -2012,11 +2063,14 @@ export default function Editor({
     : ''
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
+  const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
+  const editorStatusLabel = isEditableDocument
+    ? `${currentEntryName} · ${formatRealtimeConnectionLabel(realtimeConnectionStatus)}`
+    : currentEntryName
   const previewEntryName = activePreviewEntry?.name || 'No preview'
   const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
   const shouldShowTypPreview = isPreviewVisible && Boolean(selectedEntry && isTypEntry(selectedEntry))
-  const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
   const diagnostics = useMemo(
     () => normalizeDiagnostics(previewStatus, projectId),
     [previewStatus, projectId],
@@ -2612,7 +2666,7 @@ export default function Editor({
                     )
                   ))}
                 </div>
-                <div style={styles.panelMeta}>{currentEntryName}</div>
+                <div style={styles.panelMeta}>{editorStatusLabel}</div>
               </div>
 
               <div style={styles.editorSurface}>
@@ -2630,10 +2684,14 @@ export default function Editor({
                 ) : (
                   <div style={styles.codeFrame}>
                     <CollaborativeEditor
+                      key={realtimeSession?.room_key || currentFile?.id || selectedEntry?.path || 'editor'}
                       ref={editorRef}
+                      authToken={getAuthToken()}
+                      collaborationSession={realtimeSession}
                       fontSize={editorFontSize}
                       lineHeight={editorLineHeight}
                       onChange={setContent}
+                      onConnectionStateChange={setRealtimeConnectionStatus}
                       onDoubleClick={handleEditorDoubleClick}
                       onMount={({ scrollElement }) => {
                         setEditorWheelElement(scrollElement)
