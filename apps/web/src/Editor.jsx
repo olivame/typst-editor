@@ -988,6 +988,7 @@ export default function Editor({
   const [activePreviewPath, setActivePreviewPath] = useState('main.typ')
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
+  const [previewInstanceId, setPreviewInstanceId] = useState(0)
   const [isWordWrapEnabled, setIsWordWrapEnabled] = useState(true)
   const fileTreeCollapsedFolders = fileTreeCollapsedStateByProject[projectId] || {}
   const rememberedSelectedEntryPath = selectedEntryPathByProject[projectId] || ''
@@ -1250,6 +1251,7 @@ export default function Editor({
       if (!previewEntry?.path) {
         setPreviewStatus({ kind: 'Idle' })
         setPreviewOutline([])
+        setPreviewInstanceId(0)
         return
       }
 
@@ -1259,12 +1261,14 @@ export default function Editor({
 
         setPreviewStatus(payload?.status && typeof payload.status === 'object' ? payload.status : { kind: 'Idle' })
         setPreviewOutline(Array.isArray(payload?.outline) ? payload.outline : [])
+        setPreviewInstanceId(Number.isInteger(payload?.instance_id) ? payload.instance_id : 0)
       } catch (error) {
         if (isCancelled) return
         if (handleAccessFailure(error, '无法获取预览状态。')) return
 
         setPreviewStatus({ kind: 'Unavailable' })
         setPreviewOutline([])
+        setPreviewInstanceId(0)
       }
     }
 
@@ -2263,7 +2267,7 @@ export default function Editor({
       ) : activePreviewEntry ? (
         <TinymistPreview
           ref={previewApiRef}
-          key={`${projectId}-${activePreviewEntry.path}-${isPreviewDetached ? 'floating' : 'embedded'}`}
+          key={`${projectId}-${activePreviewEntry.path}-${previewInstanceId}-${isPreviewDetached ? 'floating' : 'embedded'}`}
           onJumpToSource={handlePreviewJump}
           onZoomChange={handlePreviewZoomChange}
           src={previewUrl}

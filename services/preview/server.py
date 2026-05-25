@@ -1076,6 +1076,7 @@ class PreviewSession:
         self._pending_diagnostics: list[dict[str, object]] = []
         self._current_diagnostic_lines: list[str] = []
         self.workspace_revision = ""
+        self.instance_id = 0
 
     def _compose_status(self, base_status: dict[str, object] | None = None) -> dict[str, object]:
         status = dict(base_status or self.last_status)
@@ -1258,6 +1259,7 @@ class PreviewSession:
                 ping_interval=None,
             )
             self.workspace_revision = current_revision
+            self.instance_id += 1
             self.control_task = asyncio.create_task(self._consume_control_socket())
 
     async def _log_stdout(self) -> None:
@@ -1433,6 +1435,7 @@ async def ensure_session(
         "project_id": project_id,
         "entrypoint": session.entrypoint,
         "client_id": session.client_id,
+        "instance_id": session.instance_id,
         "status": session.last_status,
         "view_url": f"/sessions/{project_id}/data?entrypoint={session.entrypoint}&client_id={session.client_id}",
     }
@@ -1449,6 +1452,7 @@ async def get_session_status(
         "project_id": project_id,
         "entrypoint": session.entrypoint,
         "client_id": session.client_id,
+        "instance_id": session.instance_id,
         "status": session.last_status,
         "outline": session.outline,
     }
