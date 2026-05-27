@@ -3,7 +3,7 @@ services:
     volumes:
       - ./apps/web:/usr/src/app
       - web-node-modules:/usr/src/app/node_modules
-    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0"]
     environment:
       - NODE_ENV=development
 
@@ -30,7 +30,7 @@ services:
     volumes:
       - ./services/realtime:/usr/src/app
       - realtime-node-modules:/usr/src/app/node_modules
-    command: ["npm", "run", "dev"]
+    command: ["sh", "-c", "npm install && npm run dev"]
 
   db:
     ports:
