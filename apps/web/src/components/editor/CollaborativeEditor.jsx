@@ -22,10 +22,6 @@ function getEditorReadOnlyState(readOnly, collaborationState) {
   return readOnly || !collaborationState.isSynced
 }
 
-function notifyDocumentChange(onChange, value) {
-  onChange?.(`${value}`)
-}
-
 function clampPosition(value, max) {
   return Math.max(0, Math.min(value, max))
 }
@@ -104,6 +100,8 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   const onMountRef = useRef(onMount)
   const onScrollRef = useRef(onScroll)
   const collaborationRef = useRef(null)
+  const lastPublishedValueRef = useRef(value)
+  const suppressedChangeCountRef = useRef(0)
   const initialConfigRef = useRef({
     authToken,
     collaborationSession,
@@ -167,7 +165,13 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
       })),
       EditorView.updateListener.of((update) => {
         if (!update.docChanged) return
-        onChangeRef.current?.(update.state.doc.toString())
+        const nextValue = update.state.doc.toString()
+        lastPublishedValueRef.current = nextValue
+        if (suppressedChangeCountRef.current > 0) {
+          suppressedChangeCountRef.current -= 1
+          return
+        }
+        onChangeRef.current?.(nextValue)
       }),
       EditorView.domEventHandlers({
         dblclick: () => {
@@ -184,9 +188,6 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
       const ydoc = new Y.Doc()
       const ytext = ydoc.getText('content')
       const undoManager = new Y.UndoManager(ytext)
-      const handleYTextChange = () => {
-        notifyDocumentChange(onChangeRef.current, ytext.toString())
-      }
       const provider = new WebsocketProvider(
         initialCollaborationSession.realtime_url,
         initialCollaborationSession.room_key,
@@ -203,7 +204,6 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
       collaborationState.undoManager = undoManager
       collaborationState.ydoc = ydoc
       collaborationState.ytext = ytext
-      collaborationState.handleYTextChange = handleYTextChange
       collaborationRef.current = collaborationState
       keyBindings.push(
         { key: 'Mod-z', run: () => { undoManager.undo(); return true } },
@@ -228,11 +228,9 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
         })
 
         if (isSynced) {
-          handleYTextChange()
           onConnectionStateChangeRef.current?.('connected')
         }
       })
-      ytext.observe(handleYTextChange)
       onConnectionStateChangeRef.current?.('connecting')
     } else {
       keyBindings.push(...historyKeymap)
@@ -267,7 +265,6 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
         rootElement: null,
         scrollElement: null,
       })
-      collaborationRef.current?.ytext?.unobserve?.(collaborationRef.current?.handleYTextChange)
       collaborationRef.current?.provider?.destroy()
       collaborationRef.current?.ydoc?.destroy()
       collaborationRef.current = null
@@ -283,8 +280,14 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
     if (collaborationSession && !collaborationRef.current?.isSynced) return
 
     const currentValue = view.state.doc.toString()
-    if (currentValue === value) return
+    if (currentValue === value) {
+      lastPublishedValueRef.current = currentValue
+      return
+    }
+    if (value === lastPublishedValueRef.current) return
 
+    suppressedChangeCountRef.current += 1
+    lastPublishedValueRef.current = value
     view.dispatch({
       changes: {
         from: 0,

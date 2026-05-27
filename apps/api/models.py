@@ -242,6 +242,7 @@ class File(Base):
     kind = Column(String(16), nullable=False, default="file")
     is_binary = Column(Boolean, nullable=False, default=False)
     content = Column(Text, default="")
+    realtime_state = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

@@ -247,6 +247,12 @@ export async function getFileRealtimeSession(fileId) {
   return apiFetch(`/files/${fileId}/realtime-session`)
 }
 
+export async function flushRealtimeFile(fileId) {
+  return apiFetch(`/files/${fileId}/realtime-flush`, {
+    method: 'POST',
+  })
+}
+
 export async function updateFileContent(fileId, content) {
   return apiFetch(`/files/${fileId}/content`, {
     method: 'PUT',

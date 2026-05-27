@@ -14,6 +14,7 @@ import {
   deleteProjectEntry,
   downloadProjectFile,
   downloadProjectPdf,
+  flushRealtimeFile,
   getAuthToken,
   getFileContent,
   getFileRealtimeSession,
@@ -1082,6 +1083,8 @@ export default function Editor({
         return
       }
 
+      setCurrentFile(null)
+      setContent('')
       setRealtimeSession(null)
       setRealtimeConnectionStatus('connecting')
       const [data, session] = await Promise.all([
@@ -1173,6 +1176,8 @@ export default function Editor({
           return
         }
 
+        setCurrentFile(null)
+        setContent('')
         setRealtimeSession(null)
         setRealtimeConnectionStatus('connecting')
         const [data, session] = await Promise.all([
@@ -1283,12 +1288,23 @@ export default function Editor({
     }
   }, [activePreviewPath, files, projectId])
 
+  async function persistCurrentFileContent(nextContent) {
+    if (!currentFile) return
+
+    if (realtimeSession && realtimeConnectionStatus === 'connected') {
+      await flushRealtimeFile(currentFile.id)
+      return
+    }
+
+    await updateFileContent(currentFile.id, nextContent)
+  }
+
   async function saveAndPreview() {
     if (!currentFile) return
     try {
       const nextContent = getCurrentEditorContent()
       showStatus('Saving...')
-      await updateFileContent(currentFile.id, nextContent)
+      await persistCurrentFileContent(nextContent)
       setContent(nextContent)
       setCurrentFile((current) => (current ? { ...current, content: nextContent } : current))
       showStatus('Saved', 3000)
@@ -1565,7 +1581,7 @@ export default function Editor({
     try {
       if (currentFile?.path === activePreviewEntry.path && !selectedEntry?.is_binary) {
         const nextContent = getCurrentEditorContent()
-        await updateFileContent(currentFile.id, nextContent)
+        await persistCurrentFileContent(nextContent)
         setContent(nextContent)
         setCurrentFile((current) => (current ? { ...current, content: nextContent } : current))
       }
@@ -2068,8 +2084,16 @@ export default function Editor({
   const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
+  const isEditorLoading = Boolean(
+    selectedEntry
+    && selectedEntry.kind === 'file'
+    && !selectedEntry.is_binary
+    && (!currentFile || currentFile.id !== selectedEntry.id),
+  )
   const editorStatusLabel = isEditableDocument
     ? `${currentEntryName} · ${formatRealtimeConnectionLabel(realtimeConnectionStatus)}`
+    : isEditorLoading
+      ? `${currentEntryName} · Loading`
     : currentEntryName
   const previewEntryName = activePreviewEntry?.name || 'No preview'
   const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
@@ -2685,6 +2709,11 @@ export default function Editor({
                     src={selectedFilePreviewUrl}
                     zoom={editorZoom}
                   />
+                ) : isEditorLoading ? (
+                  <div style={styles.centerPlaceholder}>
+                    Loading
+                    <strong style={styles.placeholderStrong}> {selectedEntry.path}</strong>.
+                  </div>
                 ) : (
                   <div style={styles.codeFrame}>
                     <CollaborativeEditor

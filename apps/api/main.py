@@ -94,6 +94,10 @@ with engine.begin() as connection:
         connection.execute(
             text("ALTER TABLE files ADD COLUMN is_binary BOOLEAN NOT NULL DEFAULT FALSE")
         )
+    if 'realtime_state' not in file_columns:
+        connection.execute(
+            text("ALTER TABLE files ADD COLUMN realtime_state TEXT NOT NULL DEFAULT ''")
+        )
 
     refreshed_file_columns = {column['name'] for column in inspect(connection).get_columns('files')}
     if 'path' in refreshed_file_columns:
@@ -102,6 +106,8 @@ with engine.begin() as connection:
         connection.execute(text("UPDATE files SET kind = 'file' WHERE kind IS NULL OR kind = ''"))
     if 'is_binary' in refreshed_file_columns:
         connection.execute(text("UPDATE files SET is_binary = FALSE WHERE is_binary IS NULL"))
+    if 'realtime_state' in refreshed_file_columns:
+        connection.execute(text("UPDATE files SET realtime_state = '' WHERE realtime_state IS NULL"))
 
 app = FastAPI()
 
@@ -180,6 +186,7 @@ class RealtimeRoomResolveRequest(BaseModel):
 class RealtimeFlushFileRequest(BaseModel):
     file_id: int
     content: str
+    state_base64: str = ''
     updated_by_id: int | None = None
 
 
@@ -575,6 +582,33 @@ def write_text_file_atomically(path: Path, content: str):
             os.unlink(temp_path)
 
 
+def write_bytes_file_atomically(path: Path, content: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_path)
+
+
+def summarize_content(value: str, limit: int = 80):
+    return (value or '').replace('\n', ' ').replace('\r', ' ')[:limit]
+
+
+def build_realtime_internal_url(path: str):
+    return f"{REALTIME_URL.rstrip('/')}{path}"
+
+
 def get_project_or_404(db: Session, project_id: int):
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
     if not project:
@@ -867,6 +901,101 @@ def ensure_disk_entry(project_id: int, entry: models.File):
     return disk_path
 
 
+def build_compiler_workspace_snapshot(project_id: int, entries: list[models.File]):
+    snapshot_entries: list[dict[str, str]] = []
+
+    for entry in sorted(entries, key=lambda current: (current.path.count('/'), current.path)):
+        relative_path = str(PurePosixPath(entry.path))
+
+        if entry.kind == FOLDER_ENTRY_KIND:
+            snapshot_entries.append({
+                'path': relative_path,
+                'kind': FOLDER_ENTRY_KIND,
+            })
+            continue
+
+        if entry.is_binary:
+            disk_path = ensure_disk_entry(project_id, entry)
+            if not disk_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail=f'Binary file is missing on disk: "{entry.path}"',
+                )
+            raw_content = disk_path.read_bytes()
+        else:
+            raw_content = (entry.content or '').encode('utf-8')
+
+        snapshot_entries.append({
+            'path': relative_path,
+            'kind': TEXT_ENTRY_KIND,
+            'content_base64': base64.b64encode(raw_content).decode('ascii'),
+        })
+
+    return snapshot_entries
+
+
+def compile_project_snapshot(project_id: int, entrypoint: str, entries: list[models.File]):
+    try:
+        response = requests.post(
+            COMPILER_URL,
+            json={
+                'protocol_version': 2,
+                'project_id': project_id,
+                'entrypoint': entrypoint,
+                'files': build_compiler_workspace_snapshot(project_id, entries),
+            },
+            timeout=COMPILER_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail='Compiler returned invalid JSON') from exc
+
+    if payload.get('status') == 'success':
+        pdf_base64 = payload.get('pdf_base64')
+        if not isinstance(pdf_base64, str) or not pdf_base64:
+            raise HTTPException(status_code=502, detail='Compiler response did not include PDF content')
+
+        try:
+            pdf_content = base64.b64decode(pdf_base64.encode('ascii'))
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail='Compiler returned invalid PDF content') from exc
+
+        pdf_path = get_project_dir(project_id) / Path(entrypoint).with_suffix('.pdf')
+        write_bytes_file_atomically(pdf_path, pdf_content)
+
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != 'pdf_base64'
+    }
+
+
+def flush_realtime_room(file_id: int):
+    try:
+        response = requests.post(
+            build_realtime_internal_url('/internal/realtime/flush-room'),
+            json={'file_id': file_id},
+            headers={'X-Realtime-Secret': REALTIME_SECRET},
+            timeout=5,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail='Realtime service returned invalid JSON') from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail='Realtime service returned an invalid flush payload')
+
+    return payload
+
+
 def build_file_room_key(project_id: int, file_id: int):
     return f'project:{project_id}:file:{file_id}'
 
@@ -909,6 +1038,7 @@ def serialize_realtime_session(
             'kind': entry.kind,
             'is_binary': entry.is_binary,
             'content': '' if entry.is_binary else (entry.content or ''),
+            'realtime_state': '' if entry.is_binary else (entry.realtime_state or ''),
             'updated_at': entry.updated_at,
         },
         'user': serialize_user(current_user),
@@ -1492,6 +1622,33 @@ def get_file_realtime_session(
     return serialize_realtime_session(db, entry, current_user)
 
 
+@app.post('/files/{file_id}/realtime-flush')
+def force_flush_file_realtime_state(
+    file_id: int,
+    current_user: models.User | None = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    entry = get_entry_or_404(db, file_id)
+    ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
+    if entry.kind == FOLDER_ENTRY_KIND:
+        raise HTTPException(status_code=400, detail='Folders do not have editable content')
+    if entry.is_binary:
+        raise HTTPException(status_code=400, detail='Binary files do not have realtime state')
+
+    flush_payload = flush_realtime_room(entry.id)
+    db.refresh(entry)
+
+    return {
+        'status': flush_payload.get('status', 'idle'),
+        'file': {
+            'id': entry.id,
+            'path': entry.path,
+            'content': entry.content or '',
+            'updated_at': entry.updated_at,
+        },
+    }
+
+
 @app.put('/files/{file_id}/content')
 def update_file_content(
     file_id: int,
@@ -1506,6 +1663,10 @@ def update_file_content(
     if entry.is_binary:
         raise HTTPException(status_code=400, detail='Binary files cannot be edited inline')
 
+    print(
+        f"[api] put-content file={entry.id} path={entry.path} len={len(file_update.content or '')} "
+        f"preview={summarize_content(file_update.content)}"
+    )
     entry.content = file_update.content
     db.commit()
 
@@ -1663,7 +1824,12 @@ def flush_realtime_file(
     if entry.is_binary:
         raise HTTPException(status_code=400, detail='Binary files cannot be flushed as text')
 
+    print(
+        f"[api] flush-content file={entry.id} path={entry.path} len={len(payload.content or '')} "
+        f"preview={summarize_content(payload.content)}"
+    )
     entry.content = payload.content
+    entry.realtime_state = payload.state_base64 or ''
     db.commit()
     db.refresh(entry)
 
@@ -1695,16 +1861,7 @@ def compile_project(
     entrypoint = entry.path
 
     sync_project_workspace(project_id, entries)
-
-    try:
-        response = requests.post(
-            COMPILER_URL,
-            json={'project_id': project_id, 'entrypoint': entrypoint},
-            timeout=COMPILER_TIMEOUT_SECONDS,
-        )
-        return response.json()
-    except Exception as exc:
-        return {'status': 'error', 'message': str(exc)}
+    return compile_project_snapshot(project_id, entrypoint, entries)
 
 
 @app.get('/fonts')
@@ -1743,16 +1900,7 @@ def download_pdf(
     normalized_entrypoint = entry.path
 
     sync_project_workspace(project_id, entries)
-
-    try:
-        response = requests.post(
-            COMPILER_URL,
-            json={'project_id': project_id, 'entrypoint': normalized_entrypoint},
-            timeout=COMPILER_TIMEOUT_SECONDS,
-        )
-        payload = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    payload = compile_project_snapshot(project_id, normalized_entrypoint, entries)
 
     if payload.get('status') != 'success':
         raise HTTPException(status_code=400, detail=payload.get('message') or 'Failed to export PDF')

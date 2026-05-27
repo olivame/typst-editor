@@ -21,6 +21,10 @@ const realtimeSecret = process.env.REALTIME_SECRET || 'change-this-realtime-secr
 const rooms = new Map()
 const wss = new WebSocketServer({ noServer: true })
 
+function summarizeContent(value, limit = 80) {
+  return `${value || ''}`.replace(/\s+/g, ' ').slice(0, limit)
+}
+
 function toUint8Array(data) {
   if (data instanceof Uint8Array) return data
   if (Array.isArray(data)) return Uint8Array.from(data)
@@ -30,6 +34,50 @@ function toUint8Array(data) {
 function writeJson(response, statusCode, payload) {
   response.writeHead(statusCode, { 'Content-Type': 'application/json' })
   response.end(JSON.stringify(payload))
+}
+
+function encodeStateBase64(doc) {
+  return Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64')
+}
+
+function applyStoredState(doc, stateBase64) {
+  const normalizedState = `${stateBase64 || ''}`.trim()
+  if (!normalizedState) return false
+
+  try {
+    const update = Uint8Array.from(Buffer.from(normalizedState, 'base64'))
+    if (update.byteLength === 0) return false
+    Y.applyUpdate(doc, update)
+    return true
+  } catch (error) {
+    console.error('[realtime] failed to decode stored state:', error)
+    return false
+  }
+}
+
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+
+    request.on('data', (chunk) => {
+      chunks.push(chunk)
+    })
+
+    request.on('end', () => {
+      if (chunks.length === 0) {
+        resolve({})
+        return
+      }
+
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (error) {
+        reject(error)
+      }
+    })
+
+    request.on('error', reject)
+  })
 }
 
 function sendHttpError(socket, statusCode, message) {
@@ -121,7 +169,8 @@ function cleanupRoomIfUnused(room) {
 }
 
 async function flushRoom(room, reason = 'debounce') {
-  if (!room.dirty || room.flushInFlight) return
+  const shouldForce = reason === 'manual'
+  if ((!room.dirty && !shouldForce) || room.flushInFlight) return false
 
   room.flushInFlight = true
   if (room.flushTimer) {
@@ -130,6 +179,10 @@ async function flushRoom(room, reason = 'debounce') {
   }
 
   try {
+    const content = room.ytext.toString()
+    console.log(
+      `[realtime] flush room=${room.roomKey} reason=${reason} len=${content.length} preview=${JSON.stringify(summarizeContent(content))}`,
+    )
     const response = await fetch(`${apiInternalUrl}/internal/realtime/flush-file`, {
       method: 'POST',
       headers: {
@@ -138,7 +191,8 @@ async function flushRoom(room, reason = 'debounce') {
       },
       body: JSON.stringify({
         file_id: room.fileId,
-        content: room.ytext.toString(),
+        content,
+        state_base64: encodeStateBase64(room.doc),
         updated_by_id: room.lastUpdatedById,
         reason,
       }),
@@ -150,8 +204,10 @@ async function flushRoom(room, reason = 'debounce') {
     }
 
     room.dirty = false
+    return true
   } catch (error) {
     console.error(`[realtime] flush failed for ${room.roomKey}:`, error)
+    return false
   } finally {
     room.flushInFlight = false
     cleanupRoomIfUnused(room)
@@ -195,9 +251,13 @@ function getOrCreateRoom(session) {
   const doc = new Y.Doc()
   const ytext = doc.getText('content')
   const initialContent = `${session.file?.content || ''}`
-  if (initialContent) {
+  const restoredFromState = applyStoredState(doc, session.file?.realtime_state)
+  if (!restoredFromState && initialContent) {
     ytext.insert(0, initialContent)
   }
+  console.log(
+    `[realtime] create room=${session.room_key} file=${session.file.id} len=${ytext.toString().length} source=${restoredFromState ? 'state' : 'content'} preview=${JSON.stringify(summarizeContent(ytext.toString()))}`,
+  )
 
   const room = {
     roomKey: session.room_key,
@@ -219,6 +279,9 @@ function getOrCreateRoom(session) {
     if (origin?.socket == null) return
 
     room.lastUpdatedById = origin.user?.id ?? room.lastUpdatedById
+    console.log(
+      `[realtime] update room=${room.roomKey} user=${room.lastUpdatedById ?? 'unknown'} len=${room.ytext.toString().length} preview=${JSON.stringify(summarizeContent(room.ytext.toString()))}`,
+    )
     scheduleFlush(room, 'update')
     broadcast(room, buildSyncUpdateMessage(update), origin.socket)
   })
@@ -298,6 +361,13 @@ function handleConnectionClose(room, connection) {
       cleanupRoomIfUnused(room)
     }
   }
+}
+
+function findRoomByFileId(fileId) {
+  for (const room of rooms.values()) {
+    if (room.fileId === fileId) return room
+  }
+  return null
 }
 
 async function handleUpgrade(request, socket, head) {
@@ -388,8 +458,10 @@ async function handleUpgrade(request, socket, head) {
   })
 }
 
-const server = http.createServer((request, response) => {
-  if (request.url === '/health') {
+const server = http.createServer(async (request, response) => {
+  const requestUrl = new URL(request.url || '/', 'http://localhost')
+
+  if (request.method === 'GET' && requestUrl.pathname === '/health') {
     writeJson(response, 200, {
       status: 'ok',
       service: 'realtime',
@@ -397,6 +469,44 @@ const server = http.createServer((request, response) => {
       connections: Array.from(rooms.values()).reduce((total, room) => total + room.connections.size, 0),
     })
     return
+  }
+
+  if (request.method === 'POST' && requestUrl.pathname === '/internal/realtime/flush-room') {
+    if (request.headers['x-realtime-secret'] !== realtimeSecret) {
+      writeJson(response, 401, { detail: 'Invalid realtime secret' })
+      return
+    }
+
+    try {
+      const payload = await readJsonBody(request)
+      const fileId = Number.parseInt(`${payload?.file_id || ''}`, 10)
+      if (!Number.isInteger(fileId) || fileId <= 0) {
+        writeJson(response, 400, { detail: 'Invalid file_id' })
+        return
+      }
+
+      const room = findRoomByFileId(fileId)
+      if (!room) {
+        writeJson(response, 200, {
+          status: 'idle',
+          file_id: fileId,
+        })
+        return
+      }
+
+      const flushed = await flushRoom(room, 'manual')
+      writeJson(response, 200, {
+        status: flushed ? 'flushed' : 'idle',
+        file_id: fileId,
+        room_key: room.roomKey,
+        content_length: room.ytext.toString().length,
+      })
+      return
+    } catch (error) {
+      console.error('[realtime] manual flush failed:', error)
+      writeJson(response, 500, { detail: error.message || 'Manual flush failed' })
+      return
+    }
   }
 
   writeJson(response, 200, {

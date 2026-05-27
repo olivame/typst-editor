@@ -14,17 +14,18 @@
 
 ### `compiler`
 - 负责执行 `typst compile`。
-- 目前通过共享工作目录读取 `.typ` 并输出 `.pdf`。
-- 后续如果拆成独立节点，只需要保证 API 和 compiler 能共享对象存储或文件卷语义。
+- 当前由 API 发送项目快照，compiler 在临时目录编译后把 PDF 返回给 API。
+- 这一层已经不依赖共享工作目录，后续可以单独扩缩容或替换为队列 worker。
 
 ## 当前请求链路
 
 1. Web 调用 API 保存文件内容
 2. API 将内容写入工作目录
 3. Web 调用 API 触发编译
-4. API 调用 compiler 服务
-5. compiler 生成 PDF
-6. Web 通过 API 读取 PDF 预览或下载
+4. API 打包项目快照并调用 compiler 服务
+5. compiler 在临时目录生成 PDF 并回传给 API
+6. API 将 PDF 写回工作目录
+7. Web 通过 API 读取 PDF 预览或下载
 
 ## 后续分布式演进建议
 
@@ -36,7 +37,7 @@
 ### 第二阶段
 - 把 `storage/projects` 从本地目录换成共享卷或对象存储
 - API 只存元数据和任务状态
-- Compiler 按任务拉取源文件并上传产物
+- Preview 按任务拉取源文件并建立会话
 
 ### 第三阶段
 - API 异步化编译请求
