@@ -1,9 +1,12 @@
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import time
 from pathlib import Path
@@ -16,11 +19,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 
-WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", "/workspace/projects"))
+PREVIEW_WORKSPACE_DIR = Path(os.getenv("PREVIEW_WORKSPACE_DIR", "/tmp/typst-preview-workspaces"))
 TINYMIST_BIN = os.getenv("TINYMIST_BIN", "tinymist")
 SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "1800"))
 SESSION_SWEEP_SECONDS = int(os.getenv("SESSION_SWEEP_SECONDS", "60"))
 PROXY_TIMEOUT_SECONDS = float(os.getenv("PROXY_TIMEOUT_SECONDS", "30"))
+SNAPSHOT_TIMEOUT_SECONDS = float(os.getenv("SNAPSHOT_TIMEOUT_SECONDS", "10"))
+SNAPSHOT_REFRESH_SECONDS = float(os.getenv("SNAPSHOT_REFRESH_SECONDS", "2"))
+API_INTERNAL_URL = os.getenv("API_INTERNAL_URL", "http://api:8000").rstrip("/")
+PREVIEW_SECRET = os.getenv("PREVIEW_SECRET", "change-this-preview-secret")
 
 HTML_WS_SNIPPET = 'let urlObject = new URL("/", window.location.href);'
 DIAGNOSTIC_HEADER_PATTERN = re.compile(r"^(error|warning):\s*(.+)$")
@@ -39,6 +46,8 @@ LARGE_PREVIEW_IMAGE_COUNT = 25
 LARGE_PREVIEW_TYP_COUNT = 12
 
 app = FastAPI()
+PREVIEW_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -89,48 +98,56 @@ def normalize_client_id(raw_client_id: str) -> str:
     return filtered[:128] or "default"
 
 
-def make_session_key(project_id: int, entrypoint: str, client_id: str) -> str:
-    return f"{project_id}:{entrypoint}:{client_id}"
+def normalize_snapshot_path(raw_path: str) -> str:
+    normalized = (raw_path or "").strip().replace("\\", "/")
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Snapshot path is required")
+
+    candidate = Path(normalized)
+    if candidate.is_absolute() or normalized.startswith("/") or ".." in candidate.parts:
+        raise HTTPException(status_code=400, detail=f"Invalid snapshot path: {raw_path}")
+
+    return candidate.as_posix()
 
 
-def is_template_typ_path(path: str) -> bool:
-    parts = path.lower().split("/")
-    filename = parts[-1] if parts else ""
-    return filename == "template.typ" or "template" in parts or "templates" in parts
+def normalize_entrypoint_request(project_id: int, raw_path: str) -> str:
+    normalized = (raw_path or "main.typ").strip().replace("\\", "/")
+
+    legacy_workspace_prefix = f"/workspace/projects/{project_id}/"
+    if normalized.startswith(legacy_workspace_prefix):
+        normalized = normalized.removeprefix(legacy_workspace_prefix)
+
+    preview_workspace_prefix = f"{PREVIEW_WORKSPACE_DIR.as_posix().rstrip('/')}/"
+    if normalized.startswith(preview_workspace_prefix):
+        session_path = normalized.removeprefix(preview_workspace_prefix)
+        session_dir, separator, relative_path = session_path.partition("/")
+        if separator and session_dir.startswith(f"{project_id}-"):
+            normalized = relative_path
+
+    return normalize_entrypoint(normalized)
 
 
-def resolve_entrypoint_in_project(project_dir: Path, raw_path: str) -> str:
-    normalized_raw = (raw_path or "").strip().replace("\\", "/")
-    search_candidates = []
-
-    if normalized_raw:
-        prefix = f"{project_dir.as_posix().rstrip('/')}/"
-        if normalized_raw.startswith(prefix):
-            normalized_raw = normalized_raw.split(prefix, 1)[1]
-        search_candidates = [normalized_raw]
-        if normalized_raw.startswith("/"):
-            search_candidates.append(normalized_raw.lstrip("/"))
+def resolve_entrypoint_in_snapshot(files: list[dict[str, object]], project_id: int, raw_path: str) -> str:
+    normalized_candidate = normalize_entrypoint_request(project_id, raw_path)
 
     typ_files = sorted(
-        current.relative_to(project_dir).as_posix()
-        for current in project_dir.rglob("*.typ")
-        if current.is_file()
+        normalize_snapshot_path(str(entry.get("path") or ""))
+        for entry in files
+        if entry.get("kind") != "folder" and str(entry.get("path") or "").endswith(".typ")
     )
     if not typ_files:
         raise HTTPException(status_code=404, detail="No .typ entrypoint found in project")
 
-    for candidate in search_candidates:
-        normalized_candidate = normalize_entrypoint(candidate)
-        if normalized_candidate in typ_files:
-            return normalized_candidate
+    if normalized_candidate in typ_files:
+        return normalized_candidate
 
-        suffix_matches = [path for path in typ_files if path.endswith(f"/{normalized_candidate}")]
-        if len(suffix_matches) == 1:
-            return suffix_matches[0]
+    suffix_matches = [path for path in typ_files if path.endswith(f"/{normalized_candidate}")]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
 
-        basename_matches = [path for path in typ_files if Path(path).name == Path(normalized_candidate).name]
-        if len(basename_matches) == 1:
-            return basename_matches[0]
+    basename_matches = [path for path in typ_files if Path(path).name == Path(normalized_candidate).name]
+    if len(basename_matches) == 1:
+        return basename_matches[0]
 
     direct_main = next((path for path in typ_files if path == "main.typ"), None)
     if direct_main:
@@ -151,6 +168,71 @@ def resolve_entrypoint_in_project(project_dir: Path, raw_path: str) -> str:
         return non_template_paths[0]
 
     return sorted(typ_files, key=lambda path: (path.count("/"), path))[0]
+
+
+def materialize_snapshot(project_dir: Path, files: list[dict[str, object]]) -> None:
+    if project_dir.exists():
+        shutil.rmtree(project_dir)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=502, detail="Preview snapshot contains an invalid entry")
+
+        relative_path = normalize_snapshot_path(str(entry.get("path") or ""))
+        kind = str(entry.get("kind") or "file")
+        disk_path = project_dir / relative_path
+
+        if kind == "folder":
+            disk_path.mkdir(parents=True, exist_ok=True)
+            continue
+
+        raw_content = entry.get("content_base64")
+        if not isinstance(raw_content, str):
+            raise HTTPException(status_code=502, detail=f"Preview snapshot is missing content for {relative_path}")
+
+        try:
+            decoded_content = base64.b64decode(raw_content.encode("ascii"))
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(status_code=502, detail=f"Preview snapshot has invalid content for {relative_path}") from exc
+
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_path.write_bytes(decoded_content)
+
+
+async def fetch_project_snapshot(project_id: int) -> dict[str, object]:
+    try:
+        async with httpx.AsyncClient(timeout=SNAPSHOT_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{API_INTERNAL_URL}/internal/preview/project-snapshot",
+                json={"project_id": project_id},
+                headers={"X-Preview-Secret": PREVIEW_SECRET},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        raise HTTPException(status_code=status_code, detail=exc.response.text or "Preview snapshot request failed") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        raise HTTPException(status_code=502, detail="API returned an invalid preview snapshot")
+
+    if not payload.get("revision"):
+        raise HTTPException(status_code=502, detail="API returned a preview snapshot without a revision")
+
+    return payload
+
+
+def make_session_key(project_id: int, entrypoint: str, client_id: str) -> str:
+    return f"{project_id}:{entrypoint}:{client_id}"
+
+
+def is_template_typ_path(path: str) -> bool:
+    parts = path.lower().split("/")
+    filename = parts[-1] if parts else ""
+    return filename == "template.typ" or "template" in parts or "templates" in parts
 
 
 def resolve_local_project_path(project_dir: Path, source_file: Path, raw_path: str) -> Path | None:
@@ -244,36 +326,6 @@ def should_enable_efficient_preview(project_dir: Path, entrypoint: str) -> tuple
         reasons.append("project_typ_count")
 
     return bool(reasons), reasons
-
-
-def compute_workspace_revision(project_dir: Path) -> str:
-    if not project_dir.exists():
-        return "missing"
-
-    digest = hashlib.sha1()
-    for current in sorted(project_dir.rglob("*")):
-        if not current.is_file():
-            continue
-
-        relative_path = current.relative_to(project_dir).as_posix()
-        if relative_path.endswith(".pdf"):
-            continue
-        if "/." in f"/{relative_path}" or relative_path.startswith("."):
-            continue
-
-        try:
-            stats = current.stat()
-        except OSError:
-            continue
-
-        digest.update(relative_path.encode("utf-8", errors="ignore"))
-        digest.update(b"\0")
-        digest.update(str(stats.st_mtime_ns).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(stats.st_size).encode("ascii"))
-        digest.update(b"\0")
-
-    return digest.hexdigest()
 
 
 def make_wrapper_html(project_id: int, entrypoint: str = "main.typ", client_id: str = "default") -> str:
@@ -1060,7 +1112,8 @@ class PreviewSession:
         self.project_id = project_id
         self.entrypoint = entrypoint
         self.client_id = client_id
-        self.project_dir = WORKSPACE_DIR / str(project_id)
+        session_hash = hashlib.sha1(make_session_key(project_id, entrypoint, client_id).encode("utf-8")).hexdigest()
+        self.project_dir = PREVIEW_WORKSPACE_DIR / f"{project_id}-{session_hash}"
         self.data_port = reserve_port()
         self.control_port = reserve_port()
         self.process: asyncio.subprocess.Process | None = None
@@ -1076,6 +1129,7 @@ class PreviewSession:
         self._pending_diagnostics: list[dict[str, object]] = []
         self._current_diagnostic_lines: list[str] = []
         self.workspace_revision = ""
+        self.last_snapshot_check = 0.0
         self.instance_id = 0
 
     def _compose_status(self, base_status: dict[str, object] | None = None) -> dict[str, object]:
@@ -1111,6 +1165,13 @@ class PreviewSession:
             column_number = max(int(column_text), 1)
         except ValueError:
             return None
+
+        try:
+            path_text = Path(path_text).resolve(strict=False).relative_to(
+                self.project_dir.resolve(strict=False),
+            ).as_posix()
+        except (OSError, ValueError):
+            pass
 
         return {
             "path": path_text,
@@ -1193,18 +1254,32 @@ class PreviewSession:
             self._current_diagnostic_lines.append(stripped)
             return
 
-    async def ensure_running(self) -> None:
-        self.last_access = time.monotonic()
-        current_revision = compute_workspace_revision(self.project_dir)
+    async def ensure_running(self, snapshot: dict[str, object] | None = None) -> None:
+        now = time.monotonic()
+        self.last_access = now
+        if (
+            snapshot is None
+            and self.is_healthy()
+            and self.workspace_revision
+            and now - self.last_snapshot_check < SNAPSHOT_REFRESH_SECONDS
+        ):
+            return
+
+        if snapshot is None:
+            snapshot = await fetch_project_snapshot(self.project_id)
+        self.last_snapshot_check = now
+
+        files = snapshot.get("files")
+        if not isinstance(files, list):
+            raise HTTPException(status_code=502, detail="Preview snapshot contains no files")
+        current_revision = str(snapshot.get("revision") or "")
 
         async with self.lock:
             if self.is_healthy() and self.workspace_revision == current_revision:
                 return
 
             await self.stop()
-
-            if not self.project_dir.exists():
-                raise HTTPException(status_code=404, detail="Project workspace not found")
+            materialize_snapshot(self.project_dir, files)
 
             entrypoint = self.project_dir / self.entrypoint
             if not entrypoint.exists():
@@ -1309,7 +1384,8 @@ class PreviewSession:
         )
 
     async def send_control(self, message: dict[str, object]) -> None:
-        await self.ensure_running()
+        if not self.is_healthy():
+            await self.ensure_running()
         assert self.control_socket is not None
         await self.control_socket.send(json.dumps(message))
         self.last_access = time.monotonic()
@@ -1357,6 +1433,9 @@ class PreviewSession:
                 await self.stdout_task
             self.stdout_task = None
 
+        with contextlib.suppress(OSError):
+            shutil.rmtree(self.project_dir)
+
 
 class PreviewManager:
     def __init__(self) -> None:
@@ -1370,16 +1449,27 @@ class PreviewManager:
         entrypoint: str = "main.typ",
         client_id: str = "default",
     ) -> PreviewSession:
-        project_dir = WORKSPACE_DIR / str(project_id)
-        normalized_entrypoint = resolve_entrypoint_in_project(project_dir, entrypoint)
         normalized_client_id = normalize_client_id(client_id)
+        requested_entrypoint = normalize_entrypoint_request(project_id, entrypoint)
+        requested_session_key = make_session_key(project_id, requested_entrypoint, normalized_client_id)
+        async with self.lock:
+            session = self.sessions.get(requested_session_key)
+        if session is not None:
+            await session.ensure_running()
+            return session
+
+        snapshot = await fetch_project_snapshot(project_id)
+        files = snapshot.get("files")
+        if not isinstance(files, list):
+            raise HTTPException(status_code=502, detail="Preview snapshot contains no files")
+        normalized_entrypoint = resolve_entrypoint_in_snapshot(files, project_id, entrypoint)
         session_key = make_session_key(project_id, normalized_entrypoint, normalized_client_id)
         async with self.lock:
             session = self.sessions.get(session_key)
             if session is None:
                 session = PreviewSession(project_id, normalized_entrypoint, normalized_client_id)
                 self.sessions[session_key] = session
-        await session.ensure_running()
+        await session.ensure_running(snapshot)
         return session
 
     async def sweep(self) -> None:

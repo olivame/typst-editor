@@ -32,8 +32,6 @@ services:
         condition: service_healthy
       compiler:
         condition: service_started
-      preview:
-        condition: service_started
     environment:
       - DB_HOST=db
       - DB_PORT=5432
@@ -44,6 +42,7 @@ services:
       - COMPILER_TIMEOUT_SECONDS=${COMPILER_TIMEOUT_SECONDS:-10}
       - REALTIME_URL=${REALTIME_URL:-http://realtime:8003}
       - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
+      - PREVIEW_SECRET=${PREVIEW_SECRET:-change-this-preview-secret}
       - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
     ports:
@@ -94,13 +93,16 @@ services:
         - APT_MIRROR=${APT_MIRROR:-}
         - TINYMIST_DOWNLOAD_URL=${TINYMIST_DOWNLOAD_URL:-https://github.com/Myriad-Dreamin/tinymist/releases/download/v0.14.8/tinymist-x86_64-unknown-linux-musl.tar.gz}
         - TINYMIST_VERSION=${TINYMIST_VERSION:-0.14.8}
+    depends_on:
+      api:
+        condition: service_started
     environment:
-      - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
+      - PREVIEW_WORKSPACE_DIR=${PREVIEW_WORKSPACE_DIR:-/tmp/typst-preview-workspaces}
       - SESSION_IDLE_SECONDS=${SESSION_IDLE_SECONDS:-1800}
+      - API_INTERNAL_URL=${API_INTERNAL_URL:-http://api:8000}
+      - PREVIEW_SECRET=${PREVIEW_SECRET:-change-this-preview-secret}
     ports:
       - "8002:8002"
-    volumes:
-      - ./storage/projects:/workspace/projects
     networks:
       - app-net
 

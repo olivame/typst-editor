@@ -25,6 +25,7 @@ from settings import (
     COMPILER_TIMEOUT_SECONDS,
     COMPILER_URL,
     CORS_ALLOW_ORIGINS,
+    PREVIEW_SECRET,
     REALTIME_SECRET,
     REALTIME_URL,
     WORKSPACE_DIR,
@@ -177,6 +178,10 @@ class ProjectTagsUpdate(BaseModel):
 
 class ProjectCompileRequest(BaseModel):
     entrypoint: str = ''
+
+
+class PreviewSnapshotRequest(BaseModel):
+    project_id: int
 
 
 class RealtimeRoomResolveRequest(BaseModel):
@@ -934,6 +939,15 @@ def build_compiler_workspace_snapshot(project_id: int, entries: list[models.File
     return snapshot_entries
 
 
+def build_snapshot_revision(snapshot_entries: list[dict[str, str]]):
+    digest = hashlib.sha1()
+    for entry in sorted(snapshot_entries, key=lambda current: current.get('path', '')):
+        for key in ('path', 'kind', 'content_base64'):
+            digest.update(str(entry.get(key, '')).encode('utf-8', errors='ignore'))
+            digest.update(b'\0')
+    return digest.hexdigest()
+
+
 def compile_project_snapshot(project_id: int, entrypoint: str, entries: list[models.File]):
     try:
         response = requests.post(
@@ -1012,6 +1026,11 @@ def can_edit_project_file(
         if exc.status_code in {401, 403}:
             return False
         raise
+
+
+def require_preview_secret(x_preview_secret: str | None = Header(default=None)):
+    if not x_preview_secret or x_preview_secret != PREVIEW_SECRET:
+        raise HTTPException(status_code=401, detail='Invalid preview secret')
 
 
 def require_realtime_secret(x_realtime_secret: str | None = Header(default=None)):
@@ -1795,6 +1814,23 @@ def get_file_raw(
         filename=entry.name,
         content_disposition_type='attachment' if download else 'inline',
     )
+
+
+@app.post('/internal/preview/project-snapshot')
+def get_preview_project_snapshot(
+    payload: PreviewSnapshotRequest,
+    _: None = Depends(require_preview_secret),
+    db: Session = Depends(get_db),
+):
+    get_project_or_404(db, payload.project_id)
+    entries = db.query(models.File).filter(models.File.project_id == payload.project_id).all()
+    snapshot_entries = build_compiler_workspace_snapshot(payload.project_id, entries)
+    return {
+        'protocol_version': 1,
+        'project_id': payload.project_id,
+        'revision': build_snapshot_revision(snapshot_entries),
+        'files': snapshot_entries,
+    }
 
 
 @app.post('/internal/realtime/resolve-file-room')
