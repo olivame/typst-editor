@@ -159,13 +159,23 @@ function broadcast(room, payload, exceptSocket = null) {
 
 function cleanupRoomIfUnused(room) {
   if (room.connections.size > 0 || room.dirty || room.flushInFlight) return
+  if (room.idleTimer) return
+
+  room.doc.destroy()
+  rooms.delete(room.roomKey)
+}
+
+function scheduleRoomCleanup(room) {
+  if (room.connections.size > 0) return
 
   if (room.idleTimer) {
     clearTimeout(room.idleTimer)
   }
 
-  room.doc.destroy()
-  rooms.delete(room.roomKey)
+  room.idleTimer = setTimeout(() => {
+    room.idleTimer = null
+    cleanupRoomIfUnused(room)
+  }, ROOM_IDLE_TTL_MS)
 }
 
 async function flushRoom(room, reason = 'debounce') {
@@ -287,6 +297,9 @@ function getOrCreateRoom(session) {
   })
 
   rooms.set(room.roomKey, room)
+  if (!restoredFromState && initialContent) {
+    scheduleFlush(room, 'init')
+  }
   return room
 }
 
@@ -347,18 +360,10 @@ function handleConnectionClose(room, connection) {
   room.connections.delete(connection)
 
   if (room.connections.size === 0) {
-    if (room.idleTimer) {
-      clearTimeout(room.idleTimer)
-    }
-
-    room.idleTimer = setTimeout(() => {
-      cleanupRoomIfUnused(room)
-    }, ROOM_IDLE_TTL_MS)
+    scheduleRoomCleanup(room)
 
     if (room.dirty) {
       void flushRoom(room, 'disconnect')
-    } else {
-      cleanupRoomIfUnused(room)
     }
   }
 }

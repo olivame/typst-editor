@@ -1668,6 +1668,7 @@ def update_file_content(
         f"preview={summarize_content(file_update.content)}"
     )
     entry.content = file_update.content
+    entry.realtime_state = ''
     db.commit()
 
     disk_path = get_entry_disk_path(entry.project_id, entry.path)
