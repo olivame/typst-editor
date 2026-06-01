@@ -215,6 +215,7 @@ async function flushRoom(room, reason = 'debounce') {
         file_id: room.fileId,
         content,
         state_base64: encodeStateBase64(room.doc),
+        content_revision: room.contentRevision,
         updated_by_id: room.lastUpdatedById,
         reason,
       }),
@@ -222,14 +223,22 @@ async function flushRoom(room, reason = 'debounce') {
 
     if (!response.ok) {
       const message = await response.text()
-      throw new Error(message || `Flush failed with status ${response.status}`)
+      return {
+        flushed: false,
+        statusCode: response.status,
+        message: message || `Flush failed with status ${response.status}`,
+      }
     }
 
+    const payload = await response.json().catch(() => ({}))
+    if (Number.isInteger(payload.content_revision)) {
+      room.contentRevision = payload.content_revision
+    }
     room.dirty = false
-    return true
+    return { flushed: true, statusCode: 200, contentRevision: room.contentRevision }
   } catch (error) {
     console.error(`[realtime] flush failed for ${room.roomKey}:`, error)
-    return false
+    return { flushed: false, statusCode: 502, message: error.message || 'Flush failed' }
   } finally {
     room.flushInFlight = false
     cleanupRoomIfUnused(room)
@@ -273,6 +282,7 @@ function getOrCreateRoom(session) {
   const doc = new Y.Doc()
   const ytext = doc.getText('content')
   const initialContent = `${session.file?.content || ''}`
+  const initialContentRevision = Number.parseInt(`${session.file?.content_revision ?? 0}`, 10) || 0
   const restoredFromState = applyStoredState(doc, session.file?.realtime_state)
   if (!restoredFromState && initialContent) {
     ytext.insert(0, initialContent)
@@ -286,6 +296,7 @@ function getOrCreateRoom(session) {
     fileId: session.file.id,
     projectId: session.file.project_id,
     path: session.file.path,
+    contentRevision: initialContentRevision,
     ytext,
     doc,
     awareness: new awarenessProtocol.Awareness(doc),
@@ -511,12 +522,22 @@ const server = http.createServer(async (request, response) => {
         return
       }
 
-      const flushed = await flushRoom(room, 'manual')
+      const flushResult = await flushRoom(room, 'manual')
+      if (flushResult.statusCode === 409) {
+        writeJson(response, 409, {
+          detail: flushResult.message || 'Realtime room content is stale',
+          file_id: fileId,
+          room_key: room.roomKey,
+        })
+        return
+      }
+
       writeJson(response, 200, {
-        status: flushed ? 'flushed' : 'idle',
+        status: flushResult.flushed ? 'flushed' : 'idle',
         file_id: fileId,
         room_key: room.roomKey,
         content_length: room.ytext.toString().length,
+        content_revision: room.contentRevision,
       })
       return
     } catch (error) {

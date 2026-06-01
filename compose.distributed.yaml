@@ -1,15 +1,12 @@
 services:
   web:
+    profiles: ["web"]
     build:
       context: ./apps/web
       dockerfile: Dockerfile
       args:
         - NODE_BASE_IMAGE=${NODE_BASE_IMAGE:-node:22-alpine}
         - NPM_REGISTRY=${NPM_REGISTRY:-}
-    depends_on:
-      - api
-      - preview
-      - realtime
     ports:
       - "${WEB_PUBLISH_PORT:-3000}:3000"
     environment:
@@ -27,22 +24,20 @@ services:
       - VITE_REALTIME_PORT=${VITE_REALTIME_PORT:-8003}
       - API_PROXY_TARGET=${API_PROXY_TARGET:-}
       - API_PROXY_SCHEME=${API_PROXY_SCHEME:-http}
-      - API_PROXY_HOST=${API_PROXY_HOST:-api}
+      - API_PROXY_HOST=${API_PROXY_HOST:-}
       - API_PROXY_PORT=${API_PROXY_PORT:-8000}
       - PREVIEW_PROXY_TARGET=${PREVIEW_PROXY_TARGET:-}
       - PREVIEW_PROXY_SCHEME=${PREVIEW_PROXY_SCHEME:-http}
-      - PREVIEW_PROXY_HOST=${PREVIEW_PROXY_HOST:-preview}
+      - PREVIEW_PROXY_HOST=${PREVIEW_PROXY_HOST:-}
       - PREVIEW_PROXY_PORT=${PREVIEW_PROXY_PORT:-8002}
       - REALTIME_PROXY_TARGET=${REALTIME_PROXY_TARGET:-}
       - REALTIME_PROXY_SCHEME=${REALTIME_PROXY_SCHEME:-ws}
-      - REALTIME_PROXY_HOST=${REALTIME_PROXY_HOST:-realtime}
+      - REALTIME_PROXY_HOST=${REALTIME_PROXY_HOST:-}
       - REALTIME_PROXY_PORT=${REALTIME_PROXY_PORT:-8003}
-    networks:
-      app-net:
-      service-ip-net:
-        ipv4_address: ${WEB_NETWORK_IP:-172.30.0.20}
+    restart: unless-stopped
 
   api:
+    profiles: ["api"]
     build:
       context: ./apps/api
       dockerfile: Dockerfile
@@ -50,20 +45,15 @@ services:
         - PYTHON_BASE_IMAGE=${PYTHON312_BASE_IMAGE:-python:3.12-slim}
         - PIP_INDEX_URL=${PIP_INDEX_URL:-}
         - PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-}
-    depends_on:
-      db:
-        condition: service_healthy
-      compiler:
-        condition: service_started
     environment:
-      - DB_HOST=${DB_HOST:-db}
+      - DB_HOST=${DB_HOST}
       - DB_PORT=${DB_PORT:-5432}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
       - COMPILER_URL=${COMPILER_URL:-}
       - COMPILER_SCHEME=${COMPILER_SCHEME:-http}
-      - COMPILER_HOST=${COMPILER_HOST:-compiler}
+      - COMPILER_HOST=${COMPILER_HOST}
       - COMPILER_PORT=${COMPILER_PORT:-8001}
       - COMPILER_TIMEOUT_SECONDS=${COMPILER_TIMEOUT_SECONDS:-10}
       - REALTIME_URL=${REALTIME_URL:-}
@@ -71,27 +61,23 @@ services:
       - REALTIME_BROWSER_URL=${REALTIME_BROWSER_URL:-}
       - REALTIME_BROWSER_URLS=${REALTIME_BROWSER_URLS:-}
       - REALTIME_SCHEME=${REALTIME_SCHEME:-ws}
-      - REALTIME_HOST=${REALTIME_HOST:-realtime}
+      - REALTIME_HOST=${REALTIME_HOST}
       - REALTIME_PORT=${REALTIME_PORT:-8003}
       - REALTIME_INTERNAL_URL=${REALTIME_INTERNAL_URL:-}
       - REALTIME_INTERNAL_URLS=${REALTIME_INTERNAL_URLS:-}
       - REALTIME_INTERNAL_SCHEME=${REALTIME_INTERNAL_SCHEME:-http}
-      - REALTIME_INTERNAL_HOST=${REALTIME_INTERNAL_HOST:-realtime}
+      - REALTIME_INTERNAL_HOST=${REALTIME_INTERNAL_HOST}
       - REALTIME_INTERNAL_PORT=${REALTIME_INTERNAL_PORT:-8003}
-      - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
-      - PREVIEW_SECRET=${PREVIEW_SECRET:-change-this-preview-secret}
+      - REALTIME_SECRET=${REALTIME_SECRET}
+      - PREVIEW_SECRET=${PREVIEW_SECRET}
       - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
     ports:
       - "${API_PUBLISH_PORT:-8000}:8000"
-    volumes:
-      - ./storage/projects:/workspace/projects
-    networks:
-      app-net:
-      service-ip-net:
-        ipv4_address: ${API_NETWORK_IP:-172.30.0.10}
+    restart: unless-stopped
 
   db:
+    profiles: ["db"]
     image: ${POSTGRES_IMAGE:-postgres:16}
     environment:
       - POSTGRES_USER=${DB_USER}
@@ -106,12 +92,10 @@ services:
       - db-data:/var/lib/postgresql/data
     ports:
       - "${DB_PUBLISH_PORT:-5432}:5432"
-    networks:
-      app-net:
-      service-ip-net:
-        ipv4_address: ${DB_NETWORK_IP:-172.30.0.15}
+    restart: unless-stopped
 
   compiler:
+    profiles: ["compiler"]
     build:
       context: ./services/compiler
       dockerfile: Dockerfile
@@ -122,12 +106,10 @@ services:
         - TYPST_VERSION=${TYPST_VERSION:-0.14.2}
     ports:
       - "${COMPILER_PUBLISH_PORT:-8001}:8001"
-    networks:
-      app-net:
-      service-ip-net:
-        ipv4_address: ${COMPILER_NETWORK_IP:-172.30.0.11}
+    restart: unless-stopped
 
   preview:
+    profiles: ["preview"]
     build:
       context: ./services/preview
       dockerfile: Dockerfile
@@ -138,57 +120,40 @@ services:
         - APT_MIRROR=${APT_MIRROR:-}
         - TINYMIST_DOWNLOAD_URL=${TINYMIST_DOWNLOAD_URL:-https://github.com/Myriad-Dreamin/tinymist/releases/download/v0.14.8/tinymist-x86_64-unknown-linux-musl.tar.gz}
         - TINYMIST_VERSION=${TINYMIST_VERSION:-0.14.8}
-    depends_on:
-      api:
-        condition: service_started
     environment:
       - PREVIEW_WORKSPACE_DIR=${PREVIEW_WORKSPACE_DIR:-/tmp/typst-preview-workspaces}
       - SESSION_IDLE_SECONDS=${SESSION_IDLE_SECONDS:-1800}
       - API_INTERNAL_URL=${API_INTERNAL_URL:-}
       - API_INTERNAL_SCHEME=${API_INTERNAL_SCHEME:-http}
-      - API_INTERNAL_HOST=${API_INTERNAL_HOST:-api}
+      - API_INTERNAL_HOST=${API_INTERNAL_HOST}
       - API_INTERNAL_PORT=${API_INTERNAL_PORT:-8000}
-      - API_HOST=${API_HOST:-api}
+      - API_HOST=${API_HOST}
       - API_PORT=${API_PORT:-8000}
-      - PREVIEW_SECRET=${PREVIEW_SECRET:-change-this-preview-secret}
+      - PREVIEW_SECRET=${PREVIEW_SECRET}
     ports:
       - "${PREVIEW_PUBLISH_PORT:-8002}:8002"
-    networks:
-      app-net:
-      service-ip-net:
-        ipv4_address: ${PREVIEW_NETWORK_IP:-172.30.0.12}
+    restart: unless-stopped
 
   realtime:
+    profiles: ["realtime"]
     build:
       context: ./services/realtime
       dockerfile: Dockerfile
       args:
         - NODE_BASE_IMAGE=${NODE_BASE_IMAGE:-node:22-alpine}
         - NPM_REGISTRY=${NPM_REGISTRY:-}
-    depends_on:
-      - api
     environment:
       - REALTIME_PORT=${REALTIME_PORT:-8003}
-      - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
+      - REALTIME_SECRET=${REALTIME_SECRET}
       - API_INTERNAL_URL=${API_INTERNAL_URL:-}
       - API_INTERNAL_SCHEME=${API_INTERNAL_SCHEME:-http}
-      - API_INTERNAL_HOST=${API_INTERNAL_HOST:-api}
+      - API_INTERNAL_HOST=${API_INTERNAL_HOST}
       - API_INTERNAL_PORT=${API_INTERNAL_PORT:-8000}
-      - API_HOST=${API_HOST:-api}
+      - API_HOST=${API_HOST}
       - API_PORT=${API_PORT:-8000}
     ports:
       - "${REALTIME_PUBLISH_PORT:-8003}:8003"
-    networks:
-      app-net:
-      service-ip-net:
-        ipv4_address: ${REALTIME_NETWORK_IP:-172.30.0.13}
-
-networks:
-  app-net:
-  service-ip-net:
-    ipam:
-      config:
-        - subnet: ${SERVICE_IP_SUBNET:-172.30.0.0/24}
+    restart: unless-stopped
 
 volumes:
   db-data:

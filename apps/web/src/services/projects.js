@@ -253,11 +253,14 @@ export async function flushRealtimeFile(fileId) {
   })
 }
 
-export async function updateFileContent(fileId, content) {
+export async function updateFileContent(fileId, content, contentRevision = null) {
   return apiFetch(`/files/${fileId}/content`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      content_revision: contentRevision,
+    }),
   })
 }
 

@@ -43,7 +43,7 @@ cp .env.example .env
 - `services/compiler`: Typst 编译服务，通过 API 传入的项目快照工作
 - `services/preview`: Tinymist 预览服务，通过 API 内部快照工作
 - `services/realtime`: Yjs 协同编辑服务，通过 API 内部接口 resolve/flush
-- `storage/projects`: API 当前使用的项目工作目录和生成文件
+- `storage/projects`: 单机/dev 本地缓存目录；项目文件、二进制上传和 PDF 产物的权威数据在数据库中
 
 ### 前端模块
 
@@ -61,11 +61,11 @@ cp .env.example .env
 
 ## 为分布式部署预留的配置
 
-`.env.example` 里已经提供了这些入口。所有 `*_URL` 优先级最高；不填 URL 时会按 `*_SCHEME` + `*_HOST` + `*_PORT` 组装。
+`.env.example` 里已经提供了这些入口，`.env.distributed.example` 给多机部署提供了按 IP 填写的模板。所有 `*_URL` 优先级最高；不填 URL 时会按 `*_SCHEME` + `*_HOST` + `*_PORT` 组装。
 
 - 浏览器直连地址：`VITE_API_*`、`VITE_PREVIEW_*`、`VITE_REALTIME_*`。不设置时，非 localhost 访问会走 `/api`、`/preview`、`/realtime` 代理。
 - Web dev proxy 目标：`API_PROXY_*`、`PREVIEW_PROXY_*`、`REALTIME_PROXY_*`。
-- API 调 realtime 内部接口：`REALTIME_INTERNAL_URL` 或 `REALTIME_INTERNAL_SCHEME` / `REALTIME_INTERNAL_HOST` / `REALTIME_INTERNAL_PORT`。
+- API 调 realtime 内部接口：`REALTIME_INTERNAL_URL` / `REALTIME_INTERNAL_URLS`，或 `REALTIME_INTERNAL_SCHEME` / `REALTIME_INTERNAL_HOST` / `REALTIME_INTERNAL_PORT`。
 - Preview/Realtime 调 API 内部接口：`API_INTERNAL_URL` 或 `API_INTERNAL_SCHEME` / `API_INTERNAL_HOST` / `API_INTERNAL_PORT`。
 - Compose 宿主机发布端口：`WEB_PUBLISH_PORT`、`API_PUBLISH_PORT`、`PREVIEW_PUBLISH_PORT`、`REALTIME_PUBLISH_PORT`、`COMPILER_PUBLISH_PORT`。
 
@@ -100,6 +100,45 @@ API_INTERNAL_HOST=172.30.0.10
 ```
 
 浏览器如果只开放 Web 端口，可以不设置 `VITE_*_HOST`，让前端走 `/api`、`/preview`、`/realtime`，再把 `API_PROXY_HOST=172.30.0.10`、`PREVIEW_PROXY_HOST=172.30.0.12`、`REALTIME_PROXY_HOST=172.30.0.13`。不要用本机公网 IP 模拟容器间互调，云主机通常没有把公网 IP 绑定到网卡，容器回打公网 IP 可能超时。
+
+### 多机部署方式
+
+多机部署使用 `compose.distributed.yaml`。它不声明 Docker 内部服务依赖，也不挂载共享项目目录；每台机器只启动自己的 profile，服务之间通过 `.env` 中的 IP+端口访问。
+
+1. 在每台机器复制并填写同一份环境变量：
+
+```bash
+cp .env.distributed.example .env
+```
+
+2. 在 DB 机器启动数据库：
+
+```bash
+docker compose --env-file .env -f compose.distributed.yaml --profile db up -d --build db
+```
+
+3. 在各服务机器分别启动对应服务：
+
+```bash
+docker compose --env-file .env -f compose.distributed.yaml --profile compiler up -d --build compiler
+docker compose --env-file .env -f compose.distributed.yaml --profile api up -d --build api
+docker compose --env-file .env -f compose.distributed.yaml --profile preview up -d --build preview
+docker compose --env-file .env -f compose.distributed.yaml --profile realtime up -d --build realtime
+docker compose --env-file .env -f compose.distributed.yaml --profile web up -d --build web
+```
+
+建议先只开放 Web 端口给浏览器，API/Preview/Realtime/Compiler/DB 只在内网开放。此模式下 `VITE_*_HOST` 留空，填写 `API_PROXY_HOST`、`PREVIEW_PROXY_HOST`、`REALTIME_PROXY_HOST` 为对应内网 IP。
+
+当前横向扩容边界：API 已经不需要共享盘，可以多实例共用同一个 DB；Compiler 是无状态服务，可以放到负载均衡后面；Realtime 可以用 `REALTIME_BROWSER_URLS` + `REALTIME_INTERNAL_URLS` 做按文件稳定分片；Preview 仍有内存 session 状态，多个副本需要粘性路由。
+
+Realtime 多实例分片时，两组 URL 必须一一对应，顺序必须稳定。例如：
+
+```env
+REALTIME_BROWSER_URLS=ws://10.0.0.13:8003,ws://10.0.0.14:8003
+REALTIME_INTERNAL_URLS=http://10.0.0.13:8003,http://10.0.0.14:8003
+```
+
+API 会按 `file_id` 选择固定 realtime 节点，并把浏览器可访问的 shard URL 返回给前端；如果不配置 `REALTIME_BROWSER_URLS`，前端继续使用现有 `VITE_REALTIME_*` 或 `/realtime` 代理。
 
 ## 复现标准
 

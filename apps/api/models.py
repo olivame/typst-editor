@@ -194,6 +194,7 @@ class Project(Base):
     workspace = relationship("Workspace", back_populates="projects")
     created_by = relationship("User", back_populates="created_projects", foreign_keys=[created_by_id])
     files = relationship("File", back_populates="project", cascade="all, delete-orphan")
+    artifacts = relationship("ProjectArtifact", back_populates="project", cascade="all, delete-orphan")
     tags = relationship("Tag", secondary=project_tags, back_populates="projects")
     members = relationship("ProjectMember", back_populates="project", cascade="all, delete-orphan")
     revisions = relationship("Revision", back_populates="project", cascade="all, delete-orphan")
@@ -242,12 +243,30 @@ class File(Base):
     kind = Column(String(16), nullable=False, default="file")
     is_binary = Column(Boolean, nullable=False, default=False)
     content = Column(Text, default="")
+    content_revision = Column(Integer, nullable=False, default=0)
     realtime_state = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     project = relationship("Project", back_populates="files")
     comment_threads = relationship("CommentThread", back_populates="file")
+
+
+class ProjectArtifact(Base):
+    __tablename__ = "project_artifacts"
+    __table_args__ = (
+        UniqueConstraint("project_id", "path", name="uq_project_artifacts_project_path"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    path = Column(String(1024), nullable=False)
+    media_type = Column(String(128), nullable=False, default="application/octet-stream")
+    content = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    project = relationship("Project", back_populates="artifacts")
 
 
 class Revision(Base):

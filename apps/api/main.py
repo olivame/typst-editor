@@ -2,6 +2,7 @@ import json
 import mimetypes
 import shutil
 import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -9,12 +10,13 @@ import os
 import secrets
 import tempfile
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
 import requests
 from fastapi import Depends, FastAPI, File as FastAPIFile, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -26,9 +28,9 @@ from settings import (
     COMPILER_URL,
     CORS_ALLOW_ORIGINS,
     PREVIEW_SECRET,
-    REALTIME_INTERNAL_URL,
+    REALTIME_BROWSER_URLS,
+    REALTIME_INTERNAL_URLS,
     REALTIME_SECRET,
-    REALTIME_URL,
     WORKSPACE_DIR,
 )
 
@@ -96,6 +98,10 @@ with engine.begin() as connection:
         connection.execute(
             text("ALTER TABLE files ADD COLUMN is_binary BOOLEAN NOT NULL DEFAULT FALSE")
         )
+    if 'content_revision' not in file_columns:
+        connection.execute(
+            text("ALTER TABLE files ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0")
+        )
     if 'realtime_state' not in file_columns:
         connection.execute(
             text("ALTER TABLE files ADD COLUMN realtime_state TEXT NOT NULL DEFAULT ''")
@@ -108,6 +114,8 @@ with engine.begin() as connection:
         connection.execute(text("UPDATE files SET kind = 'file' WHERE kind IS NULL OR kind = ''"))
     if 'is_binary' in refreshed_file_columns:
         connection.execute(text("UPDATE files SET is_binary = FALSE WHERE is_binary IS NULL"))
+    if 'content_revision' in refreshed_file_columns:
+        connection.execute(text("UPDATE files SET content_revision = 0 WHERE content_revision IS NULL"))
     if 'realtime_state' in refreshed_file_columns:
         connection.execute(text("UPDATE files SET realtime_state = '' WHERE realtime_state IS NULL"))
 
@@ -159,6 +167,7 @@ class FolderCreate(BaseModel):
 
 class FileUpdate(BaseModel):
     content: str
+    content_revision: int | None = None
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -194,6 +203,7 @@ class RealtimeFlushFileRequest(BaseModel):
     file_id: int
     content: str
     state_base64: str = ''
+    content_revision: int | None = None
     updated_by_id: int | None = None
 
 
@@ -348,6 +358,7 @@ def serialize_entry(entry: models.File):
         'path': entry.path,
         'kind': entry.kind,
         'is_binary': entry.is_binary,
+        'content_revision': entry.content_revision or 0,
         'project_id': entry.project_id,
     }
 
@@ -608,12 +619,217 @@ def write_bytes_file_atomically(path: Path, content: bytes):
             os.unlink(temp_path)
 
 
+def encode_binary_content(content: bytes):
+    return base64.b64encode(content).decode('ascii')
+
+
+def decode_binary_content(content: str, label: str, invalid_status_code: int = 500):
+    try:
+        return base64.b64decode((content or '').encode('ascii'), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=invalid_status_code,
+            detail=f'Invalid binary content for "{label}"',
+        ) from exc
+
+
+def cache_text_file(project_id: int, relative_path: str, content: str):
+    with contextlib.suppress(OSError):
+        write_text_file_atomically(get_entry_disk_path(project_id, relative_path), content)
+
+
+def cache_binary_file(project_id: int, relative_path: str, content: bytes):
+    with contextlib.suppress(OSError):
+        write_bytes_file_atomically(get_entry_disk_path(project_id, relative_path), content)
+
+
+def delete_cache_path(path: Path):
+    with contextlib.suppress(OSError):
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+
+def cache_project_workspace(project_id: int, entries: list[models.File]):
+    with contextlib.suppress(OSError, HTTPException, shutil.Error):
+        sync_project_workspace(project_id, entries)
+
+
+def read_binary_entry_content(
+    db: Session,
+    project_id: int,
+    entry: models.File,
+    missing_status_code: int = 500,
+):
+    if entry.content:
+        return decode_binary_content(entry.content, entry.path)
+
+    disk_path = get_entry_disk_path(project_id, entry.path)
+    if disk_path.exists() and disk_path.is_file():
+        try:
+            raw_content = disk_path.read_bytes()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f'Failed to read legacy binary cache: "{entry.path}"',
+            ) from exc
+
+        entry.content = encode_binary_content(raw_content)
+        db.commit()
+        db.refresh(entry)
+        return raw_content
+
+    raise HTTPException(
+        status_code=missing_status_code,
+        detail=f'Binary file content is unavailable: "{entry.path}"',
+    )
+
+
+def read_entry_content_bytes(
+    db: Session,
+    project_id: int,
+    entry: models.File,
+    missing_status_code: int = 500,
+):
+    if entry.kind == FOLDER_ENTRY_KIND:
+        raise HTTPException(status_code=400, detail='Folders do not have file content')
+    if entry.is_binary:
+        return read_binary_entry_content(db, project_id, entry, missing_status_code)
+    return (entry.content or '').encode('utf-8')
+
+
+def build_content_disposition(filename: str, download: bool):
+    disposition_type = 'attachment' if download else 'inline'
+    safe_filename = (filename or 'download').replace('\\', '_').replace('"', '_')
+    ascii_filename = safe_filename.encode('ascii', errors='ignore').decode('ascii') or 'download'
+    encoded_filename = quote(safe_filename)
+    return f'{disposition_type}; filename="{ascii_filename}"; filename*=UTF-8\'\'{encoded_filename}'
+
+
+def build_bytes_response(
+    content: bytes,
+    filename: str,
+    media_type: str,
+    download: bool = False,
+):
+    return Response(
+        content=content,
+        media_type=media_type or 'application/octet-stream',
+        headers={'Content-Disposition': build_content_disposition(filename, download)},
+    )
+
+
+def upsert_project_artifact(
+    db: Session,
+    project_id: int,
+    relative_path: str,
+    media_type: str,
+    content: bytes,
+):
+    artifact = (
+        db.query(models.ProjectArtifact)
+        .filter(
+            models.ProjectArtifact.project_id == project_id,
+            models.ProjectArtifact.path == relative_path,
+        )
+        .first()
+    )
+    if artifact is None:
+        artifact = models.ProjectArtifact(
+            project_id=project_id,
+            path=relative_path,
+            media_type=media_type,
+            content=encode_binary_content(content),
+        )
+        db.add(artifact)
+    else:
+        artifact.media_type = media_type
+        artifact.content = encode_binary_content(content)
+
+    db.commit()
+    db.refresh(artifact)
+    return artifact
+
+
+def read_project_artifact_bytes(
+    db: Session,
+    project_id: int,
+    relative_path: str,
+    media_type: str = 'application/octet-stream',
+):
+    artifact = (
+        db.query(models.ProjectArtifact)
+        .filter(
+            models.ProjectArtifact.project_id == project_id,
+            models.ProjectArtifact.path == relative_path,
+        )
+        .first()
+    )
+    if artifact and artifact.content:
+        return artifact, decode_binary_content(artifact.content, relative_path)
+
+    disk_path = get_entry_disk_path(project_id, relative_path)
+    if disk_path.exists() and disk_path.is_file():
+        try:
+            raw_content = disk_path.read_bytes()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail='Failed to read legacy artifact cache') from exc
+        artifact = upsert_project_artifact(db, project_id, relative_path, media_type, raw_content)
+        return artifact, raw_content
+
+    raise HTTPException(status_code=404, detail='Artifact not found')
+
+
+def hydrate_legacy_binary_entries_from_disk(db: Session):
+    hydrated_count = 0
+    entries = (
+        db.query(models.File)
+        .filter(
+            models.File.kind == TEXT_ENTRY_KIND,
+            models.File.is_binary.is_(True),
+        )
+        .all()
+    )
+
+    for entry in entries:
+        if entry.content:
+            continue
+
+        disk_path = get_entry_disk_path(entry.project_id, entry.path)
+        if not disk_path.exists() or not disk_path.is_file():
+            continue
+
+        try:
+            entry.content = encode_binary_content(disk_path.read_bytes())
+        except OSError:
+            continue
+        hydrated_count += 1
+
+    if hydrated_count:
+        db.commit()
+        print(f'[api] hydrated {hydrated_count} legacy binary files into database storage')
+
+
 def summarize_content(value: str, limit: int = 80):
     return (value or '').replace('\n', ' ').replace('\r', ' ')[:limit]
 
 
-def build_realtime_internal_url(path: str):
-    return f"{REALTIME_INTERNAL_URL.rstrip('/')}{path}"
+def choose_realtime_endpoint_index(file_id: int):
+    endpoint_count = max(len(REALTIME_INTERNAL_URLS), 1)
+    return (max(file_id, 1) - 1) % endpoint_count
+
+
+def get_realtime_browser_url(file_id: int):
+    if not REALTIME_BROWSER_URLS:
+        return ''
+    return REALTIME_BROWSER_URLS[choose_realtime_endpoint_index(file_id)]
+
+
+def build_realtime_internal_url(path: str, file_id: int):
+    endpoint = REALTIME_INTERNAL_URLS[choose_realtime_endpoint_index(file_id)]
+    return f"{endpoint.rstrip('/')}{path}"
 
 
 def get_project_or_404(db: Session, project_id: int):
@@ -724,6 +940,7 @@ with Session(engine) as db:
     legacy_projects = db.query(models.Project).filter(models.Project.created_by_id.is_not(None)).all()
     for legacy_project in legacy_projects:
         ensure_project_membership(db, legacy_project)
+    hydrate_legacy_binary_entries_from_disk(db)
 
 
 def get_entry_or_404(db: Session, file_id: int):
@@ -859,6 +1076,12 @@ def sync_project_workspace(project_id: int, entries: list[models.File]):
 
         disk_path.parent.mkdir(parents=True, exist_ok=True)
         if entry.is_binary:
+            if entry.content:
+                try:
+                    raw_content = decode_binary_content(entry.content, entry.path)
+                except HTTPException:
+                    continue
+                write_bytes_file_atomically(disk_path, raw_content)
             continue
 
         write_text_file_atomically(disk_path, entry.content or '')
@@ -886,8 +1109,7 @@ def create_text_file_entry(
     db.commit()
     db.refresh(entry)
 
-    disk_path = get_entry_disk_path(project_id, relative_path)
-    write_text_file_atomically(disk_path, content)
+    cache_text_file(project_id, relative_path, content)
 
     return entry
 
@@ -902,13 +1124,16 @@ def ensure_disk_entry(project_id: int, entry: models.File):
         return disk_path
 
     disk_path.parent.mkdir(parents=True, exist_ok=True)
-    if not entry.is_binary:
+    if entry.is_binary:
+        if entry.content:
+            write_bytes_file_atomically(disk_path, decode_binary_content(entry.content, entry.path))
+    else:
         write_text_file_atomically(disk_path, entry.content or '')
 
     return disk_path
 
 
-def build_compiler_workspace_snapshot(project_id: int, entries: list[models.File]):
+def build_compiler_workspace_snapshot(db: Session, project_id: int, entries: list[models.File]):
     snapshot_entries: list[dict[str, str]] = []
 
     for entry in sorted(entries, key=lambda current: (current.path.count('/'), current.path)):
@@ -921,21 +1146,11 @@ def build_compiler_workspace_snapshot(project_id: int, entries: list[models.File
             })
             continue
 
-        if entry.is_binary:
-            disk_path = ensure_disk_entry(project_id, entry)
-            if not disk_path.exists():
-                raise HTTPException(
-                    status_code=500,
-                    detail=f'Binary file is missing on disk: "{entry.path}"',
-                )
-            raw_content = disk_path.read_bytes()
-        else:
-            raw_content = (entry.content or '').encode('utf-8')
-
+        raw_content = read_entry_content_bytes(db, project_id, entry)
         snapshot_entries.append({
             'path': relative_path,
             'kind': TEXT_ENTRY_KIND,
-            'content_base64': base64.b64encode(raw_content).decode('ascii'),
+            'content_base64': encode_binary_content(raw_content),
         })
 
     return snapshot_entries
@@ -946,7 +1161,7 @@ def update_snapshot_digest(digest, value: str):
     digest.update(b'\0')
 
 
-def build_project_snapshot_revision(project_id: int, entries: list[models.File]):
+def build_project_snapshot_revision(db: Session, project_id: int, entries: list[models.File]):
     digest = hashlib.sha1()
     for entry in sorted(entries, key=lambda current: (current.path.count('/'), current.path)):
         relative_path = str(PurePosixPath(entry.path))
@@ -957,23 +1172,13 @@ def build_project_snapshot_revision(project_id: int, entries: list[models.File])
         if entry.kind == FOLDER_ENTRY_KIND:
             continue
 
-        if entry.is_binary:
-            disk_path = ensure_disk_entry(project_id, entry)
-            if not disk_path.exists():
-                raise HTTPException(
-                    status_code=500,
-                    detail=f'Binary file is missing on disk: "{entry.path}"',
-                )
-            raw_content = disk_path.read_bytes()
-        else:
-            raw_content = (entry.content or '').encode('utf-8')
-
+        raw_content = read_entry_content_bytes(db, project_id, entry)
         digest.update(hashlib.sha1(raw_content).hexdigest().encode('ascii'))
         digest.update(b'\0')
     return digest.hexdigest()
 
 
-def compile_project_snapshot(project_id: int, entrypoint: str, entries: list[models.File]):
+def compile_project_snapshot(db: Session, project_id: int, entrypoint: str, entries: list[models.File]):
     try:
         response = requests.post(
             COMPILER_URL,
@@ -981,7 +1186,7 @@ def compile_project_snapshot(project_id: int, entrypoint: str, entries: list[mod
                 'protocol_version': 2,
                 'project_id': project_id,
                 'entrypoint': entrypoint,
-                'files': build_compiler_workspace_snapshot(project_id, entries),
+                'files': build_compiler_workspace_snapshot(db, project_id, entries),
             },
             timeout=COMPILER_TIMEOUT_SECONDS,
         )
@@ -997,13 +1202,14 @@ def compile_project_snapshot(project_id: int, entrypoint: str, entries: list[mod
         if not isinstance(pdf_base64, str) or not pdf_base64:
             raise HTTPException(status_code=502, detail='Compiler response did not include PDF content')
 
+        pdf_content = decode_binary_content(pdf_base64, 'compiler PDF', invalid_status_code=502)
+        raw_output_path = payload.get('output_path') or Path(entrypoint).with_suffix('.pdf').as_posix()
         try:
-            pdf_content = base64.b64decode(pdf_base64.encode('ascii'))
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail='Compiler returned invalid PDF content') from exc
-
-        pdf_path = get_project_dir(project_id) / Path(entrypoint).with_suffix('.pdf')
-        write_bytes_file_atomically(pdf_path, pdf_content)
+            pdf_relative_path = normalize_relative_path(str(raw_output_path))
+        except HTTPException as exc:
+            raise HTTPException(status_code=502, detail='Compiler returned an invalid PDF output path') from exc
+        upsert_project_artifact(db, project_id, pdf_relative_path, 'application/pdf', pdf_content)
+        cache_binary_file(project_id, pdf_relative_path, pdf_content)
 
     return {
         key: value
@@ -1015,11 +1221,13 @@ def compile_project_snapshot(project_id: int, entrypoint: str, entries: list[mod
 def flush_realtime_room(file_id: int):
     try:
         response = requests.post(
-            build_realtime_internal_url('/internal/realtime/flush-room'),
+            build_realtime_internal_url('/internal/realtime/flush-room', file_id),
             json={'file_id': file_id},
             headers={'X-Realtime-Secret': REALTIME_SECRET},
             timeout=5,
         )
+        if response.status_code == 409:
+            raise HTTPException(status_code=409, detail=response.text or 'Realtime room content is stale')
         response.raise_for_status()
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1073,7 +1281,7 @@ def serialize_realtime_session(
     return {
         'protocol_version': 1,
         'room_key': build_file_room_key(entry.project_id, entry.id),
-        'realtime_url': REALTIME_URL,
+        'realtime_url': get_realtime_browser_url(entry.id),
         'file': {
             'id': entry.id,
             'project_id': entry.project_id,
@@ -1081,6 +1289,7 @@ def serialize_realtime_session(
             'name': entry.name,
             'kind': entry.kind,
             'is_binary': entry.is_binary,
+            'content_revision': entry.content_revision or 0,
             'content': '' if entry.is_binary else (entry.content or ''),
             'realtime_state': '' if entry.is_binary else (entry.realtime_state or ''),
             'updated_at': entry.updated_at,
@@ -1406,15 +1615,8 @@ def copy_project(
         )
     db.commit()
 
-    source_dir = get_project_dir(project_id)
-    copied_dir = get_project_dir(copied_project.id)
-    copied_dir.mkdir(parents=True, exist_ok=True)
-
-    if source_dir.exists():
-        shutil.copytree(source_dir, copied_dir, dirs_exist_ok=True)
-    else:
-        copied_entries = db.query(models.File).filter(models.File.project_id == copied_project.id).all()
-        sync_project_workspace(copied_project.id, copied_entries)
+    copied_entries = db.query(models.File).filter(models.File.project_id == copied_project.id).all()
+    cache_project_workspace(copied_project.id, copied_entries)
 
     return serialize_project(copied_project)
 
@@ -1474,9 +1676,7 @@ def delete_project(
     db.delete(project)
     db.commit()
 
-    project_dir = get_project_dir(project_id)
-    if project_dir.exists():
-        shutil.rmtree(project_dir)
+    delete_cache_path(get_project_dir(project_id))
 
     return {'status': 'success', 'id': project_id}
 
@@ -1552,7 +1752,8 @@ def create_folder(
     db.commit()
     db.refresh(folder_entry)
 
-    get_entry_disk_path(project_id, relative_path).mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        get_entry_disk_path(project_id, relative_path).mkdir(parents=True, exist_ok=True)
 
     return serialize_entry(folder_entry)
 
@@ -1606,9 +1807,8 @@ def upload_files(
             text_content = ''
             is_binary = True
 
-        disk_path = get_entry_disk_path(project_id, relative_path)
-        disk_path.parent.mkdir(parents=True, exist_ok=True)
-        disk_path.write_bytes(binary_content)
+        stored_content = encode_binary_content(binary_content) if is_binary else text_content
+        cache_binary_file(project_id, relative_path, binary_content)
 
         entry = models.File(
             project_id=project_id,
@@ -1616,7 +1816,7 @@ def upload_files(
             path=relative_path,
             kind=TEXT_ENTRY_KIND,
             is_binary=is_binary,
-            content=text_content,
+            content=stored_content,
         )
         db.add(entry)
         db.flush()
@@ -1647,6 +1847,7 @@ def get_file_content(
         'path': entry.path,
         'kind': entry.kind,
         'is_binary': entry.is_binary,
+        'content_revision': entry.content_revision or 0,
         'content': '' if entry.is_binary else (entry.content or ''),
     }
 
@@ -1688,6 +1889,7 @@ def force_flush_file_realtime_state(
             'id': entry.id,
             'path': entry.path,
             'content': entry.content or '',
+            'content_revision': entry.content_revision or 0,
             'updated_at': entry.updated_at,
         },
     }
@@ -1707,16 +1909,20 @@ def update_file_content(
     if entry.is_binary:
         raise HTTPException(status_code=400, detail='Binary files cannot be edited inline')
 
+    current_revision = entry.content_revision or 0
+    if file_update.content_revision is not None and file_update.content_revision != current_revision:
+        raise HTTPException(status_code=409, detail='File content changed; reload before saving')
+
     print(
         f"[api] put-content file={entry.id} path={entry.path} len={len(file_update.content or '')} "
         f"preview={summarize_content(file_update.content)}"
     )
     entry.content = file_update.content
+    entry.content_revision = current_revision + 1
     entry.realtime_state = ''
     db.commit()
 
-    disk_path = get_entry_disk_path(entry.project_id, entry.path)
-    write_text_file_atomically(disk_path, entry.content)
+    cache_text_file(entry.project_id, entry.path, entry.content)
 
     return serialize_entry(entry)
 
@@ -1732,6 +1938,7 @@ def rename_file_entry(
     ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     next_path = normalize_relative_path(payload.path)
     old_path = entry.path
+    project_id = entry.project_id
 
     if next_path == old_path:
         return serialize_entry(entry)
@@ -1762,21 +1969,22 @@ def rename_file_entry(
             raise HTTPException(status_code=409, detail=f'Path already exists: "{mapped_path}"')
         remapped_paths[current_entry.id] = mapped_path
 
-    source_path = get_entry_disk_path(entry.project_id, old_path)
-    destination_path = get_entry_disk_path(entry.project_id, next_path)
-
-    if source_path.exists():
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source_path), str(destination_path))
+    source_path = get_entry_disk_path(project_id, old_path)
+    destination_path = get_entry_disk_path(project_id, next_path)
 
     for current_entry in affected_entries:
         current_entry.path = remapped_paths[current_entry.id]
         current_entry.name = PurePosixPath(current_entry.path).name
 
     db.commit()
-    sync_project_workspace(
-        entry.project_id,
-        db.query(models.File).filter(models.File.project_id == entry.project_id).all(),
+
+    with contextlib.suppress(OSError, shutil.Error):
+        if source_path.exists():
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_path), str(destination_path))
+    cache_project_workspace(
+        project_id,
+        db.query(models.File).filter(models.File.project_id == project_id).all(),
     )
     db.refresh(entry)
 
@@ -1802,16 +2010,11 @@ def delete_file_entry(
         db.delete(entry)
 
     db.commit()
-    sync_project_workspace(
+    cache_project_workspace(
         project_id,
         db.query(models.File).filter(models.File.project_id == project_id).all(),
     )
-
-    if disk_path.exists():
-        if disk_path.is_dir():
-            shutil.rmtree(disk_path)
-        else:
-            disk_path.unlink()
+    delete_cache_path(disk_path)
 
     return {'status': 'success', 'id': file_id}
 
@@ -1828,16 +2031,13 @@ def get_file_raw(
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have raw content')
 
-    disk_path = ensure_disk_entry(entry.project_id, entry)
-    if not disk_path.exists():
-        raise HTTPException(status_code=404, detail='File not found on disk')
-
+    raw_content = read_entry_content_bytes(db, entry.project_id, entry, missing_status_code=404)
     media_type, _ = mimetypes.guess_type(entry.path)
-    return FileResponse(
-        disk_path,
-        media_type=media_type or 'application/octet-stream',
-        filename=entry.name,
-        content_disposition_type='attachment' if download else 'inline',
+    return build_bytes_response(
+        raw_content,
+        entry.name,
+        media_type or 'application/octet-stream',
+        download=download,
     )
 
 
@@ -1849,7 +2049,7 @@ def get_preview_project_snapshot(
 ):
     get_project_or_404(db, payload.project_id)
     entries = db.query(models.File).filter(models.File.project_id == payload.project_id).all()
-    revision = build_project_snapshot_revision(payload.project_id, entries)
+    revision = build_project_snapshot_revision(db, payload.project_id, entries)
 
     if payload.known_revision and payload.known_revision == revision:
         return {
@@ -1859,7 +2059,7 @@ def get_preview_project_snapshot(
             'unchanged': True,
         }
 
-    snapshot_entries = build_compiler_workspace_snapshot(payload.project_id, entries)
+    snapshot_entries = build_compiler_workspace_snapshot(db, payload.project_id, entries)
     return {
         'protocol_version': 1,
         'project_id': payload.project_id,
@@ -1897,17 +2097,21 @@ def flush_realtime_file(
     if entry.is_binary:
         raise HTTPException(status_code=400, detail='Binary files cannot be flushed as text')
 
+    current_revision = entry.content_revision or 0
+    if payload.content_revision is not None and payload.content_revision != current_revision:
+        raise HTTPException(status_code=409, detail='File content changed outside this realtime room')
+
     print(
         f"[api] flush-content file={entry.id} path={entry.path} len={len(payload.content or '')} "
         f"preview={summarize_content(payload.content)}"
     )
     entry.content = payload.content
+    entry.content_revision = current_revision + 1
     entry.realtime_state = payload.state_base64 or ''
     db.commit()
     db.refresh(entry)
 
-    disk_path = get_entry_disk_path(entry.project_id, entry.path)
-    write_text_file_atomically(disk_path, entry.content)
+    cache_text_file(entry.project_id, entry.path, entry.content)
 
     return {
         'status': 'flushed',
@@ -1915,6 +2119,7 @@ def flush_realtime_file(
         'project_id': entry.project_id,
         'path': entry.path,
         'updated_by_id': payload.updated_by_id,
+        'content_revision': entry.content_revision or 0,
         'updated_at': entry.updated_at,
     }
 
@@ -1933,8 +2138,7 @@ def compile_project(
     entry = resolve_project_entrypoint(entries, payload.entrypoint)
     entrypoint = entry.path
 
-    sync_project_workspace(project_id, entries)
-    return compile_project_snapshot(project_id, entrypoint, entries)
+    return compile_project_snapshot(db, project_id, entrypoint, entries)
 
 
 @app.get('/fonts')
@@ -1953,10 +2157,13 @@ def get_pdf(
     ensure_project_access(db, project, current_user)
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     entry = resolve_project_entrypoint(entries, entrypoint)
-    pdf_path = get_project_dir(project_id) / Path(entry.path).with_suffix('.pdf')
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail='PDF not found')
-    return FileResponse(pdf_path, media_type='application/pdf')
+    pdf_relative_path = Path(entry.path).with_suffix('.pdf').as_posix()
+    artifact, raw_content = read_project_artifact_bytes(db, project_id, pdf_relative_path, 'application/pdf')
+    return build_bytes_response(
+        raw_content,
+        Path(artifact.path).name,
+        artifact.media_type or 'application/pdf',
+    )
 
 
 @app.get('/projects/{project_id}/pdf/download')
@@ -1972,19 +2179,16 @@ def download_pdf(
     entry = resolve_project_entrypoint(entries, entrypoint)
     normalized_entrypoint = entry.path
 
-    sync_project_workspace(project_id, entries)
-    payload = compile_project_snapshot(project_id, normalized_entrypoint, entries)
+    payload = compile_project_snapshot(db, project_id, normalized_entrypoint, entries)
 
     if payload.get('status') != 'success':
         raise HTTPException(status_code=400, detail=payload.get('message') or 'Failed to export PDF')
 
-    pdf_relative_path = Path(normalized_entrypoint).with_suffix('.pdf')
-    pdf_path = get_project_dir(project_id) / pdf_relative_path
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail='PDF not found')
-    return FileResponse(
-        pdf_path,
-        media_type='application/pdf',
-        filename=pdf_relative_path.name,
-        content_disposition_type='attachment',
+    pdf_relative_path = Path(normalized_entrypoint).with_suffix('.pdf').as_posix()
+    artifact, raw_content = read_project_artifact_bytes(db, project_id, pdf_relative_path, 'application/pdf')
+    return build_bytes_response(
+        raw_content,
+        Path(artifact.path).name,
+        artifact.media_type or 'application/pdf',
+        download=True,
     )

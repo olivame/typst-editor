@@ -68,6 +68,10 @@ function DiagnosticsRailGlyph() {
   )
 }
 
+function resolveRealtimeUrl(session) {
+  return session?.realtime_url || REALTIME_URL
+}
+
 const RAIL_ITEMS = [
   { id: 'files', label: '≡', title: 'Files' },
   { id: 'search', label: '⌕', title: 'Search' },
@@ -1092,7 +1096,7 @@ export default function Editor({
         getFileRealtimeSession(entry.id),
       ])
       setCurrentFile(data)
-      setRealtimeSession({ ...session, realtime_url: REALTIME_URL })
+      setRealtimeSession({ ...session, realtime_url: resolveRealtimeUrl(session) })
       setRealtimeConnectionStatus('connecting')
       setContent(data.content)
     } catch (error) {
@@ -1187,7 +1191,7 @@ export default function Editor({
         if (isCancelled) return
 
         setCurrentFile(data)
-        setRealtimeSession({ ...session, realtime_url: REALTIME_URL })
+        setRealtimeSession({ ...session, realtime_url: resolveRealtimeUrl(session) })
         setRealtimeConnectionStatus('connecting')
         setContent(data.content)
       } catch (error) {
@@ -1289,14 +1293,13 @@ export default function Editor({
   }, [activePreviewPath, files, projectId])
 
   async function persistCurrentFileContent(nextContent) {
-    if (!currentFile) return
+    if (!currentFile) return null
 
     if (realtimeSession && realtimeConnectionStatus === 'connected') {
-      await flushRealtimeFile(currentFile.id)
-      return
+      return flushRealtimeFile(currentFile.id)
     }
 
-    await updateFileContent(currentFile.id, nextContent)
+    return updateFileContent(currentFile.id, nextContent, currentFile.content_revision ?? null)
   }
 
   async function saveAndPreview() {
@@ -1304,9 +1307,14 @@ export default function Editor({
     try {
       const nextContent = getCurrentEditorContent()
       showStatus('Saving...')
-      await persistCurrentFileContent(nextContent)
+      const persisted = await persistCurrentFileContent(nextContent)
+      const nextRevision = persisted?.file?.content_revision ?? persisted?.content_revision
       setContent(nextContent)
-      setCurrentFile((current) => (current ? { ...current, content: nextContent } : current))
+      setCurrentFile((current) => (current ? {
+        ...current,
+        content: nextContent,
+        content_revision: nextRevision ?? current.content_revision,
+      } : current))
       showStatus('Saved', 3000)
     } catch (error) {
       if (handleAccessFailure(error, '保存失败，请重新登录后重试。')) return
