@@ -11,13 +11,36 @@ services:
       - preview
       - realtime
     ports:
-      - "3000:3000"
+      - "${WEB_PUBLISH_PORT:-3000}:3000"
     environment:
       - VITE_API_URL=${VITE_API_URL:-}
+      - VITE_API_SCHEME=${VITE_API_SCHEME:-}
+      - VITE_API_HOST=${VITE_API_HOST:-}
+      - VITE_API_PORT=${VITE_API_PORT:-8000}
       - VITE_PREVIEW_URL=${VITE_PREVIEW_URL:-}
+      - VITE_PREVIEW_SCHEME=${VITE_PREVIEW_SCHEME:-}
+      - VITE_PREVIEW_HOST=${VITE_PREVIEW_HOST:-}
+      - VITE_PREVIEW_PORT=${VITE_PREVIEW_PORT:-8002}
       - VITE_REALTIME_URL=${VITE_REALTIME_URL:-}
+      - VITE_REALTIME_SCHEME=${VITE_REALTIME_SCHEME:-}
+      - VITE_REALTIME_HOST=${VITE_REALTIME_HOST:-}
+      - VITE_REALTIME_PORT=${VITE_REALTIME_PORT:-8003}
+      - API_PROXY_TARGET=${API_PROXY_TARGET:-}
+      - API_PROXY_SCHEME=${API_PROXY_SCHEME:-http}
+      - API_PROXY_HOST=${API_PROXY_HOST:-api}
+      - API_PROXY_PORT=${API_PROXY_PORT:-8000}
+      - PREVIEW_PROXY_TARGET=${PREVIEW_PROXY_TARGET:-}
+      - PREVIEW_PROXY_SCHEME=${PREVIEW_PROXY_SCHEME:-http}
+      - PREVIEW_PROXY_HOST=${PREVIEW_PROXY_HOST:-preview}
+      - PREVIEW_PROXY_PORT=${PREVIEW_PROXY_PORT:-8002}
+      - REALTIME_PROXY_TARGET=${REALTIME_PROXY_TARGET:-}
+      - REALTIME_PROXY_SCHEME=${REALTIME_PROXY_SCHEME:-ws}
+      - REALTIME_PROXY_HOST=${REALTIME_PROXY_HOST:-realtime}
+      - REALTIME_PROXY_PORT=${REALTIME_PROXY_PORT:-8003}
     networks:
-      - app-net
+      app-net:
+      service-ip-net:
+        ipv4_address: ${WEB_NETWORK_IP:-172.30.0.20}
 
   api:
     build:
@@ -33,24 +56,36 @@ services:
       compiler:
         condition: service_started
     environment:
-      - DB_HOST=db
-      - DB_PORT=5432
+      - DB_HOST=${DB_HOST:-db}
+      - DB_PORT=${DB_PORT:-5432}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
-      - COMPILER_URL=${COMPILER_URL:-http://compiler:8001}
+      - COMPILER_URL=${COMPILER_URL:-}
+      - COMPILER_SCHEME=${COMPILER_SCHEME:-http}
+      - COMPILER_HOST=${COMPILER_HOST:-compiler}
+      - COMPILER_PORT=${COMPILER_PORT:-8001}
       - COMPILER_TIMEOUT_SECONDS=${COMPILER_TIMEOUT_SECONDS:-10}
-      - REALTIME_URL=${REALTIME_URL:-http://realtime:8003}
+      - REALTIME_URL=${REALTIME_URL:-}
+      - REALTIME_SCHEME=${REALTIME_SCHEME:-ws}
+      - REALTIME_HOST=${REALTIME_HOST:-realtime}
+      - REALTIME_PORT=${REALTIME_PORT:-8003}
+      - REALTIME_INTERNAL_URL=${REALTIME_INTERNAL_URL:-}
+      - REALTIME_INTERNAL_SCHEME=${REALTIME_INTERNAL_SCHEME:-http}
+      - REALTIME_INTERNAL_HOST=${REALTIME_INTERNAL_HOST:-realtime}
+      - REALTIME_INTERNAL_PORT=${REALTIME_INTERNAL_PORT:-8003}
       - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
       - PREVIEW_SECRET=${PREVIEW_SECRET:-change-this-preview-secret}
       - WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/projects}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
     ports:
-      - "8000:8000"
+      - "${API_PUBLISH_PORT:-8000}:8000"
     volumes:
       - ./storage/projects:/workspace/projects
     networks:
-      - app-net
+      app-net:
+      service-ip-net:
+        ipv4_address: ${API_NETWORK_IP:-172.30.0.10}
 
   db:
     image: ${POSTGRES_IMAGE:-postgres:16}
@@ -66,9 +101,11 @@ services:
     volumes:
       - db-data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${DB_PUBLISH_PORT:-5432}:5432"
     networks:
-      - app-net
+      app-net:
+      service-ip-net:
+        ipv4_address: ${DB_NETWORK_IP:-172.30.0.15}
 
   compiler:
     build:
@@ -79,8 +116,12 @@ services:
         - APT_MIRROR=${APT_MIRROR:-}
         - TYPST_DOWNLOAD_URL=${TYPST_DOWNLOAD_URL:-https://github.com/typst/typst/releases/download/v0.14.2/typst-x86_64-unknown-linux-musl.tar.xz}
         - TYPST_VERSION=${TYPST_VERSION:-0.14.2}
+    ports:
+      - "${COMPILER_PUBLISH_PORT:-8001}:8001"
     networks:
-      - app-net
+      app-net:
+      service-ip-net:
+        ipv4_address: ${COMPILER_NETWORK_IP:-172.30.0.11}
 
   preview:
     build:
@@ -99,12 +140,19 @@ services:
     environment:
       - PREVIEW_WORKSPACE_DIR=${PREVIEW_WORKSPACE_DIR:-/tmp/typst-preview-workspaces}
       - SESSION_IDLE_SECONDS=${SESSION_IDLE_SECONDS:-1800}
-      - API_INTERNAL_URL=${API_INTERNAL_URL:-http://api:8000}
+      - API_INTERNAL_URL=${API_INTERNAL_URL:-}
+      - API_INTERNAL_SCHEME=${API_INTERNAL_SCHEME:-http}
+      - API_INTERNAL_HOST=${API_INTERNAL_HOST:-api}
+      - API_INTERNAL_PORT=${API_INTERNAL_PORT:-8000}
+      - API_HOST=${API_HOST:-api}
+      - API_PORT=${API_PORT:-8000}
       - PREVIEW_SECRET=${PREVIEW_SECRET:-change-this-preview-secret}
     ports:
-      - "8002:8002"
+      - "${PREVIEW_PUBLISH_PORT:-8002}:8002"
     networks:
-      - app-net
+      app-net:
+      service-ip-net:
+        ipv4_address: ${PREVIEW_NETWORK_IP:-172.30.0.12}
 
   realtime:
     build:
@@ -118,14 +166,25 @@ services:
     environment:
       - REALTIME_PORT=${REALTIME_PORT:-8003}
       - REALTIME_SECRET=${REALTIME_SECRET:-change-this-realtime-secret}
-      - API_INTERNAL_URL=http://api:8000
+      - API_INTERNAL_URL=${API_INTERNAL_URL:-}
+      - API_INTERNAL_SCHEME=${API_INTERNAL_SCHEME:-http}
+      - API_INTERNAL_HOST=${API_INTERNAL_HOST:-api}
+      - API_INTERNAL_PORT=${API_INTERNAL_PORT:-8000}
+      - API_HOST=${API_HOST:-api}
+      - API_PORT=${API_PORT:-8000}
     ports:
-      - "8003:8003"
+      - "${REALTIME_PUBLISH_PORT:-8003}:8003"
     networks:
-      - app-net
+      app-net:
+      service-ip-net:
+        ipv4_address: ${REALTIME_NETWORK_IP:-172.30.0.13}
 
 networks:
   app-net:
+  service-ip-net:
+    ipam:
+      config:
+        - subnet: ${SERVICE_IP_SUBNET:-172.30.0.0/24}
 
 volumes:
   db-data:

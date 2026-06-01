@@ -11,8 +11,25 @@ function isLocalHostname(hostname) {
     || hostname === '[::1]'
 }
 
-export function getRealtimeBaseUrl() {
+function getDefaultRealtimeScheme() {
+  if (typeof window !== 'undefined' && window.location.protocol === 'https:') return 'wss'
+  return 'ws'
+}
+
+function buildEnvUrl() {
   const envUrl = normalizeBaseUrl(import.meta.env.VITE_REALTIME_URL)
+  if (envUrl) return envUrl
+
+  const envHost = `${import.meta.env.VITE_REALTIME_HOST || ''}`.trim()
+  if (!envHost) return ''
+
+  const scheme = `${import.meta.env.VITE_REALTIME_SCHEME || getDefaultRealtimeScheme()}`.replace(/:+$/, '') || getDefaultRealtimeScheme()
+  const port = `${import.meta.env.VITE_REALTIME_PORT || DEFAULT_REALTIME_PORT}`.trim()
+  return `${scheme}://${envHost}${port ? `:${port}` : ''}`
+}
+
+export function getRealtimeBaseUrl() {
+  const envUrl = buildEnvUrl()
   if (envUrl) return envUrl
 
   if (typeof window !== 'undefined') {

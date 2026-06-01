@@ -26,6 +26,7 @@ from settings import (
     COMPILER_URL,
     CORS_ALLOW_ORIGINS,
     PREVIEW_SECRET,
+    REALTIME_INTERNAL_URL,
     REALTIME_SECRET,
     REALTIME_URL,
     WORKSPACE_DIR,
@@ -612,7 +613,7 @@ def summarize_content(value: str, limit: int = 80):
 
 
 def build_realtime_internal_url(path: str):
-    return f"{REALTIME_URL.rstrip('/')}{path}"
+    return f"{REALTIME_INTERNAL_URL.rstrip('/')}{path}"
 
 
 def get_project_or_404(db: Session, project_id: int):

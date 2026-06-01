@@ -39,9 +39,11 @@ cp .env.example .env
 ### 基础服务
 
 - `apps/web`: React/Vite 前端
-- `apps/api`: FastAPI 接口层
-- `services/compiler`: Typst 编译服务
-- `storage/projects`: 项目工作目录和生成文件
+- `apps/api`: FastAPI 接口层和项目存储边界
+- `services/compiler`: Typst 编译服务，通过 API 传入的项目快照工作
+- `services/preview`: Tinymist 预览服务，通过 API 内部快照工作
+- `services/realtime`: Yjs 协同编辑服务，通过 API 内部接口 resolve/flush
+- `storage/projects`: API 当前使用的项目工作目录和生成文件
 
 ### 前端模块
 
@@ -59,16 +61,45 @@ cp .env.example .env
 
 ## 为分布式部署预留的配置
 
-`.env.example` 里已经提供了这些入口：
+`.env.example` 里已经提供了这些入口。所有 `*_URL` 优先级最高；不填 URL 时会按 `*_SCHEME` + `*_HOST` + `*_PORT` 组装。
 
-- `TYPST_VERSION`: compiler 容器使用的 Typst 版本
-- `VITE_API_URL`: 前端显式 API 地址
-- `CORS_ALLOW_ORIGINS`: API 允许的来源
-- `COMPILER_URL`: API 调用编译服务的地址
-- `COMPILER_TIMEOUT_SECONDS`: 编译超时
-- `WORKSPACE_DIR`: API 的工作目录
+- 浏览器直连地址：`VITE_API_*`、`VITE_PREVIEW_*`、`VITE_REALTIME_*`。不设置时，非 localhost 访问会走 `/api`、`/preview`、`/realtime` 代理。
+- Web dev proxy 目标：`API_PROXY_*`、`PREVIEW_PROXY_*`、`REALTIME_PROXY_*`。
+- API 调 realtime 内部接口：`REALTIME_INTERNAL_URL` 或 `REALTIME_INTERNAL_SCHEME` / `REALTIME_INTERNAL_HOST` / `REALTIME_INTERNAL_PORT`。
+- Preview/Realtime 调 API 内部接口：`API_INTERNAL_URL` 或 `API_INTERNAL_SCHEME` / `API_INTERNAL_HOST` / `API_INTERNAL_PORT`。
+- Compose 宿主机发布端口：`WEB_PUBLISH_PORT`、`API_PUBLISH_PORT`、`PREVIEW_PUBLISH_PORT`、`REALTIME_PUBLISH_PORT`、`COMPILER_PUBLISH_PORT`。
 
-本地不填 `VITE_API_URL` 也能工作，前端会自动按当前访问主机推导 API 地址。
+单机不填 `VITE_*_HOST` 也能工作，前端会自动按当前访问主机推导地址。多机部署时直接写各服务机器的 IP，例如：
+
+```env
+VITE_API_HOST=10.0.0.10
+VITE_PREVIEW_HOST=10.0.0.12
+VITE_REALTIME_HOST=10.0.0.13
+COMPILER_HOST=10.0.0.11
+REALTIME_INTERNAL_HOST=10.0.0.13
+API_INTERNAL_HOST=10.0.0.10
+```
+
+如果走 HTTPS/WSS 或网关路径，直接设置完整 `VITE_API_URL`、`VITE_PREVIEW_URL`、`VITE_REALTIME_URL` 即可。`*_PORT` 表示服务访问端口；如果只是改 Docker 暴露到宿主机的端口，用 `*_PUBLISH_PORT`。
+
+### 单机模拟多机
+
+当前 compose 会额外挂载 `service-ip-net`，给服务分配固定容器 IP：
+
+- API: `172.30.0.10:8000`
+- Compiler: `172.30.0.11:8001`
+- Preview: `172.30.0.12:8002`
+- Realtime: `172.30.0.13:8003`
+
+在一台机器上模拟多机时，可以让服务间地址指向这些固定 IP，例如：
+
+```env
+COMPILER_HOST=172.30.0.11
+REALTIME_INTERNAL_HOST=172.30.0.13
+API_INTERNAL_HOST=172.30.0.10
+```
+
+浏览器如果只开放 Web 端口，可以不设置 `VITE_*_HOST`，让前端走 `/api`、`/preview`、`/realtime`，再把 `API_PROXY_HOST=172.30.0.10`、`PREVIEW_PROXY_HOST=172.30.0.12`、`REALTIME_PROXY_HOST=172.30.0.13`。不要用本机公网 IP 模拟容器间互调，云主机通常没有把公网 IP 绑定到网卡，容器回打公网 IP 可能超时。
 
 ## 复现标准
 

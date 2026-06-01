@@ -14,8 +14,20 @@ const MESSAGE_QUERY_AWARENESS = 3
 const FLUSH_DEBOUNCE_MS = 900
 const ROOM_IDLE_TTL_MS = 60_000
 
+function buildServiceUrl(prefix, defaultHost, defaultPort, defaultScheme = 'http') {
+  const explicitUrl = `${process.env[`${prefix}_URL`] || ''}`.trim()
+  if (explicitUrl) return explicitUrl.replace(/\/+$/, '')
+
+  const scheme = `${process.env[`${prefix}_SCHEME`] || defaultScheme}`.trim() || defaultScheme
+  const host = `${process.env[`${prefix}_HOST`] || defaultHost}`.trim() || defaultHost
+  const port = `${process.env[`${prefix}_PORT`] || defaultPort}`.trim()
+  return `${scheme}://${host}${port ? `:${port}` : ''}`.replace(/\/+$/, '')
+}
+
 const realtimePort = Number.parseInt(process.env.REALTIME_PORT || '8003', 10)
-const apiInternalUrl = `${process.env.API_INTERNAL_URL || 'http://api:8000'}`.replace(/\/+$/, '')
+const apiHost = process.env.API_HOST || 'api'
+const apiPort = process.env.API_PORT || '8000'
+const apiInternalUrl = buildServiceUrl('API_INTERNAL', apiHost, apiPort)
 const realtimeSecret = process.env.REALTIME_SECRET || 'change-this-realtime-secret'
 
 const rooms = new Map()

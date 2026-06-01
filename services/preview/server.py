@@ -19,6 +19,18 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 
+def build_service_url(prefix: str, default_host: str, default_port: str, default_scheme: str = "http") -> str:
+    explicit_url = os.getenv(f"{prefix}_URL", "").strip()
+    if explicit_url:
+        return explicit_url.rstrip("/")
+
+    scheme = os.getenv(f"{prefix}_SCHEME", default_scheme).strip() or default_scheme
+    host = os.getenv(f"{prefix}_HOST", default_host).strip() or default_host
+    port = os.getenv(f"{prefix}_PORT", default_port).strip()
+    port_suffix = f":{port}" if port else ""
+    return f"{scheme}://{host}{port_suffix}".rstrip("/")
+
+
 PREVIEW_WORKSPACE_DIR = Path(os.getenv("PREVIEW_WORKSPACE_DIR", "/tmp/typst-preview-workspaces"))
 TINYMIST_BIN = os.getenv("TINYMIST_BIN", "tinymist")
 SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "1800"))
@@ -26,7 +38,9 @@ SESSION_SWEEP_SECONDS = int(os.getenv("SESSION_SWEEP_SECONDS", "60"))
 PROXY_TIMEOUT_SECONDS = float(os.getenv("PROXY_TIMEOUT_SECONDS", "30"))
 SNAPSHOT_TIMEOUT_SECONDS = float(os.getenv("SNAPSHOT_TIMEOUT_SECONDS", "10"))
 SNAPSHOT_REFRESH_SECONDS = float(os.getenv("SNAPSHOT_REFRESH_SECONDS", "2"))
-API_INTERNAL_URL = os.getenv("API_INTERNAL_URL", "http://api:8000").rstrip("/")
+API_HOST = os.getenv("API_HOST", "api")
+API_PORT = os.getenv("API_PORT", "8000")
+API_INTERNAL_URL = build_service_url("API_INTERNAL", API_HOST, API_PORT)
 PREVIEW_SECRET = os.getenv("PREVIEW_SECRET", "change-this-preview-secret")
 
 HTML_WS_SNIPPET = 'let urlObject = new URL("/", window.location.href);'

@@ -37,6 +37,15 @@
 8. compiler 在临时目录生成 PDF 并回传给 API
 9. API 将 PDF 写回工作目录并分发下载
 
+## 多机访问配置
+
+- 所有服务间调用都支持完整 `*_URL`，也支持 `*_SCHEME` / `*_HOST` / `*_PORT` 组装。
+- 单机 Docker Compose 默认继续使用服务名，例如 `api`、`compiler`、`preview`、`realtime`。
+- 多机部署时把 host 改成目标机器 IP；后续免密访问只影响机器运维层，不要求服务共享本地路径。
+- Compiler、Preview、Realtime 都已暴露端口；API 当前仍需要访问自己的 `storage/projects`。
+
+- 单机模拟多机时可使用 `service-ip-net` 的固定容器 IP，不依赖 Docker 服务名，也避免宿主公网 IP 回环。
+
 ## 后续分布式演进建议
 
 ### 第一阶段
