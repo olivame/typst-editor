@@ -200,12 +200,16 @@ def materialize_snapshot(project_dir: Path, files: list[dict[str, object]]) -> N
         disk_path.write_bytes(decoded_content)
 
 
-async def fetch_project_snapshot(project_id: int) -> dict[str, object]:
+async def fetch_project_snapshot(project_id: int, known_revision: str = "") -> dict[str, object]:
+    request_payload: dict[str, object] = {"project_id": project_id}
+    if known_revision:
+        request_payload["known_revision"] = known_revision
+
     try:
         async with httpx.AsyncClient(timeout=SNAPSHOT_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 f"{API_INTERNAL_URL}/internal/preview/project-snapshot",
-                json={"project_id": project_id},
+                json=request_payload,
                 headers={"X-Preview-Secret": PREVIEW_SECRET},
             )
             response.raise_for_status()
@@ -216,11 +220,17 @@ async def fetch_project_snapshot(project_id: int) -> dict[str, object]:
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+    if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="API returned an invalid preview snapshot")
 
     if not payload.get("revision"):
         raise HTTPException(status_code=502, detail="API returned a preview snapshot without a revision")
+
+    if payload.get("unchanged") is True:
+        return payload
+
+    if not isinstance(payload.get("files"), list):
+        raise HTTPException(status_code=502, detail="API returned a preview snapshot without files")
 
     return payload
 
@@ -1266,13 +1276,20 @@ class PreviewSession:
             return
 
         if snapshot is None:
-            snapshot = await fetch_project_snapshot(self.project_id)
+            known_revision = self.workspace_revision if self.is_healthy() else ""
+            snapshot = await fetch_project_snapshot(self.project_id, known_revision)
         self.last_snapshot_check = now
+
+        current_revision = str(snapshot.get("revision") or "")
+        if snapshot.get("unchanged") is True:
+            if self.is_healthy() and self.workspace_revision == current_revision:
+                return
+            snapshot = await fetch_project_snapshot(self.project_id)
+            current_revision = str(snapshot.get("revision") or "")
 
         files = snapshot.get("files")
         if not isinstance(files, list):
             raise HTTPException(status_code=502, detail="Preview snapshot contains no files")
-        current_revision = str(snapshot.get("revision") or "")
 
         async with self.lock:
             if self.is_healthy() and self.workspace_revision == current_revision:

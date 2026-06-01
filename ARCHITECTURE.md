@@ -18,7 +18,7 @@
 
 ### `preview`
 - 负责 Tinymist preview 会话、预览代理、光标同步和 outline/diagnostics。
-- 当前通过内部密钥向 API 拉项目快照，在本地临时目录启动 tinymist。
+- 当前通过内部密钥向 API 按 revision 条件拉项目快照，在本地临时目录启动 tinymist。
 - 这一层已经不依赖共享工作目录，可以和 API 分开部署。
 
 ### `realtime`
@@ -47,7 +47,7 @@
 ### 第二阶段
 - 把 API 侧 `storage/projects` 从本地目录换成对象存储或共享存储适配层
 - API 保持元数据和快照出口，二进制文件从存储层读取
-- 为 Preview 快照增加轻量 revision 查询，避免大项目频繁传完整快照
+- 继续把 API 侧快照读取接入存储适配层，减少对本地 `storage/projects` 的直接依赖
 
 ### 第三阶段
 - API 异步化编译请求

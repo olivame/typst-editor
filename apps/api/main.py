@@ -182,6 +182,7 @@ class ProjectCompileRequest(BaseModel):
 
 class PreviewSnapshotRequest(BaseModel):
     project_id: int
+    known_revision: str = ''
 
 
 class RealtimeRoomResolveRequest(BaseModel):
@@ -939,12 +940,35 @@ def build_compiler_workspace_snapshot(project_id: int, entries: list[models.File
     return snapshot_entries
 
 
-def build_snapshot_revision(snapshot_entries: list[dict[str, str]]):
+def update_snapshot_digest(digest, value: str):
+    digest.update(str(value).encode('utf-8', errors='ignore'))
+    digest.update(b'\0')
+
+
+def build_project_snapshot_revision(project_id: int, entries: list[models.File]):
     digest = hashlib.sha1()
-    for entry in sorted(snapshot_entries, key=lambda current: current.get('path', '')):
-        for key in ('path', 'kind', 'content_base64'):
-            digest.update(str(entry.get(key, '')).encode('utf-8', errors='ignore'))
-            digest.update(b'\0')
+    for entry in sorted(entries, key=lambda current: (current.path.count('/'), current.path)):
+        relative_path = str(PurePosixPath(entry.path))
+        update_snapshot_digest(digest, relative_path)
+        update_snapshot_digest(digest, entry.kind)
+        update_snapshot_digest(digest, 'binary' if entry.is_binary else 'text')
+
+        if entry.kind == FOLDER_ENTRY_KIND:
+            continue
+
+        if entry.is_binary:
+            disk_path = ensure_disk_entry(project_id, entry)
+            if not disk_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail=f'Binary file is missing on disk: "{entry.path}"',
+                )
+            raw_content = disk_path.read_bytes()
+        else:
+            raw_content = (entry.content or '').encode('utf-8')
+
+        digest.update(hashlib.sha1(raw_content).hexdigest().encode('ascii'))
+        digest.update(b'\0')
     return digest.hexdigest()
 
 
@@ -1824,11 +1848,22 @@ def get_preview_project_snapshot(
 ):
     get_project_or_404(db, payload.project_id)
     entries = db.query(models.File).filter(models.File.project_id == payload.project_id).all()
+    revision = build_project_snapshot_revision(payload.project_id, entries)
+
+    if payload.known_revision and payload.known_revision == revision:
+        return {
+            'protocol_version': 1,
+            'project_id': payload.project_id,
+            'revision': revision,
+            'unchanged': True,
+        }
+
     snapshot_entries = build_compiler_workspace_snapshot(payload.project_id, entries)
     return {
         'protocol_version': 1,
         'project_id': payload.project_id,
-        'revision': build_snapshot_revision(snapshot_entries),
+        'revision': revision,
+        'unchanged': False,
         'files': snapshot_entries,
     }
 
