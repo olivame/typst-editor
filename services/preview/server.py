@@ -3,6 +3,7 @@ import base64
 import binascii
 import contextlib
 import hashlib
+from collections import deque
 import json
 import os
 import re
@@ -38,6 +39,7 @@ SESSION_SWEEP_SECONDS = int(os.getenv("SESSION_SWEEP_SECONDS", "60"))
 PROXY_TIMEOUT_SECONDS = float(os.getenv("PROXY_TIMEOUT_SECONDS", "30"))
 SNAPSHOT_TIMEOUT_SECONDS = float(os.getenv("SNAPSHOT_TIMEOUT_SECONDS", "10"))
 SNAPSHOT_REFRESH_SECONDS = float(os.getenv("SNAPSHOT_REFRESH_SECONDS", "2"))
+CURSOR_EVENT_TTL_SECONDS = float(os.getenv("CURSOR_EVENT_TTL_SECONDS", "10"))
 API_HOST = os.getenv("API_HOST", "api")
 API_PORT = os.getenv("API_PORT", "8000")
 API_INTERNAL_URL = build_service_url("API_INTERNAL", API_HOST, API_PORT)
@@ -249,8 +251,8 @@ async def fetch_project_snapshot(project_id: int, known_revision: str = "") -> d
     return payload
 
 
-def make_session_key(project_id: int, entrypoint: str, client_id: str) -> str:
-    return f"{project_id}:{entrypoint}:{client_id}"
+def make_session_key(project_id: int, entrypoint: str) -> str:
+    return f"{project_id}:{entrypoint}"
 
 
 def is_template_typ_path(path: str) -> bool:
@@ -1132,11 +1134,10 @@ class CursorRequest(BaseModel):
 
 
 class PreviewSession:
-    def __init__(self, project_id: int, entrypoint: str, client_id: str):
+    def __init__(self, project_id: int, entrypoint: str):
         self.project_id = project_id
         self.entrypoint = entrypoint
-        self.client_id = client_id
-        session_hash = hashlib.sha1(make_session_key(project_id, entrypoint, client_id).encode("utf-8")).hexdigest()
+        session_hash = hashlib.sha1(make_session_key(project_id, entrypoint).encode("utf-8")).hexdigest()
         self.project_dir = PREVIEW_WORKSPACE_DIR / f"{project_id}-{session_hash}"
         self.data_port = reserve_port()
         self.control_port = reserve_port()
@@ -1149,12 +1150,29 @@ class PreviewSession:
         self.last_diagnostics: list[dict[str, object]] = []
         self.outline: list[dict[str, object]] = []
         self.last_access = time.monotonic()
-        self.listeners: set[asyncio.Queue[str]] = set()
+        self.listeners: dict[str, set[asyncio.Queue[str]]] = {}
         self._pending_diagnostics: list[dict[str, object]] = []
         self._current_diagnostic_lines: list[str] = []
         self.workspace_revision = ""
         self.last_snapshot_check = 0.0
         self.instance_id = 0
+        self.pending_cursor_clients: deque[tuple[str, float]] = deque()
+
+    def _log_prefix(self) -> str:
+        return f"[preview:{self.project_id}:{self.entrypoint}]"
+
+    def _prune_pending_cursor_clients(self) -> None:
+        cutoff = time.monotonic() - CURSOR_EVENT_TTL_SECONDS
+        while self.pending_cursor_clients and self.pending_cursor_clients[0][1] < cutoff:
+            self.pending_cursor_clients.popleft()
+
+    def _pop_next_cursor_client_id(self) -> str | None:
+        self._prune_pending_cursor_clients()
+        while self.pending_cursor_clients:
+            client_id, _ = self.pending_cursor_clients.popleft()
+            if client_id:
+                return client_id
+        return None
 
     def _compose_status(self, base_status: dict[str, object] | None = None) -> dict[str, object]:
         status = dict(base_status or self.last_status)
@@ -1343,7 +1361,7 @@ class PreviewSession:
             ])
 
             print(
-                f"[preview:{self.project_id}:{self.entrypoint}:{self.client_id}] "
+                f"{self._log_prefix()} "
                 f"efficient_preview={'on' if efficient_preview else 'off'} "
                 f"reasons={','.join(efficient_preview_reasons) or 'none'}"
             )
@@ -1381,7 +1399,7 @@ class PreviewSession:
                 return
             decoded_line = line.decode("utf-8", errors="replace").rstrip()
             self._consume_stdout_line(decoded_line)
-            print(f"[preview:{self.project_id}:{self.entrypoint}:{self.client_id}] {decoded_line}")
+            print(f"{self._log_prefix()} {decoded_line}")
 
     async def _consume_control_socket(self) -> None:
         if not self.control_socket:
@@ -1402,7 +1420,7 @@ class PreviewSession:
                 elif event == "outline":
                     self.outline = message.get("items", [])
                 elif event == "editorScrollTo":
-                    self.broadcast(message)
+                    self.broadcast(message, client_id=self._pop_next_cursor_client_id())
         except Exception:
             return
 
@@ -1414,24 +1432,37 @@ class PreviewSession:
             and getattr(self.control_socket, "close_code", None) is None
         )
 
-    async def send_control(self, message: dict[str, object]) -> None:
+    async def send_control(self, message: dict[str, object], *, request_client_id: str | None = None) -> None:
         if not self.is_healthy():
             await self.ensure_running()
+        if message.get("event") == "changeCursorPosition" and request_client_id:
+            self._prune_pending_cursor_clients()
+            self.pending_cursor_clients.append((request_client_id, time.monotonic()))
         assert self.control_socket is not None
         await self.control_socket.send(json.dumps(message))
         self.last_access = time.monotonic()
 
-    def add_listener(self) -> asyncio.Queue[str]:
+    def add_listener(self, client_id: str) -> asyncio.Queue[str]:
         queue: asyncio.Queue[str] = asyncio.Queue()
-        self.listeners.add(queue)
+        listeners = self.listeners.setdefault(client_id, set())
+        listeners.add(queue)
         return queue
 
-    def remove_listener(self, queue: asyncio.Queue[str]) -> None:
-        self.listeners.discard(queue)
+    def remove_listener(self, client_id: str, queue: asyncio.Queue[str]) -> None:
+        listeners = self.listeners.get(client_id)
+        if listeners is None:
+            return
+        listeners.discard(queue)
+        if not listeners:
+            self.listeners.pop(client_id, None)
 
-    def broadcast(self, message: dict[str, object]) -> None:
+    def broadcast(self, message: dict[str, object], *, client_id: str | None = None) -> None:
         payload = json.dumps(message)
-        for listener in list(self.listeners):
+        if client_id:
+            target_listeners = list(self.listeners.get(client_id, set()))
+        else:
+            target_listeners = [listener for listeners in self.listeners.values() for listener in listeners]
+        for listener in target_listeners:
             with contextlib.suppress(asyncio.QueueFull):
                 listener.put_nowait(payload)
 
@@ -1457,6 +1488,7 @@ class PreviewSession:
 
         self.process = None
         self.workspace_revision = ""
+        self.pending_cursor_clients.clear()
 
         if self.stdout_task:
             self.stdout_task.cancel()
@@ -1469,6 +1501,7 @@ class PreviewSession:
 
 
 class PreviewManager:
+
     def __init__(self) -> None:
         self.sessions: dict[str, PreviewSession] = {}
         self.lock = asyncio.Lock()
@@ -1480,9 +1513,8 @@ class PreviewManager:
         entrypoint: str = "main.typ",
         client_id: str = "default",
     ) -> PreviewSession:
-        normalized_client_id = normalize_client_id(client_id)
         requested_entrypoint = normalize_entrypoint_request(project_id, entrypoint)
-        requested_session_key = make_session_key(project_id, requested_entrypoint, normalized_client_id)
+        requested_session_key = make_session_key(project_id, requested_entrypoint)
         async with self.lock:
             session = self.sessions.get(requested_session_key)
         if session is not None:
@@ -1494,11 +1526,11 @@ class PreviewManager:
         if not isinstance(files, list):
             raise HTTPException(status_code=502, detail="Preview snapshot contains no files")
         normalized_entrypoint = resolve_entrypoint_in_snapshot(files, project_id, entrypoint)
-        session_key = make_session_key(project_id, normalized_entrypoint, normalized_client_id)
+        session_key = make_session_key(project_id, normalized_entrypoint)
         async with self.lock:
             session = self.sessions.get(session_key)
             if session is None:
-                session = PreviewSession(project_id, normalized_entrypoint, normalized_client_id)
+                session = PreviewSession(project_id, normalized_entrypoint)
                 self.sessions[session_key] = session
         await session.ensure_running(snapshot)
         return session
@@ -1551,14 +1583,15 @@ async def ensure_session(
     entrypoint: str = Query("main.typ"),
     client_id: str = Query("default"),
 ) -> dict[str, object]:
-    session = await manager.get_session(project_id, entrypoint, client_id)
+    normalized_client_id = normalize_client_id(client_id)
+    session = await manager.get_session(project_id, entrypoint, normalized_client_id)
     return {
         "project_id": project_id,
         "entrypoint": session.entrypoint,
-        "client_id": session.client_id,
+        "client_id": normalized_client_id,
         "instance_id": session.instance_id,
         "status": session.last_status,
-        "view_url": f"/sessions/{project_id}/data?entrypoint={session.entrypoint}&client_id={session.client_id}",
+        "view_url": f"/sessions/{project_id}/data?entrypoint={session.entrypoint}&client_id={normalized_client_id}",
     }
 
 
@@ -1568,11 +1601,12 @@ async def get_session_status(
     entrypoint: str = Query("main.typ"),
     client_id: str = Query("default"),
 ) -> dict[str, object]:
-    session = await manager.get_session(project_id, entrypoint, client_id)
+    normalized_client_id = normalize_client_id(client_id)
+    session = await manager.get_session(project_id, entrypoint, normalized_client_id)
     return {
         "project_id": project_id,
         "entrypoint": session.entrypoint,
-        "client_id": session.client_id,
+        "client_id": normalized_client_id,
         "instance_id": session.instance_id,
         "status": session.last_status,
         "outline": session.outline,
@@ -1585,9 +1619,10 @@ async def get_wrapper(
     entrypoint: str = Query("main.typ"),
     client_id: str = Query("default"),
 ) -> RedirectResponse:
-    session = await manager.get_session(project_id, entrypoint, client_id)
+    normalized_client_id = normalize_client_id(client_id)
+    session = await manager.get_session(project_id, entrypoint, normalized_client_id)
     return RedirectResponse(
-        url=f"data?entrypoint={session.entrypoint}&client_id={session.client_id}",
+        url=f"data?entrypoint={session.entrypoint}&client_id={normalized_client_id}",
         status_code=307,
     )
 
@@ -1599,7 +1634,8 @@ async def update_cursor(
     entrypoint: str = Query("main.typ"),
     client_id: str = Query("default"),
 ) -> JSONResponse:
-    session = await manager.get_session(project_id, entrypoint, client_id)
+    normalized_client_id = normalize_client_id(client_id)
+    session = await manager.get_session(project_id, entrypoint, normalized_client_id)
 
     file_path = Path(cursor.path)
     if not file_path.is_absolute():
@@ -1611,7 +1647,8 @@ async def update_cursor(
             "filepath": str(file_path),
             "line": cursor.line,
             "character": cursor.character,
-        }
+        },
+        request_client_id=normalized_client_id,
     )
     return JSONResponse({"status": "ok"})
 
@@ -1619,10 +1656,11 @@ async def update_cursor(
 @app.get("/sessions/{project_id}/data")
 @app.get("/sessions/{project_id}/data/{asset_path:path}")
 async def proxy_data_http(project_id: int, request: Request, asset_path: str = "") -> Response:
+    request_client_id = normalize_client_id(request.query_params.get("client_id", "default"))
     session = await manager.get_session(
         project_id,
         request.query_params.get("entrypoint", "main.typ"),
-        request.query_params.get("client_id", "default"),
+        request_client_id,
     )
     upstream_path = f"/{asset_path}" if asset_path else "/"
     upstream_url = f"http://127.0.0.1:{session.data_port}{upstream_path}"
@@ -1643,12 +1681,12 @@ async def proxy_data_http(project_id: int, request: Request, asset_path: str = "
             (
                 'let urlObject = new URL("ws", window.location.href);'
                 f'urlObject.searchParams.set("entrypoint", {json.dumps(session.entrypoint)});'
-                f'urlObject.searchParams.set("client_id", {json.dumps(session.client_id)});'
+                f'urlObject.searchParams.set("client_id", {json.dumps(request_client_id)});'
             ),
         )
         html_text = html_text.replace(
             "</body>",
-            f"{make_bridge_script(project_id, session.entrypoint, session.client_id)}</body>",
+            f"{make_bridge_script(project_id, session.entrypoint, request_client_id)}</body>",
         )
         content = html_text.encode("utf-8")
         headers["content-type"] = "text/html; charset=utf-8"
@@ -1664,10 +1702,11 @@ async def proxy_data_http(project_id: int, request: Request, asset_path: str = "
 
 @app.websocket("/sessions/{project_id}/ws")
 async def proxy_data_websocket(project_id: int, websocket: WebSocket) -> None:
+    request_client_id = normalize_client_id(websocket.query_params.get("client_id", "default"))
     session = await manager.get_session(
         project_id,
         websocket.query_params.get("entrypoint", "main.typ"),
-        websocket.query_params.get("client_id", "default"),
+        request_client_id,
     )
     await websocket.accept()
 
@@ -1709,13 +1748,14 @@ async def proxy_data_websocket(project_id: int, websocket: WebSocket) -> None:
 
 @app.websocket("/sessions/{project_id}/events")
 async def stream_editor_events(project_id: int, websocket: WebSocket) -> None:
+    request_client_id = normalize_client_id(websocket.query_params.get("client_id", "default"))
     session = await manager.get_session(
         project_id,
         websocket.query_params.get("entrypoint", "main.typ"),
-        websocket.query_params.get("client_id", "default"),
+        request_client_id,
     )
     await websocket.accept()
-    listener = session.add_listener()
+    listener = session.add_listener(request_client_id)
 
     try:
         while True:
@@ -1724,6 +1764,6 @@ async def stream_editor_events(project_id: int, websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
     finally:
-        session.remove_listener(listener)
+        session.remove_listener(request_client_id, listener)
         with contextlib.suppress(Exception):
             await websocket.close()

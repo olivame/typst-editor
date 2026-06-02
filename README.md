@@ -64,7 +64,9 @@ cp .env.example .env
 `.env.example` 里已经提供了这些入口，`.env.distributed.example` 给多机部署提供了按 IP 填写的模板。所有 `*_URL` 优先级最高；不填 URL 时会按 `*_SCHEME` + `*_HOST` + `*_PORT` 组装。
 
 - 浏览器直连地址：`VITE_API_*`、`VITE_PREVIEW_*`、`VITE_REALTIME_*`。不设置时，非 localhost 访问会走 `/api`、`/preview`、`/realtime` 代理。
-- Web dev proxy 目标：`API_PROXY_*`、`PREVIEW_PROXY_*`、`REALTIME_PROXY_*`。
+- Web dev proxy 目标：`API_PROXY_*`、`PREVIEW_PROXY_*`、`REALTIME_PROXY_*`。如果 Web 要代理多个 preview/realtime shard，再额外配置 `PREVIEW_PROXY_TARGETS`、`REALTIME_PROXY_TARGETS`。
+- API 调 preview 内部接口：`PREVIEW_INTERNAL_URL` / `PREVIEW_INTERNAL_URLS`，或 `PREVIEW_INTERNAL_SCHEME` / `PREVIEW_INTERNAL_HOST` / `PREVIEW_INTERNAL_PORT`。
+- API 给浏览器返回 preview shard 地址：`PREVIEW_BROWSER_URL` / `PREVIEW_BROWSER_URLS`，未配置时前端继续回退到 `VITE_PREVIEW_*` 或 `/preview`。
 - API 调 realtime 内部接口：`REALTIME_INTERNAL_URL` / `REALTIME_INTERNAL_URLS`，或 `REALTIME_INTERNAL_SCHEME` / `REALTIME_INTERNAL_HOST` / `REALTIME_INTERNAL_PORT`。
 - Preview/Realtime 调 API 内部接口：`API_INTERNAL_URL` 或 `API_INTERNAL_SCHEME` / `API_INTERNAL_HOST` / `API_INTERNAL_PORT`。
 - Compose 宿主机发布端口：`WEB_PUBLISH_PORT`、`API_PUBLISH_PORT`、`PREVIEW_PUBLISH_PORT`、`REALTIME_PUBLISH_PORT`、`COMPILER_PUBLISH_PORT`。
@@ -129,7 +131,25 @@ docker compose --env-file .env -f compose.distributed.yaml --profile web up -d -
 
 建议先只开放 Web 端口给浏览器，API/Preview/Realtime/Compiler/DB 只在内网开放。此模式下 `VITE_*_HOST` 留空，填写 `API_PROXY_HOST`、`PREVIEW_PROXY_HOST`、`REALTIME_PROXY_HOST` 为对应内网 IP。
 
-当前横向扩容边界：API 已经不需要共享盘，可以多实例共用同一个 DB；Compiler 是无状态服务，可以放到负载均衡后面；Realtime 可以用 `REALTIME_BROWSER_URLS` + `REALTIME_INTERNAL_URLS` 做按文件稳定分片；Preview 仍有内存 session 状态，多个副本需要粘性路由。
+如果 Web 自己要代理多个 preview/realtime shard，则不要只填单个 `PREVIEW_PROXY_HOST` / `REALTIME_PROXY_HOST`，而是直接填内部可达 URL 列表：
+
+```env
+PREVIEW_PROXY_TARGETS=http://10.0.0.12:8002,http://10.0.0.16:8002
+REALTIME_PROXY_TARGETS=ws://10.0.0.13:8003,ws://10.0.0.14:8003
+```
+
+Web 会按 `project_id` 把 `/preview/sessions/{project_id}/...` 稳定代理到对应 preview shard，并按 `fileId` 把 `/realtime/...?...fileId=` 稳定代理到对应 realtime shard。这样浏览器仍然只访问 Web 一个入口。
+
+当前横向扩容边界：API 已经不需要共享盘，可以多实例共用同一个 DB；Compiler 是无状态服务，可以放到负载均衡后面；Realtime 可以用 `REALTIME_BROWSER_URLS` + `REALTIME_INTERNAL_URLS` 做按文件稳定分片；Preview 可以用 `PREVIEW_BROWSER_URLS` + `PREVIEW_INTERNAL_URLS` 做按项目稳定分片，同一项目同一 entrypoint 在同一节点上会共享一个 Tinymist session，但 session 仍然只保存在各自实例内存里，不支持跨节点迁移。
+
+Preview 多实例分片时，两组 URL 也必须一一对应，顺序必须稳定，而且 `PREVIEW_BROWSER_URLS` 必须是浏览器可直连的地址。例如：
+
+```env
+PREVIEW_BROWSER_URLS=http://10.0.0.12:8002,http://10.0.0.16:8002
+PREVIEW_INTERNAL_URLS=http://10.0.0.12:8002,http://10.0.0.16:8002
+```
+
+API 会按 `project_id` 选择固定 preview 节点，并把该节点的浏览器地址返回给前端；如果不配置 `PREVIEW_BROWSER_URLS`，前端继续使用现有 `VITE_PREVIEW_*` 或 `/preview` 回退。现在如果 `web` 配了 `PREVIEW_PROXY_TARGETS`，`/preview` 也可以按项目稳定代理到多个 preview shard。
 
 Realtime 多实例分片时，两组 URL 必须一一对应，顺序必须稳定。例如：
 

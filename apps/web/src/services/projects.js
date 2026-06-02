@@ -290,12 +290,42 @@ export async function listAvailableFonts() {
   return apiFetch('/fonts')
 }
 
+function getResolvedPreviewClientId(options = {}) {
+  return options.clientId || getPreviewClientId()
+}
+
+function matchesPreviewSession(previewSession, options = {}) {
+  if (!previewSession || typeof previewSession !== 'object') return false
+
+  const clientId = getResolvedPreviewClientId(options)
+  if (previewSession.client_id && previewSession.client_id !== clientId) return false
+  if (options.entrypoint && previewSession.entrypoint && previewSession.entrypoint !== options.entrypoint) return false
+  return true
+}
+
+export async function getProjectPreviewSession(projectId, options = {}) {
+  const url = new URL(`${API_URL}/projects/${projectId}/preview-session`)
+  if (options.entrypoint) {
+    url.searchParams.set('entrypoint', options.entrypoint)
+  }
+  url.searchParams.set('client_id', getResolvedPreviewClientId(options))
+
+  const response = await fetch(url, {
+    headers: getAuthHeaders(),
+  })
+  return parseJsonResponse(response)
+}
+
 export function getProjectPreviewUrl(projectId, options = {}) {
+  if (matchesPreviewSession(options.previewSession, options) && options.previewSession.preview_url) {
+    return options.previewSession.preview_url
+  }
+
   const url = new URL(`${PREVIEW_URL}/sessions/${projectId}/data`)
   if (options.entrypoint) {
     url.searchParams.set('entrypoint', options.entrypoint)
   }
-  url.searchParams.set('client_id', options.clientId || getPreviewClientId())
+  url.searchParams.set('client_id', getResolvedPreviewClientId(options))
   return url.toString()
 }
 
@@ -308,11 +338,18 @@ export function getProjectFileUrl(fileId, options = {}) {
 }
 
 export async function getProjectPreviewStatus(projectId, options = {}) {
+  if (matchesPreviewSession(options.previewSession, options) && options.previewSession.status_url) {
+    const response = await fetch(options.previewSession.status_url, {
+      headers: getAuthHeaders(),
+    })
+    return parseJsonResponse(response)
+  }
+
   const url = new URL(`${PREVIEW_URL}/sessions/${projectId}/status`)
   if (options.entrypoint) {
     url.searchParams.set('entrypoint', options.entrypoint)
   }
-  url.searchParams.set('client_id', options.clientId || getPreviewClientId())
+  url.searchParams.set('client_id', getResolvedPreviewClientId(options))
   const response = await fetch(url, {
     headers: getAuthHeaders(),
   })

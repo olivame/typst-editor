@@ -27,6 +27,8 @@ from settings import (
     COMPILER_TIMEOUT_SECONDS,
     COMPILER_URL,
     CORS_ALLOW_ORIGINS,
+    PREVIEW_BROWSER_URLS,
+    PREVIEW_INTERNAL_URLS,
     PREVIEW_SECRET,
     REALTIME_BROWSER_URLS,
     REALTIME_INTERNAL_URLS,
@@ -814,6 +816,38 @@ def hydrate_legacy_binary_entries_from_disk(db: Session):
 
 def summarize_content(value: str, limit: int = 80):
     return (value or '').replace('\n', ' ').replace('\r', ' ')[:limit]
+
+
+def choose_preview_endpoint_index(project_id: int):
+    endpoint_count = max(len(PREVIEW_INTERNAL_URLS), 1)
+    return (max(project_id, 1) - 1) % endpoint_count
+
+
+def get_preview_browser_url(project_id: int):
+    if not PREVIEW_BROWSER_URLS:
+        return ''
+    return PREVIEW_BROWSER_URLS[choose_preview_endpoint_index(project_id)]
+
+
+def build_preview_internal_url(path: str, project_id: int):
+    endpoint = PREVIEW_INTERNAL_URLS[choose_preview_endpoint_index(project_id)]
+    return f"{endpoint.rstrip('/')}" + path
+
+
+def build_preview_browser_url(path: str, project_id: int, *, query: dict[str, str] | None = None):
+    endpoint = get_preview_browser_url(project_id)
+    if not endpoint:
+        return ''
+
+    url = f"{endpoint.rstrip('/')}" + path
+    if query:
+        query_string = '&'.join(
+            f"{quote(str(key), safe='')}={quote(str(value), safe='')}"
+            for key, value in query.items()
+        )
+        if query_string:
+            url = f"{url}?{query_string}"
+    return url
 
 
 def choose_realtime_endpoint_index(file_id: int):
@@ -1849,6 +1883,62 @@ def get_file_content(
         'is_binary': entry.is_binary,
         'content_revision': entry.content_revision or 0,
         'content': '' if entry.is_binary else (entry.content or ''),
+    }
+
+
+@app.get('/projects/{project_id}/preview-session')
+def get_project_preview_session(
+    project_id: int,
+    entrypoint: str = Query('main.typ'),
+    client_id: str = Query('default'),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
+
+    try:
+        response = requests.get(
+            build_preview_internal_url(f'/sessions/{project_id}/status', project_id),
+            params={
+                'entrypoint': entrypoint or 'main.typ',
+                'client_id': client_id or 'default',
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail='Preview service returned invalid JSON') from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail='Preview service returned an invalid session payload')
+
+    resolved_entrypoint = str(payload.get('entrypoint') or entrypoint or 'main.typ')
+    resolved_client_id = str(payload.get('client_id') or client_id or 'default')
+    query = {
+        'entrypoint': resolved_entrypoint,
+        'client_id': resolved_client_id,
+    }
+
+    return {
+        'protocol_version': 1,
+        'project_id': project_id,
+        'entrypoint': resolved_entrypoint,
+        'client_id': resolved_client_id,
+        'instance_id': payload.get('instance_id', 0),
+        'status': payload.get('status', {'kind': 'Idle'}),
+        'outline': payload.get('outline', []),
+        'preview_base_url': get_preview_browser_url(project_id),
+        'preview_url': build_preview_browser_url(f'/sessions/{project_id}/data', project_id, query=query),
+        'status_url': build_preview_browser_url(f'/sessions/{project_id}/status', project_id, query=query),
+        'view_url': build_preview_browser_url(f'/sessions/{project_id}/view', project_id, query=query),
+        'ws_url': build_preview_browser_url(f'/sessions/{project_id}/ws', project_id, query=query),
+        'events_url': build_preview_browser_url(f'/sessions/{project_id}/events', project_id, query=query),
     }
 
 

@@ -19,7 +19,7 @@ import {
   getFileContent,
   getFileRealtimeSession,
   getProjectFileUrl,
-  getProjectPreviewStatus,
+  getProjectPreviewSession,
   getProjectPreviewUrl,
   listAvailableFonts,
   listProjectFiles,
@@ -991,6 +991,7 @@ export default function Editor({
   const [availableFonts, setAvailableFonts] = useState([])
   const [openFontPicker, setOpenFontPicker] = useState('')
   const [activePreviewPath, setActivePreviewPath] = useState('main.typ')
+  const [previewSession, setPreviewSession] = useState(null)
   const [previewStatus, setPreviewStatus] = useState({ kind: 'Idle' })
   const [previewOutline, setPreviewOutline] = useState([])
   const [previewInstanceId, setPreviewInstanceId] = useState(0)
@@ -1255,9 +1256,10 @@ export default function Editor({
   useEffect(() => {
     let isCancelled = false
 
-    async function loadPreviewStatus() {
+    async function loadPreviewSession() {
       const previewEntry = findPreferredTypEntry(files, activePreviewPath)
       if (!previewEntry?.path) {
+        setPreviewSession(null)
         setPreviewStatus({ kind: 'Idle' })
         setPreviewOutline([])
         setPreviewInstanceId(0)
@@ -1265,9 +1267,10 @@ export default function Editor({
       }
 
       try {
-        const payload = await getProjectPreviewStatus(projectId, { entrypoint: previewEntry.path })
+        const payload = await getProjectPreviewSession(projectId, { entrypoint: previewEntry.path })
         if (isCancelled) return
 
+        setPreviewSession(payload && typeof payload === 'object' ? payload : null)
         setPreviewStatus(payload?.status && typeof payload.status === 'object' ? payload.status : { kind: 'Idle' })
         setPreviewOutline(Array.isArray(payload?.outline) ? payload.outline : [])
         setPreviewInstanceId(Number.isInteger(payload?.instance_id) ? payload.instance_id : 0)
@@ -1275,15 +1278,16 @@ export default function Editor({
         if (isCancelled) return
         if (handleAccessFailure(error, '无法获取预览状态。')) return
 
+        setPreviewSession(null)
         setPreviewStatus({ kind: 'Unavailable' })
         setPreviewOutline([])
         setPreviewInstanceId(0)
       }
     }
 
-    void loadPreviewStatus()
+    void loadPreviewSession()
     const intervalId = window.setInterval(() => {
-      void loadPreviewStatus()
+      void loadPreviewSession()
     }, 1200)
 
     return () => {
@@ -2083,8 +2087,11 @@ export default function Editor({
   )
 
   const activePreviewEntry = findPreferredTypEntry(files, activePreviewPath)
+  const activePreviewSession = activePreviewEntry?.path && previewSession?.entrypoint === activePreviewEntry.path
+    ? previewSession
+    : null
   const previewUrl = activePreviewEntry
-    ? getProjectPreviewUrl(projectId, { entrypoint: activePreviewEntry.path })
+    ? getProjectPreviewUrl(projectId, { entrypoint: activePreviewEntry.path, previewSession: activePreviewSession })
     : ''
   const selectedFilePreviewUrl = selectedEntry?.kind === 'file'
     ? getProjectFileUrl(selectedEntry.id)
@@ -2299,7 +2306,7 @@ export default function Editor({
       ) : activePreviewEntry ? (
         <TinymistPreview
           ref={previewApiRef}
-          key={`${projectId}-${activePreviewEntry.path}-${previewInstanceId}-${isPreviewDetached ? 'floating' : 'embedded'}`}
+          key={`${projectId}-${activePreviewEntry.path}-${previewInstanceId}-${activePreviewSession?.preview_base_url || 'preview'}-${isPreviewDetached ? 'floating' : 'embedded'}`}
           onJumpToSource={handlePreviewJump}
           onZoomChange={handlePreviewZoomChange}
           src={previewUrl}
