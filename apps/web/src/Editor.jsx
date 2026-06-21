@@ -194,6 +194,49 @@ function getSelectionOffset(content, line, character) {
   return offsetBeforeLine + boundedCharacter
 }
 
+function getVisiblePreviewSelectionRange(source, location, fallbackSnippet = '') {
+  const lines = source.split('\n')
+  const lineIndex = Math.max(0, Math.min(Number(location.startLine) || 0, lines.length - 1))
+  const lineText = lines[lineIndex] || ''
+  const rawSnippet = `${fallbackSnippet || location.lineSnippet || ''}`.trim()
+  const lineOffset = getSelectionOffset(source, lineIndex, 0)
+  const snippetStart = rawSnippet ? lineText.indexOf(rawSnippet) : -1
+
+  if (snippetStart >= 0) {
+    return {
+      start: lineOffset + snippetStart,
+      end: lineOffset + snippetStart + rawSnippet.length,
+    }
+  }
+
+  let start = getSelectionOffset(source, location.startLine, location.startCharacter)
+  let end = getSelectionOffset(
+    source,
+    location.endLine ?? location.startLine,
+    location.endCharacter ?? location.startCharacter,
+  )
+
+  if (end < start) {
+    const previousStart = start
+    start = end
+    end = previousStart
+  }
+
+  if (end - start >= 3) {
+    return { start, end }
+  }
+
+  const lineEnd = lineOffset + lineText.length
+  if (lineEnd > lineOffset) {
+    return { start: lineOffset, end: lineEnd }
+  }
+
+  return {
+    start: lineOffset,
+    end: Math.min(lineOffset + 1, source.length),
+  }
+}
+
 function getLineColumnFromOffset(source, offset) {
   const boundedOffset = Math.max(0, Math.min(offset, source.length))
   const beforeOffset = source.slice(0, boundedOffset)
@@ -1128,6 +1171,7 @@ export default function Editor({
   const referenceButtonRef = useRef(null)
   const referenceMenuRef = useRef(null)
   const accessFailureHandledRef = useRef(false)
+  const editorPreviewRevealNonceRef = useRef(0)
   const historyDiffScrollSyncRef = useRef({ before: null, after: null, isSyncing: false })
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
@@ -1826,6 +1870,7 @@ export default function Editor({
     if (!matchingEntry || matchingEntry.kind !== 'file' || matchingEntry.is_binary) return
 
     pendingCursorJumpRef.current = {
+      origin: 'preview',
       path: relativePath,
       startLine: start[0],
       startCharacter: start[1],
@@ -1848,6 +1893,7 @@ export default function Editor({
     if (!matchingEntry || matchingEntry.kind !== 'file' || matchingEntry.is_binary) return
 
     pendingCursorJumpRef.current = {
+      origin: 'sidebar',
       path: location.path,
       startLine: location.start[0],
       startCharacter: location.start[1],
@@ -1914,16 +1960,48 @@ export default function Editor({
     }
   }
 
-  function handleEditorDoubleClick(cursor) {
-    if (typeof cursor !== 'number' || !currentFile) return
+  async function handleEditorPreviewJump(cursor) {
+    if (typeof cursor !== 'number' || !currentFile || !activePreviewEntry) return
 
-    const lineStart = content.lastIndexOf('\n', Math.max(cursor - 1, 0)) + 1
-    const lineNumber = content.slice(0, cursor).split('\n').length - 1
-    const character = cursor - lineStart
+    const editor = editorRef.current
+    const cursorLocation = editor?.getDocumentPosition?.(cursor)
+    if (!cursorLocation) return
+
+    const revealNonce = editorPreviewRevealNonceRef.current + 1
+    editorPreviewRevealNonceRef.current = revealNonce
+
+    const nextContent = getCurrentEditorContent()
+    if (nextContent !== (currentFile.content || '')) {
+      try {
+        const persisted = await persistCurrentFileContent(nextContent, {
+          createRevision: false,
+          force: false,
+        })
+        const nextRevision = persisted?.file?.content_revision ?? persisted?.content_revision
+
+        if (editorPreviewRevealNonceRef.current !== revealNonce) return
+
+        setContent(nextContent)
+        setCurrentFile((current) => (
+          current?.id === currentFile.id
+            ? {
+              ...current,
+              content: nextContent,
+              content_revision: nextRevision ?? current.content_revision,
+            }
+            : current
+        ))
+      } catch (error) {
+        if (handleAccessFailure(error, '无法同步预览定位。')) return
+        showStatus(error.message || 'Failed to sync preview position', 3000)
+        return
+      }
+    }
+
     previewApiRef.current?.revealCursor({
       path: currentFile.path,
-      line: lineNumber,
-      character,
+      line: cursorLocation.line,
+      character: cursorLocation.character,
     })
   }
 
@@ -1945,54 +2023,50 @@ export default function Editor({
         return
       }
 
-      let selectionStart = matchesPreviewJump
-        ? getSelectionOffset(content, pendingCursorJump.startLine, pendingCursorJump.startCharacter)
-        : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.start)
-      let selectionEnd = matchesPreviewJump
-        ? getSelectionOffset(content, pendingCursorJump.endLine, pendingCursorJump.endCharacter)
-        : getSelectionOffset(content, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.end)
+      const source = editor.getValue?.() || content
+      const visiblePreviewSelection = matchesPreviewJump
+        ? getVisiblePreviewSelectionRange(source, pendingCursorJump)
+        : null
+      let selectionStart = visiblePreviewSelection
+        ? visiblePreviewSelection.start
+        : getSelectionOffset(source, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.start)
+      let selectionEnd = visiblePreviewSelection
+        ? visiblePreviewSelection.end
+        : getSelectionOffset(source, Math.max(pendingCursorJump.lineNumber - 1, 0), pendingCursorJump.end)
 
       if (
         matchesPreviewJump
         && selectionEnd === selectionStart
         && typeof pendingCursorJump.startLine === 'number'
       ) {
-        const lines = content.split('\n')
+        const lines = source.split('\n')
         const lineIndex = pendingCursorJump.startLine
         const lineText = lines[lineIndex] || ''
         const rawSnippet = `${pendingCursorJump.lineSnippet || ''}`.trim()
         const snippetStart = rawSnippet ? lineText.indexOf(rawSnippet) : -1
 
         if (snippetStart >= 0) {
-          const lineOffset = getSelectionOffset(content, lineIndex, 0)
+          const lineOffset = getSelectionOffset(source, lineIndex, 0)
           selectionStart = lineOffset + snippetStart
           selectionEnd = lineOffset + snippetStart + rawSnippet.length
         } else {
-          selectionStart = getSelectionOffset(content, lineIndex, 0)
-          selectionEnd = getSelectionOffset(content, lineIndex, lineText.length)
+          selectionStart = getSelectionOffset(source, lineIndex, 0)
+          selectionEnd = getSelectionOffset(source, lineIndex, lineText.length)
         }
       }
 
-      const lineHeight = editorLineHeight
-      const lineNumber = matchesPreviewJump ? pendingCursorJump.startLine + 1 : pendingCursorJump.lineNumber
-      const targetScrollTop = Math.max(
-        (lineNumber - 3) * lineHeight,
-        0,
-      )
       editor.setSelectionRange(selectionStart, selectionEnd, {
         reveal: true,
         center: true,
       })
-      editor.setScrollTop(targetScrollTop)
-      window.requestAnimationFrame(() => {
-        editorRef.current?.setScrollTop(targetScrollTop)
-      })
 
-      previewApiRef.current?.revealCursor({
-        path: currentFile.path,
-        line: matchesPreviewJump ? pendingCursorJump.startLine : Math.max(pendingCursorJump.lineNumber - 1, 0),
-        character: matchesPreviewJump ? pendingCursorJump.startCharacter : pendingCursorJump.start,
-      })
+      if (pendingCursorJump.origin !== 'preview') {
+        previewApiRef.current?.revealCursor({
+          path: currentFile.path,
+          line: matchesPreviewJump ? pendingCursorJump.startLine : Math.max(pendingCursorJump.lineNumber - 1, 0),
+          character: matchesPreviewJump ? pendingCursorJump.startCharacter : pendingCursorJump.start,
+        })
+      }
 
       pendingCursorJumpRef.current = null
       return
@@ -3268,7 +3342,7 @@ export default function Editor({
                       lineHeight={editorLineHeight}
                       onChange={setContent}
                       onConnectionStateChange={setRealtimeConnectionStatus}
-                      onDoubleClick={handleEditorDoubleClick}
+                      onCursorClick={handleEditorPreviewJump}
                       onMount={({ scrollElement }) => {
                         setEditorWheelElement(scrollElement)
                       }}

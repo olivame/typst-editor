@@ -245,6 +245,7 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   lineHeight = 24,
   onChange,
   onConnectionStateChange,
+  onCursorClick,
   onDoubleClick,
   onMount,
   onScroll,
@@ -257,6 +258,7 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   const viewRef = useRef(null)
   const onChangeRef = useRef(onChange)
   const onConnectionStateChangeRef = useRef(onConnectionStateChange)
+  const onCursorClickRef = useRef(onCursorClick)
   const onDoubleClickRef = useRef(onDoubleClick)
   const onMountRef = useRef(onMount)
   const onScrollRef = useRef(onScroll)
@@ -283,6 +285,10 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   useEffect(() => {
     onConnectionStateChangeRef.current = onConnectionStateChange
   }, [onConnectionStateChange])
+
+  useEffect(() => {
+    onCursorClickRef.current = onCursorClick
+  }, [onCursorClick])
 
   useEffect(() => {
     onDoubleClickRef.current = onDoubleClick
@@ -359,11 +365,31 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
         }
       }),
       EditorView.domEventHandlers({
-        dblclick: () => {
+        click: (event, view) => {
+          if (event.button !== 0) return
+          const clickedPosition = view.posAtCoords({
+            x: event.clientX,
+            y: event.clientY,
+          })
+          if (typeof clickedPosition !== 'number') return
+
+          window.requestAnimationFrame(() => {
+            onCursorClickRef.current?.(clickedPosition)
+          })
+        },
+        dblclick: (event, view) => {
+          const clickedPosition = view.posAtCoords({
+            x: event.clientX,
+            y: event.clientY,
+          })
           window.requestAnimationFrame(() => {
             const activeView = viewRef.current
             if (!activeView) return
-            onDoubleClickRef.current?.(activeView.state.selection.main.head)
+            onDoubleClickRef.current?.(
+              typeof clickedPosition === 'number'
+                ? clickedPosition
+                : activeView.state.selection.main.head,
+            )
           })
         },
       }),
@@ -552,6 +578,26 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
     },
     getValue() {
       return viewRef.current?.state.doc.toString() || ''
+    },
+    getDocumentPosition(position) {
+      const view = viewRef.current
+      if (!view) {
+        return { offset: 0, line: 0, character: 0, lineText: '' }
+      }
+
+      const fallbackPosition = view.state.selection.main.head
+      const safePosition = clampPosition(
+        typeof position === 'number' ? position : fallbackPosition,
+        view.state.doc.length,
+      )
+      const line = view.state.doc.lineAt(safePosition)
+
+      return {
+        offset: safePosition,
+        line: line.number - 1,
+        character: safePosition - line.from,
+        lineText: line.text,
+      }
     },
     redo() {
       if (collaborationRef.current?.undoManager) {

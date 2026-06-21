@@ -566,7 +566,7 @@ const server = http.createServer(async (request, response) => {
         return
       }
 
-      const flushResult = await flushRoom(room, 'manual')
+      const flushResult = await flushRoom(room, payload?.force === false ? 'opportunistic' : 'manual')
       if (flushResult.statusCode === 409) {
         writeJson(response, 409, {
           detail: flushResult.message || 'Realtime room content is stale',

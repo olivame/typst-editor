@@ -282,6 +282,7 @@ export async function flushRealtimeFile(fileId, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       create_revision: options.createRevision !== false,
+      force: options.force !== false,
     }),
   })
 }

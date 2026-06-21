@@ -46,6 +46,17 @@ API_INTERNAL_URL = build_service_url("API_INTERNAL", API_HOST, API_PORT)
 PREVIEW_SECRET = os.getenv("PREVIEW_SECRET", "change-this-preview-secret")
 
 HTML_WS_SNIPPET = 'let urlObject = new URL("/", window.location.href);'
+TINYMIST_RESOLVE_SOURCE_LEAF_SNIPPET = """function resolveSourceLeaf(elem, path) {
+  const page = elem.getElementsByClassName("typst-page")[0];
+  let curElem = page;"""
+TINYMIST_RESOLVE_SOURCE_LEAF_PATCH = """function resolveSourceLeaf(elem, path) {
+  const pagePoint = Array.isArray(path) ? path[0] : null;
+  const pageIndex = Number(pagePoint?.index);
+  const pages = Array.from(elem.getElementsByClassName("typst-page"));
+  const page = Number.isInteger(pageIndex) && pageIndex >= 0
+    ? pages[pageIndex]
+    : pages[0];
+  let curElem = page;"""
 DIAGNOSTIC_HEADER_PATTERN = re.compile(r"^(error|warning):\s*(.+)$")
 INCLUDE_PATTERN = re.compile(r'#include\s+"([^"]+)"')
 IMPORT_PATTERN = re.compile(r'#import\s+"([^"]+)"')
@@ -126,6 +137,13 @@ def normalize_snapshot_path(raw_path: str) -> str:
     return candidate.as_posix()
 
 
+def patch_tinymist_preview_html(html_text: str) -> str:
+    return html_text.replace(
+        TINYMIST_RESOLVE_SOURCE_LEAF_SNIPPET,
+        TINYMIST_RESOLVE_SOURCE_LEAF_PATCH,
+    )
+
+
 def normalize_entrypoint_request(project_id: int, raw_path: str) -> str:
     normalized = (raw_path or "main.typ").strip().replace("\\", "/")
 
@@ -141,6 +159,28 @@ def normalize_entrypoint_request(project_id: int, raw_path: str) -> str:
             normalized = relative_path
 
     return normalize_entrypoint(normalized)
+
+
+def resolve_cursor_file_path(project_id: int, project_dir: Path, raw_path: str) -> Path:
+    normalized = (raw_path or "").strip().replace("\\", "/")
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Cursor path is required")
+
+    legacy_workspace_prefix = f"/workspace/projects/{project_id}/"
+    if normalized.startswith(legacy_workspace_prefix):
+        normalized = normalized.removeprefix(legacy_workspace_prefix)
+
+    candidate = Path(normalized)
+    if candidate.is_absolute():
+        try:
+            relative_path = candidate.resolve(strict=False).relative_to(
+                project_dir.resolve(strict=False),
+            )
+            return project_dir / normalize_snapshot_path(relative_path.as_posix())
+        except (OSError, ValueError):
+            return candidate
+
+    return project_dir / normalize_snapshot_path(normalized)
 
 
 def resolve_entrypoint_in_snapshot(files: list[dict[str, object]], project_id: int, raw_path: str) -> str:
@@ -458,6 +498,7 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ", client_id: 
       let eventSocket = null;
       let zoomSyncTimer = null;
       let activeZoomTask = 0;
+      let activeRevealToken = 0;
 
       function setStatus(message) {{
         if (!message) {{
@@ -482,6 +523,14 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ", client_id: 
         const previewDocument = getPreviewDocument();
         const container = previewDocument?.getElementById("typst-container");
         return container?.documents?.[0] || null;
+      }}
+
+      function clearTinymistCursorState() {{
+        const tinymistDoc = getTinymistDoc();
+        if (tinymistDoc?.impl) {{
+          tinymistDoc.impl.cursorPosition = null;
+          tinymistDoc.impl.cursorPaths = null;
+        }}
       }}
 
       function findNearestZoom(value) {{
@@ -607,10 +656,272 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ", client_id: 
         doc.head.appendChild(style);
       }}
 
+      function getCursorPosition() {{
+        const tinymistDoc = getTinymistDoc();
+        const cursorPosition = tinymistDoc?.impl?.cursorPosition;
+        if (!Array.isArray(cursorPosition) || cursorPosition.length < 3) {{
+          return null;
+        }}
+
+        const page = Number(cursorPosition[0]);
+        const x = Number(cursorPosition[1]);
+        const y = Number(cursorPosition[2]);
+        if (!Number.isFinite(page) || !Number.isFinite(x) || !Number.isFinite(y)) {{
+          return null;
+        }}
+
+        return [page, x, y];
+      }}
+
+      function getElementScrollPoint(scrollNode, element) {{
+        const elementRect = element.getBoundingClientRect();
+        const scrollRect = scrollNode.getBoundingClientRect();
+        return {{
+          left: elementRect.left - scrollRect.left + scrollNode.scrollLeft + elementRect.width / 2,
+          top: elementRect.top - scrollRect.top + scrollNode.scrollTop + elementRect.height / 2,
+        }};
+      }}
+
+      function scrollPointIntoView(scrollNode, point) {{
+        if (!point) {{
+          return false;
+        }}
+
+        scrollNode.scrollTo({{
+          left: Math.max(point.left - scrollNode.clientWidth / 2, 0),
+          top: Math.max(point.top - scrollNode.clientHeight / 2, 0),
+          behavior: "smooth",
+        }});
+        return true;
+      }}
+
+      function findSvgPageElement(rootElem, pageNumber) {{
+        const pageElements = Array.from(rootElem?.children || []).filter((child) => {{
+          return child.classList?.contains("typst-page");
+        }});
+        if (pageElements.length > 0) {{
+          return pageElements[pageNumber - 1] || null;
+        }}
+
+        let nthPage = 0;
+        for (const child of rootElem?.children || []) {{
+          if (child.tagName?.toLowerCase() !== "g") {{
+            continue;
+          }}
+
+          nthPage += 1;
+          if (nthPage === pageNumber) {{
+            return child;
+          }}
+        }}
+
+        return null;
+      }}
+
+      function getCursorPointFromRenderedPage(doc, scrollNode, cursorPosition) {{
+        const [page, x, y] = cursorPosition;
+        const rootElem = doc.getElementById("typst-app")?.firstElementChild;
+        if (!rootElem) {{
+          return null;
+        }}
+
+        if (rootElem.getAttribute("data-render-mode") === "canvas") {{
+          const pageElement = Array.from(rootElem.querySelectorAll(".typst-page")).find((candidate) => {{
+            return Number(candidate.getAttribute("data-page-number")) === page - 1;
+          }});
+          const canvas = pageElement?.firstElementChild;
+          if (!canvas) {{
+            return null;
+          }}
+
+          const canvasRect = canvas.getBoundingClientRect();
+          const scrollRect = scrollNode.getBoundingClientRect();
+          const dataWidth = Number.parseFloat(canvas.getAttribute("data-page-width") || "0");
+          const dataHeight = Number.parseFloat(canvas.getAttribute("data-page-height") || "0");
+          if (!dataWidth || !dataHeight) {{
+            return null;
+          }}
+
+          return {{
+            left: canvasRect.left - scrollRect.left + scrollNode.scrollLeft + (x / dataWidth) * canvasRect.width,
+            top: canvasRect.top - scrollRect.top + scrollNode.scrollTop + (y / dataHeight) * canvasRect.height,
+          }};
+        }}
+
+        const pageElement = findSvgPageElement(rootElem, page);
+        if (!pageElement) {{
+          return null;
+        }}
+
+        const pageInner = doc.querySelector(`.typst-page-inner[data-page-number="${{page - 1}}"]`);
+        const pageRect = (pageInner || pageElement).getBoundingClientRect();
+        const scrollRect = scrollNode.getBoundingClientRect();
+        const dataWidth = Number.parseFloat(
+          pageInner?.getAttribute("data-page-width") ||
+          rootElem.getAttribute("data-width") ||
+          "0"
+        );
+        const dataHeight = Number.parseFloat(
+          pageInner?.getAttribute("data-page-height") ||
+          rootElem.getAttribute("data-height") ||
+          "0"
+        );
+        if (!dataWidth || !dataHeight) {{
+          return null;
+        }}
+
+        return {{
+          left: pageRect.left - scrollRect.left + scrollNode.scrollLeft + (x / dataWidth) * pageRect.width,
+          top: pageRect.top - scrollRect.top + scrollNode.scrollTop + (y / dataHeight) * pageRect.height,
+        }};
+      }}
+
+      function getCursorPointFromDocumentLayout(doc, scrollNode, cursorPosition) {{
+        const tinymistDoc = getTinymistDoc();
+        const impl = tinymistDoc?.impl;
+        const rootElem = doc.getElementById("typst-app")?.firstElementChild;
+        let pagesInfo = null;
+        try {{
+          pagesInfo = impl?.kModule?.retrievePagesInfo?.();
+        }} catch {{
+          return null;
+        }}
+        if (!rootElem || !Array.isArray(pagesInfo) || pagesInfo.length === 0) {{
+          return null;
+        }}
+
+        const [page, x, y] = cursorPosition;
+        const pageIndex = page - 1;
+        const pageInfo = pagesInfo[pageIndex];
+        if (!pageInfo) {{
+          return null;
+        }}
+
+        const rootRect = rootElem.getBoundingClientRect();
+        const scrollRect = scrollNode.getBoundingClientRect();
+        const dataHeight = Number.parseFloat(rootElem.getAttribute("data-height") || "0");
+        const dataWidth = Number.parseFloat(rootElem.getAttribute("data-width") || "0");
+        if (!dataWidth || !dataHeight || !rootRect.width || !rootRect.height) {{
+          return null;
+        }}
+
+        const maxPageWidth = pagesInfo.reduce((maxWidth, current) => {{
+          return Math.max(maxWidth, Number(current.width) || 0);
+        }}, Number(pageInfo.width) || 1);
+        const containerWidth = impl.cachedDOMState?.width || scrollNode.clientWidth || maxPageWidth;
+        const computedScale = containerWidth ? containerWidth / maxPageWidth : 1;
+        const scale = 1 / ((impl.currentScaleRatio || 1) * computedScale);
+        const heightMargin = (impl.isContentPreview ? 6 : 5) * scale;
+        const fontSize = 12 * scale;
+
+        let accumulatedHeight = 0;
+        let pageTop = 0;
+        for (let index = 0; index <= pageIndex; index += 1) {{
+          const currentPage = pagesInfo[index];
+          const calculatedY = accumulatedHeight + (index === 0 ? 0 : heightMargin);
+          if (index === pageIndex) {{
+            pageTop = calculatedY;
+            break;
+          }}
+
+          let pageHeightEnd = Number(currentPage.height) || 0;
+          if (index + 1 !== pagesInfo.length) {{
+            pageHeightEnd += heightMargin;
+          }}
+          if (impl.isContentPreview) {{
+            pageHeightEnd += fontSize;
+          }}
+          accumulatedHeight = calculatedY + pageHeightEnd;
+        }}
+
+        const pageWidth = Number(pageInfo.width) || dataWidth;
+        const pageHeight = Number(pageInfo.height) || dataHeight;
+        const pageLeft = Math.max((maxPageWidth - pageWidth) / 2, 0);
+        const scaleX = rootRect.width / dataWidth;
+        const scaleY = rootRect.height / dataHeight;
+
+        return {{
+          left: rootRect.left - scrollRect.left + scrollNode.scrollLeft + (pageLeft + x) * scaleX,
+          top: rootRect.top - scrollRect.top + scrollNode.scrollTop + (pageTop + Math.min(y, pageHeight)) * scaleY,
+        }};
+      }}
+
+      function getCursorPointFromPosition(doc, scrollNode) {{
+        const cursorPosition = getCursorPosition();
+        if (!cursorPosition) {{
+          return null;
+        }}
+
+        return (
+          getCursorPointFromRenderedPage(doc, scrollNode, cursorPosition) ||
+          getCursorPointFromDocumentLayout(doc, scrollNode, cursorPosition)
+        );
+      }}
+
+      function pruneCursorMarkers(doc, scrollNode = null) {{
+        const cursors = Array.from(doc.querySelectorAll(".typst-svg-cursor"));
+        if (cursors.length === 0) {{
+          return null;
+        }}
+
+        const targetPoint = scrollNode ? getCursorPointFromPosition(doc, scrollNode) : null;
+        const latestCursor = targetPoint
+          ? cursors.reduce((best, cursor) => {{
+            const bestPoint = getElementScrollPoint(scrollNode, best);
+            const cursorPoint = getElementScrollPoint(scrollNode, cursor);
+            const bestDistance = Math.abs(bestPoint.top - targetPoint.top) + Math.abs(bestPoint.left - targetPoint.left);
+            const cursorDistance = Math.abs(cursorPoint.top - targetPoint.top) + Math.abs(cursorPoint.left - targetPoint.left);
+            return cursorDistance < bestDistance ? cursor : best;
+          }}, cursors[0])
+          : cursors.at(-1) || null;
+        cursors.forEach((cursor) => {{
+          if (cursor !== latestCursor) {{
+            cursor.remove();
+          }}
+        }});
+
+        return latestCursor;
+      }}
+
+      function clearCursorMarkers(doc) {{
+        doc.querySelectorAll(".typst-svg-cursor").forEach((cursor) => cursor.remove());
+      }}
+
+      function scrollToTinymistCursor(doc) {{
+        const frameWindow = frame.contentWindow;
+        const cursorPosition = getCursorPosition();
+        if (!cursorPosition) {{
+          return false;
+        }}
+
+        const [page, x, y] = cursorPosition;
+        const scrollNode = doc.getElementById("typst-container-main");
+        const cursorPoint = scrollNode ? getCursorPointFromPosition(doc, scrollNode) : null;
+        if (scrollNode && scrollPointIntoView(scrollNode, cursorPoint)) {{
+          return true;
+        }}
+
+        const rootElem = doc.getElementById("typst-app")?.firstElementChild;
+        const container = doc.getElementById("typst-container");
+        const jumpHandler = container?.handleTypstLocation || frameWindow?.handleTypstLocation;
+        if (!rootElem || typeof jumpHandler !== "function") {{
+          return false;
+        }}
+
+        jumpHandler(rootElem, page, x, y);
+        return true;
+      }}
+
       const entrypointParam = {json.dumps(entrypoint)};
       const clientIdParam = {json.dumps(client_id)};
 
       async function revealCursor(payload) {{
+        const revealToken = ++activeRevealToken;
+        const previousDoc = frame.contentDocument;
+        if (previousDoc) {{
+          clearTinymistCursorState();
+          clearCursorMarkers(previousDoc);
+        }}
         const cursorUrl = new URL("cursor", window.location.href);
         cursorUrl.searchParams.set("entrypoint", entrypointParam);
         cursorUrl.searchParams.set("client_id", clientIdParam);
@@ -630,24 +941,22 @@ def make_wrapper_html(project_id: int, entrypoint: str = "main.typ", client_id: 
 
         const startedAt = performance.now();
         while (performance.now() - startedAt < 1600) {{
+          if (revealToken !== activeRevealToken) {{
+            return;
+          }}
+
           const doc = frame.contentDocument;
           const scrollNode = doc?.getElementById("typst-container-main");
-          const cursor = doc?.querySelector(".typst-svg-cursor");
+          const cursor = doc ? pruneCursorMarkers(doc, scrollNode) : null;
           if (doc && scrollNode && cursor) {{
             ensureFlashStyle(doc);
             cursor.classList.remove("olivame-preview-flash");
             void cursor.getBoundingClientRect();
             cursor.classList.add("olivame-preview-flash");
-
-            const cursorRect = cursor.getBoundingClientRect();
-            const scrollRect = scrollNode.getBoundingClientRect();
-            const targetTop =
-              cursorRect.top - scrollRect.top + scrollNode.scrollTop - scrollNode.clientHeight / 2;
-
-            scrollNode.scrollTo({{
-              top: Math.max(targetTop, 0),
-              behavior: "smooth",
-            }});
+            scrollPointIntoView(scrollNode, getElementScrollPoint(scrollNode, cursor));
+            return;
+          }}
+          if (doc && scrollToTinymistCursor(doc)) {{
             return;
           }}
 
@@ -785,6 +1094,14 @@ def make_bridge_script(project_id: int, entrypoint: str, client_id: str) -> str:
   function getTinymistDoc() {{
     const container = document.getElementById("typst-container");
     return container?.documents?.[0] || null;
+  }}
+
+  function clearTinymistCursorState() {{
+    const tinymistDoc = getTinymistDoc();
+    if (tinymistDoc?.impl) {{
+      tinymistDoc.impl.cursorPosition = null;
+      tinymistDoc.impl.cursorPaths = null;
+    }}
   }}
 
   function findNearestZoom(value) {{
@@ -941,13 +1258,224 @@ def make_bridge_script(project_id: int, entrypoint: str, client_id: str) -> str:
     document.head.appendChild(style);
   }}
 
-  function pruneCursorMarkers() {{
+  function getCursorPosition() {{
+    const tinymistDoc = getTinymistDoc();
+    const cursorPosition = tinymistDoc?.impl?.cursorPosition;
+    if (!Array.isArray(cursorPosition) || cursorPosition.length < 3) {{
+      return null;
+    }}
+
+    const page = Number(cursorPosition[0]);
+    const x = Number(cursorPosition[1]);
+    const y = Number(cursorPosition[2]);
+    if (!Number.isFinite(page) || !Number.isFinite(x) || !Number.isFinite(y)) {{
+      return null;
+    }}
+
+    return [page, x, y];
+  }}
+
+  function getElementScrollPoint(scrollNode, element) {{
+    const elementRect = element.getBoundingClientRect();
+    const scrollRect = scrollNode.getBoundingClientRect();
+    return {{
+      left: elementRect.left - scrollRect.left + scrollNode.scrollLeft + elementRect.width / 2,
+      top: elementRect.top - scrollRect.top + scrollNode.scrollTop + elementRect.height / 2,
+    }};
+  }}
+
+  function scrollPointIntoView(scrollNode, point) {{
+    if (!point) {{
+      return false;
+    }}
+
+    scrollNode.scrollTo({{
+      left: Math.max(point.left - scrollNode.clientWidth / 2, 0),
+      top: Math.max(point.top - scrollNode.clientHeight / 2, 0),
+      behavior: "smooth",
+    }});
+    return true;
+  }}
+
+  function findSvgPageElement(rootElem, pageNumber) {{
+    const pageElements = Array.from(rootElem?.children || []).filter((child) => {{
+      return child.classList?.contains("typst-page");
+    }});
+    if (pageElements.length > 0) {{
+      return pageElements[pageNumber - 1] || null;
+    }}
+
+    let nthPage = 0;
+    for (const child of rootElem?.children || []) {{
+      if (child.tagName?.toLowerCase() !== "g") {{
+        continue;
+      }}
+
+      nthPage += 1;
+      if (nthPage === pageNumber) {{
+        return child;
+      }}
+    }}
+
+    return null;
+  }}
+
+  function getCursorPointFromRenderedPage(scrollNode, cursorPosition) {{
+    const [page, x, y] = cursorPosition;
+    const rootElem = document.getElementById("typst-app")?.firstElementChild;
+    if (!rootElem) {{
+      return null;
+    }}
+
+    if (rootElem.getAttribute("data-render-mode") === "canvas") {{
+      const pageElement = Array.from(rootElem.querySelectorAll(".typst-page")).find((candidate) => {{
+        return Number(candidate.getAttribute("data-page-number")) === page - 1;
+      }});
+      const canvas = pageElement?.firstElementChild;
+      if (!canvas) {{
+        return null;
+      }}
+
+      const canvasRect = canvas.getBoundingClientRect();
+      const scrollRect = scrollNode.getBoundingClientRect();
+      const dataWidth = Number.parseFloat(canvas.getAttribute("data-page-width") || "0");
+      const dataHeight = Number.parseFloat(canvas.getAttribute("data-page-height") || "0");
+      if (!dataWidth || !dataHeight) {{
+        return null;
+      }}
+
+      return {{
+        left: canvasRect.left - scrollRect.left + scrollNode.scrollLeft + (x / dataWidth) * canvasRect.width,
+        top: canvasRect.top - scrollRect.top + scrollNode.scrollTop + (y / dataHeight) * canvasRect.height,
+      }};
+    }}
+
+    const pageElement = findSvgPageElement(rootElem, page);
+    if (!pageElement) {{
+      return null;
+    }}
+
+    const pageInner = document.querySelector(`.typst-page-inner[data-page-number="${{page - 1}}"]`);
+    const pageRect = (pageInner || pageElement).getBoundingClientRect();
+    const scrollRect = scrollNode.getBoundingClientRect();
+    const dataWidth = Number.parseFloat(
+      pageInner?.getAttribute("data-page-width") ||
+      rootElem.getAttribute("data-width") ||
+      "0"
+    );
+    const dataHeight = Number.parseFloat(
+      pageInner?.getAttribute("data-page-height") ||
+      rootElem.getAttribute("data-height") ||
+      "0"
+    );
+    if (!dataWidth || !dataHeight) {{
+      return null;
+    }}
+
+    return {{
+      left: pageRect.left - scrollRect.left + scrollNode.scrollLeft + (x / dataWidth) * pageRect.width,
+      top: pageRect.top - scrollRect.top + scrollNode.scrollTop + (y / dataHeight) * pageRect.height,
+    }};
+  }}
+
+  function getCursorPointFromDocumentLayout(scrollNode, cursorPosition) {{
+    const tinymistDoc = getTinymistDoc();
+    const impl = tinymistDoc?.impl;
+    const rootElem = document.getElementById("typst-app")?.firstElementChild;
+    let pagesInfo = null;
+    try {{
+      pagesInfo = impl?.kModule?.retrievePagesInfo?.();
+    }} catch {{
+      return null;
+    }}
+    if (!rootElem || !Array.isArray(pagesInfo) || pagesInfo.length === 0) {{
+      return null;
+    }}
+
+    const [page, x, y] = cursorPosition;
+    const pageIndex = page - 1;
+    const pageInfo = pagesInfo[pageIndex];
+    if (!pageInfo) {{
+      return null;
+    }}
+
+    const rootRect = rootElem.getBoundingClientRect();
+    const scrollRect = scrollNode.getBoundingClientRect();
+    const dataHeight = Number.parseFloat(rootElem.getAttribute("data-height") || "0");
+    const dataWidth = Number.parseFloat(rootElem.getAttribute("data-width") || "0");
+    if (!dataWidth || !dataHeight || !rootRect.width || !rootRect.height) {{
+      return null;
+    }}
+
+    const maxPageWidth = pagesInfo.reduce((maxWidth, current) => {{
+      return Math.max(maxWidth, Number(current.width) || 0);
+    }}, Number(pageInfo.width) || 1);
+    const containerWidth = impl.cachedDOMState?.width || scrollNode.clientWidth || maxPageWidth;
+    const computedScale = containerWidth ? containerWidth / maxPageWidth : 1;
+    const scale = 1 / ((impl.currentScaleRatio || 1) * computedScale);
+    const heightMargin = (impl.isContentPreview ? 6 : 5) * scale;
+    const fontSize = 12 * scale;
+
+    let accumulatedHeight = 0;
+    let pageTop = 0;
+    for (let index = 0; index <= pageIndex; index += 1) {{
+      const currentPage = pagesInfo[index];
+      const calculatedY = accumulatedHeight + (index === 0 ? 0 : heightMargin);
+      if (index === pageIndex) {{
+        pageTop = calculatedY;
+        break;
+      }}
+
+      let pageHeightEnd = Number(currentPage.height) || 0;
+      if (index + 1 !== pagesInfo.length) {{
+        pageHeightEnd += heightMargin;
+      }}
+      if (impl.isContentPreview) {{
+        pageHeightEnd += fontSize;
+      }}
+      accumulatedHeight = calculatedY + pageHeightEnd;
+    }}
+
+    const pageWidth = Number(pageInfo.width) || dataWidth;
+    const pageHeight = Number(pageInfo.height) || dataHeight;
+    const pageLeft = Math.max((maxPageWidth - pageWidth) / 2, 0);
+    const scaleX = rootRect.width / dataWidth;
+    const scaleY = rootRect.height / dataHeight;
+
+    return {{
+      left: rootRect.left - scrollRect.left + scrollNode.scrollLeft + (pageLeft + x) * scaleX,
+      top: rootRect.top - scrollRect.top + scrollNode.scrollTop + (pageTop + Math.min(y, pageHeight)) * scaleY,
+    }};
+  }}
+
+  function getCursorPointFromPosition(scrollNode) {{
+    const cursorPosition = getCursorPosition();
+    if (!cursorPosition) {{
+      return null;
+    }}
+
+    return (
+      getCursorPointFromRenderedPage(scrollNode, cursorPosition) ||
+      getCursorPointFromDocumentLayout(scrollNode, cursorPosition)
+    );
+  }}
+
+  function pruneCursorMarkers(scrollNode = null) {{
     const cursors = Array.from(document.querySelectorAll(".typst-svg-cursor"));
     if (cursors.length === 0) {{
       return null;
     }}
 
-    const latestCursor = cursors.at(-1) || null;
+    const targetPoint = scrollNode ? getCursorPointFromPosition(scrollNode) : null;
+    const latestCursor = targetPoint
+      ? cursors.reduce((best, cursor) => {{
+        const bestPoint = getElementScrollPoint(scrollNode, best);
+        const cursorPoint = getElementScrollPoint(scrollNode, cursor);
+        const bestDistance = Math.abs(bestPoint.top - targetPoint.top) + Math.abs(bestPoint.left - targetPoint.left);
+        const cursorDistance = Math.abs(cursorPoint.top - targetPoint.top) + Math.abs(cursorPoint.left - targetPoint.left);
+        return cursorDistance < bestDistance ? cursor : best;
+      }}, cursors[0])
+      : cursors.at(-1) || null;
     cursors.forEach((cursor) => {{
       if (cursor !== latestCursor) {{
         cursor.remove();
@@ -957,6 +1485,34 @@ def make_bridge_script(project_id: int, entrypoint: str, client_id: str) -> str:
     return latestCursor;
   }}
 
+  function clearCursorMarkers() {{
+    document.querySelectorAll(".typst-svg-cursor").forEach((cursor) => cursor.remove());
+  }}
+
+  function scrollToTinymistCursor() {{
+    const cursorPosition = getCursorPosition();
+    if (!cursorPosition) {{
+      return false;
+    }}
+
+    const [page, x, y] = cursorPosition;
+    const scrollNode = document.getElementById("typst-container-main");
+    const cursorPoint = scrollNode ? getCursorPointFromPosition(scrollNode) : null;
+    if (scrollNode && scrollPointIntoView(scrollNode, cursorPoint)) {{
+      return true;
+    }}
+
+    const rootElem = document.getElementById("typst-app")?.firstElementChild;
+    const container = document.getElementById("typst-container");
+    const jumpHandler = container?.handleTypstLocation || window.handleTypstLocation;
+    if (!rootElem || typeof jumpHandler !== "function") {{
+      return false;
+    }}
+
+    jumpHandler(rootElem, page, x, y);
+    return true;
+  }}
+
   function scheduleCursorCleanup() {{
     if (cursorCleanupFrame) {{
       cancelAnimationFrame(cursorCleanupFrame);
@@ -964,7 +1520,7 @@ def make_bridge_script(project_id: int, entrypoint: str, client_id: str) -> str:
 
     cursorCleanupFrame = requestAnimationFrame(() => {{
       cursorCleanupFrame = 0;
-      pruneCursorMarkers();
+      pruneCursorMarkers(document.getElementById("typst-container-main"));
     }});
   }}
 
@@ -999,6 +1555,8 @@ def make_bridge_script(project_id: int, entrypoint: str, client_id: str) -> str:
 
   async function revealCursor(payload) {{
     const revealToken = ++activeRevealToken;
+    clearTinymistCursorState();
+    clearCursorMarkers();
     const cursorUrl = new URL("cursor", window.location.href);
     cursorUrl.searchParams.set("entrypoint", entrypointParam);
     cursorUrl.searchParams.set("client_id", clientIdParam);
@@ -1025,22 +1583,16 @@ def make_bridge_script(project_id: int, entrypoint: str, client_id: str) -> str:
       }}
 
       const scrollNode = document.getElementById("typst-container-main");
-      const cursor = pruneCursorMarkers();
+      const cursor = pruneCursorMarkers(scrollNode);
       if (scrollNode && cursor) {{
         ensureFlashStyle();
         cursor.classList.remove("olivame-preview-flash");
         void cursor.getBoundingClientRect();
         cursor.classList.add("olivame-preview-flash");
-
-        const cursorRect = cursor.getBoundingClientRect();
-        const scrollRect = scrollNode.getBoundingClientRect();
-        const targetTop =
-          cursorRect.top - scrollRect.top + scrollNode.scrollTop - scrollNode.clientHeight / 2;
-
-        scrollNode.scrollTo({{
-          top: Math.max(targetTop, 0),
-          behavior: "smooth",
-        }});
+        scrollPointIntoView(scrollNode, getElementScrollPoint(scrollNode, cursor));
+        return;
+      }}
+      if (scrollToTinymistCursor()) {{
         return;
       }}
 
@@ -1296,11 +1848,17 @@ class PreviewSession:
             self._current_diagnostic_lines.append(stripped)
             return
 
-    async def ensure_running(self, snapshot: dict[str, object] | None = None) -> None:
+    async def ensure_running(
+        self,
+        snapshot: dict[str, object] | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> None:
         now = time.monotonic()
         self.last_access = now
         if (
-            snapshot is None
+            not force_refresh
+            and snapshot is None
             and self.is_healthy()
             and self.workspace_revision
             and now - self.last_snapshot_check < SNAPSHOT_REFRESH_SECONDS
@@ -1636,10 +2194,9 @@ async def update_cursor(
 ) -> JSONResponse:
     normalized_client_id = normalize_client_id(client_id)
     session = await manager.get_session(project_id, entrypoint, normalized_client_id)
+    await session.ensure_running(force_refresh=True)
 
-    file_path = Path(cursor.path)
-    if not file_path.is_absolute():
-        file_path = session.project_dir / file_path
+    file_path = resolve_cursor_file_path(project_id, session.project_dir, cursor.path)
 
     await session.send_control(
         {
@@ -1676,6 +2233,7 @@ async def proxy_data_http(project_id: int, request: Request, asset_path: str = "
 
     if "text/html" in content_type:
         html_text = content.decode("utf-8", errors="replace")
+        html_text = patch_tinymist_preview_html(html_text)
         html_text = html_text.replace(
             HTML_WS_SNIPPET,
             (

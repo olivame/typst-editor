@@ -213,6 +213,7 @@ class FileUpdate(BaseModel):
 
 class RealtimeFlushRequest(BaseModel):
     create_revision: bool = True
+    force: bool = True
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -1865,11 +1866,11 @@ def compile_project_snapshot(db: Session, project_id: int, entrypoint: str, entr
     }
 
 
-def flush_realtime_room(file_id: int):
+def flush_realtime_room(file_id: int, *, force: bool = True):
     try:
         response = requests.post(
             build_realtime_internal_url('/internal/realtime/flush-room', file_id),
-            json={'file_id': file_id},
+            json={'file_id': file_id, 'force': force},
             headers={'X-Realtime-Secret': REALTIME_SECRET},
             timeout=5,
         )
@@ -2982,7 +2983,10 @@ def force_flush_file_realtime_state(
         raise HTTPException(status_code=400, detail='Binary files do not have realtime state')
 
     ensure_project_baseline_revision(db, entry.project_id)
-    flush_payload = flush_realtime_room(entry.id)
+    flush_payload = flush_realtime_room(
+        entry.id,
+        force=payload.force if payload is not None else True,
+    )
     db.refresh(entry)
 
     revision = None
