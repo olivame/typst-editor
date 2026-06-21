@@ -4,6 +4,13 @@
 
 ## 快速启动
 
+当前仓库提供两种最常用的运行方式：
+
+- 单机开发/验证：`compose.yaml + compose.dev.yaml`
+- 多机拆分部署：`compose.distributed.yaml`
+
+### 单机开发/验证
+
 1. 复制环境变量
 
 ```bash
@@ -22,7 +29,7 @@ cp .env.example .env
 ./compose-smart.sh -f compose.yaml -f compose.dev.yaml build
 ```
 
-如果已经构建完成，需要用新镜像重建并重启服务：
+如果已经构建完成，需要按新代码重建并重启：
 
 ```bash
 ./compose-smart.sh -f compose.yaml -f compose.dev.yaml up -d --force-recreate
@@ -34,16 +41,27 @@ cp .env.example .env
 - API: `http://localhost:8000`
 - API Docs: `http://localhost:8000/docs`
 
+### 单机接近生产的验证方式
+
+如果你想验证“不挂源码卷、只跑镜像”的形态，可以只使用基础编排：
+
+```bash
+cp .env.example .env
+docker compose --env-file .env -f compose.yaml up -d --build
+```
+
+这一模式仍然适合当前项目的单机验证，但 `apps/web` 容器目前跑的是 Vite 服务，更适合作为现阶段验证入口，而不是最终生产网关形态。
+
 ## 模块划分
 
 ### 基础服务
 
-- `apps/web`: React/Vite 前端
+- `apps/web`: React/Vite 前端与当前验证用入口代理
 - `apps/api`: FastAPI 接口层和项目存储边界
 - `services/compiler`: Typst 编译服务，通过 API 传入的项目快照工作
-- `services/preview`: Tinymist 预览服务，通过 API 内部快照工作
+- `services/preview`: Tinymist 预览服务，通过 API 内部快照工作；同一项目同一入口会共享一个 Tinymist session
 - `services/realtime`: Yjs 协同编辑服务，通过 API 内部接口 resolve/flush
-- `storage/projects`: 单机/dev 本地缓存目录；项目文件、二进制上传和 PDF 产物的权威数据在数据库中
+- `storage/projects`: 单机/dev 本地缓存目录；项目文件、二进制上传和 PDF 产物的权威数据仍然在数据库中，磁盘不是 correctness 依赖
 
 ### 前端模块
 
@@ -107,6 +125,13 @@ API_INTERNAL_HOST=172.30.0.10
 
 多机部署使用 `compose.distributed.yaml`。它不声明 Docker 内部服务依赖，也不挂载共享项目目录；每台机器只启动自己的 profile，服务之间通过 `.env` 中的 IP+端口访问。
 
+推荐先按这个拓扑落地：
+
+- 公网：只暴露 `web`
+- 内网：`api`、`preview`、`realtime`、`compiler`、`db`
+- 浏览器：统一访问 `web`
+- `web`：反向代理 `/api`、`/preview`、`/realtime`
+
 1. 在每台机器复制并填写同一份环境变量：
 
 ```bash
@@ -129,36 +154,54 @@ docker compose --env-file .env -f compose.distributed.yaml --profile realtime up
 docker compose --env-file .env -f compose.distributed.yaml --profile web up -d --build web
 ```
 
-建议先只开放 Web 端口给浏览器，API/Preview/Realtime/Compiler/DB 只在内网开放。此模式下 `VITE_*_HOST` 留空，填写 `API_PROXY_HOST`、`PREVIEW_PROXY_HOST`、`REALTIME_PROXY_HOST` 为对应内网 IP。
+4. 网络暴露建议：
 
-如果 Web 自己要代理多个 preview/realtime shard，则不要只填单个 `PREVIEW_PROXY_HOST` / `REALTIME_PROXY_HOST`，而是直接填内部可达 URL 列表：
+- 最稳妥：浏览器只访问 `web`
+- `api/preview/realtime/compiler/db` 只开放内网端口
+- `preview` 不要直接裸暴露公网端口；它应该被 `web` 或受控网关代理
+
+如果浏览器只访问 `web`，可以不设置 `VITE_*_HOST`，而是让 `web` 代理到内网服务：
+
+```env
+API_PROXY_HOST=10.0.0.10
+PREVIEW_PROXY_HOST=10.0.0.12
+REALTIME_PROXY_HOST=10.0.0.13
+```
+
+如果要让 `web` 代理多个 preview/realtime shard，则不要只填单个 `PREVIEW_PROXY_HOST` / `REALTIME_PROXY_HOST`，而是直接填内部可达 URL 列表：
 
 ```env
 PREVIEW_PROXY_TARGETS=http://10.0.0.12:8002,http://10.0.0.16:8002
 REALTIME_PROXY_TARGETS=ws://10.0.0.13:8003,ws://10.0.0.14:8003
 ```
 
-Web 会按 `project_id` 把 `/preview/sessions/{project_id}/...` 稳定代理到对应 preview shard，并按 `fileId` 把 `/realtime/...?...fileId=` 稳定代理到对应 realtime shard。这样浏览器仍然只访问 Web 一个入口。
+当前项目里的 `web` 会按下面的规则稳定代理：
 
-当前横向扩容边界：API 已经不需要共享盘，可以多实例共用同一个 DB；Compiler 是无状态服务，可以放到负载均衡后面；Realtime 可以用 `REALTIME_BROWSER_URLS` + `REALTIME_INTERNAL_URLS` 做按文件稳定分片；Preview 可以用 `PREVIEW_BROWSER_URLS` + `PREVIEW_INTERNAL_URLS` 做按项目稳定分片，同一项目同一 entrypoint 在同一节点上会共享一个 Tinymist session，但 session 仍然只保存在各自实例内存里，不支持跨节点迁移。
+- `/preview/sessions/{project_id}/...`：按 `project_id` 选 preview shard
+- `/realtime/...?...fileId=`：按 `fileId` 选 realtime shard
 
-Preview 多实例分片时，两组 URL 也必须一一对应，顺序必须稳定，而且 `PREVIEW_BROWSER_URLS` 必须是浏览器可直连的地址。例如：
+当前横向扩容边界：
+
+- `api` 已经不需要共享盘，可以多实例共用同一个 DB
+- `compiler` 无状态，可以放到负载均衡后面
+- `realtime` 可以用 `REALTIME_BROWSER_URLS` + `REALTIME_INTERNAL_URLS` 做按文件稳定分片
+- `preview` 可以用 `PREVIEW_BROWSER_URLS` + `PREVIEW_INTERNAL_URLS` 做按项目稳定分片
+- 同一项目同一 entrypoint 在同一 preview 节点上会共享一个 Tinymist session
+- `preview` session 仍然只保存在实例内存里，不支持跨节点迁移，所以同一个 `project_id` 必须稳定落到同一节点
+
+Preview 多实例分片时，两组 URL 必须一一对应，顺序必须稳定，而且 `PREVIEW_BROWSER_URLS` 必须是浏览器可直连的地址。例如：
 
 ```env
 PREVIEW_BROWSER_URLS=http://10.0.0.12:8002,http://10.0.0.16:8002
 PREVIEW_INTERNAL_URLS=http://10.0.0.12:8002,http://10.0.0.16:8002
 ```
 
-API 会按 `project_id` 选择固定 preview 节点，并把该节点的浏览器地址返回给前端；如果不配置 `PREVIEW_BROWSER_URLS`，前端继续使用现有 `VITE_PREVIEW_*` 或 `/preview` 回退。现在如果 `web` 配了 `PREVIEW_PROXY_TARGETS`，`/preview` 也可以按项目稳定代理到多个 preview shard。
-
-Realtime 多实例分片时，两组 URL 必须一一对应，顺序必须稳定。例如：
+Realtime 多实例分片时，两组 URL 也必须一一对应，顺序必须稳定。例如：
 
 ```env
 REALTIME_BROWSER_URLS=ws://10.0.0.13:8003,ws://10.0.0.14:8003
 REALTIME_INTERNAL_URLS=http://10.0.0.13:8003,http://10.0.0.14:8003
 ```
-
-API 会按 `file_id` 选择固定 realtime 节点，并把浏览器可访问的 shard URL 返回给前端；如果不配置 `REALTIME_BROWSER_URLS`，前端继续使用现有 `VITE_REALTIME_*` 或 `/realtime` 代理。
 
 ## 复现标准
 
