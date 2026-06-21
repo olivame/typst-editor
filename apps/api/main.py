@@ -42,6 +42,24 @@ TEXT_ENTRY_KIND = 'file'
 FOLDER_ENTRY_KIND = 'folder'
 ALLOWED_PROJECT_STATUSES = {'active', 'archived', 'trashed'}
 SESSION_TTL_DAYS = 30
+BINARY_FILE_EXTENSIONS = {
+    '.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.tif', '.tiff', '.webp',
+    '.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav',
+    '.avi', '.m4v', '.mov', '.mp4', '.ogv', '.webm',
+    '.eot', '.otf', '.ttf', '.woff', '.woff2',
+    '.pdf',
+    '.7z', '.gz', '.rar', '.tar', '.tgz', '.zip',
+}
+BINARY_MEDIA_TYPES = {
+    'application/gzip',
+    'application/octet-stream',
+    'application/pdf',
+    'application/x-7z-compressed',
+    'application/x-rar-compressed',
+    'application/x-tar',
+    'application/zip',
+}
+BINARY_MEDIA_TYPE_PREFIXES = ('audio/', 'font/', 'image/', 'video/')
 ROOT_ADMIN_EMAILS = {
     current.strip().lower()
     for current in os.getenv('ROOT_ADMIN_EMAILS', '').split(',')
@@ -213,6 +231,27 @@ def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def normalize_media_type(value: str | None):
+    return (value or '').split(';', 1)[0].strip().lower()
+
+
+def should_treat_file_as_binary(relative_path: str, media_type: str | None = None):
+    suffix = PurePosixPath(relative_path or '').suffix.lower()
+    if suffix in BINARY_FILE_EXTENSIONS:
+        return True
+
+    guessed_media_type, _ = mimetypes.guess_type(relative_path or '')
+    normalized_media_type = normalize_media_type(media_type or guessed_media_type)
+    return normalized_media_type in BINARY_MEDIA_TYPES or normalized_media_type.startswith(BINARY_MEDIA_TYPE_PREFIXES)
+
+
+def is_binary_entry(entry: models.File):
+    return bool(
+        entry.kind == TEXT_ENTRY_KIND
+        and (entry.is_binary or should_treat_file_as_binary(entry.path))
+    )
+
+
 def normalize_email(email: str):
     normalized = (email or '').strip().lower()
     if not normalized or '@' not in normalized:
@@ -354,12 +393,13 @@ def serialize_tag(tag: models.Tag):
 
 
 def serialize_entry(entry: models.File):
+    effective_is_binary = is_binary_entry(entry)
     return {
         'id': entry.id,
         'name': entry.name,
         'path': entry.path,
         'kind': entry.kind,
-        'is_binary': entry.is_binary,
+        'is_binary': effective_is_binary,
         'content_revision': entry.content_revision or 0,
         'project_id': entry.project_id,
     }
@@ -372,7 +412,7 @@ def search_project_entries(entries: list[models.File], query: str):
 
     results = []
     for entry in entries:
-        if entry.kind != TEXT_ENTRY_KIND or entry.is_binary:
+        if entry.kind != TEXT_ENTRY_KIND or is_binary_entry(entry):
             continue
 
         lines = (entry.content or '').splitlines()
@@ -504,7 +544,7 @@ def resolve_project_entrypoint(entries: list[models.File], raw_path: str):
     typ_entries = [
         entry
         for entry in entries
-        if entry.kind == TEXT_ENTRY_KIND and not entry.is_binary and entry.path.endswith('.typ')
+        if entry.kind == TEXT_ENTRY_KIND and not is_binary_entry(entry) and entry.path.endswith('.typ')
     ]
     if not typ_entries:
         raise HTTPException(status_code=404, detail='No .typ entrypoint found in project')
@@ -689,6 +729,40 @@ def read_binary_entry_content(
     )
 
 
+def read_effective_binary_entry_content(
+    db: Session,
+    project_id: int,
+    entry: models.File,
+    missing_status_code: int = 500,
+):
+    if entry.is_binary:
+        return read_binary_entry_content(db, project_id, entry, missing_status_code)
+
+    disk_path = get_entry_disk_path(project_id, entry.path)
+    if disk_path.exists() and disk_path.is_file():
+        try:
+            raw_content = disk_path.read_bytes()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f'Failed to read legacy binary cache: "{entry.path}"',
+            ) from exc
+    else:
+        if not entry.content:
+            raise HTTPException(
+                status_code=missing_status_code,
+                detail=f'Binary file content is unavailable: "{entry.path}"',
+            )
+        raw_content = (entry.content or '').encode('utf-8')
+
+    entry.is_binary = True
+    entry.content = encode_binary_content(raw_content)
+    entry.realtime_state = ''
+    db.commit()
+    db.refresh(entry)
+    return raw_content
+
+
 def read_entry_content_bytes(
     db: Session,
     project_id: int,
@@ -697,8 +771,8 @@ def read_entry_content_bytes(
 ):
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have file content')
-    if entry.is_binary:
-        return read_binary_entry_content(db, project_id, entry, missing_status_code)
+    if is_binary_entry(entry):
+        return read_effective_binary_entry_content(db, project_id, entry, missing_status_code)
     return (entry.content or '').encode('utf-8')
 
 
@@ -1109,12 +1183,15 @@ def sync_project_workspace(project_id: int, entries: list[models.File]):
             continue
 
         disk_path.parent.mkdir(parents=True, exist_ok=True)
-        if entry.is_binary:
+        if is_binary_entry(entry):
             if entry.content:
-                try:
-                    raw_content = decode_binary_content(entry.content, entry.path)
-                except HTTPException:
-                    continue
+                if entry.is_binary:
+                    try:
+                        raw_content = decode_binary_content(entry.content, entry.path)
+                    except HTTPException:
+                        continue
+                else:
+                    raw_content = entry.content.encode('utf-8')
                 write_bytes_file_atomically(disk_path, raw_content)
             continue
 
@@ -1158,9 +1235,14 @@ def ensure_disk_entry(project_id: int, entry: models.File):
         return disk_path
 
     disk_path.parent.mkdir(parents=True, exist_ok=True)
-    if entry.is_binary:
+    if is_binary_entry(entry):
         if entry.content:
-            write_bytes_file_atomically(disk_path, decode_binary_content(entry.content, entry.path))
+            raw_content = (
+                decode_binary_content(entry.content, entry.path)
+                if entry.is_binary
+                else entry.content.encode('utf-8')
+            )
+            write_bytes_file_atomically(disk_path, raw_content)
     else:
         write_text_file_atomically(disk_path, entry.content or '')
 
@@ -1201,7 +1283,7 @@ def build_project_snapshot_revision(db: Session, project_id: int, entries: list[
         relative_path = str(PurePosixPath(entry.path))
         update_snapshot_digest(digest, relative_path)
         update_snapshot_digest(digest, entry.kind)
-        update_snapshot_digest(digest, 'binary' if entry.is_binary else 'text')
+        update_snapshot_digest(digest, 'binary' if is_binary_entry(entry) else 'text')
 
         if entry.kind == FOLDER_ENTRY_KIND:
             continue
@@ -1311,6 +1393,7 @@ def serialize_realtime_session(
     current_user: models.User,
 ):
     ensure_project_access(db, entry.project, current_user)
+    effective_is_binary = is_binary_entry(entry)
 
     return {
         'protocol_version': 1,
@@ -1322,10 +1405,10 @@ def serialize_realtime_session(
             'path': entry.path,
             'name': entry.name,
             'kind': entry.kind,
-            'is_binary': entry.is_binary,
+            'is_binary': effective_is_binary,
             'content_revision': entry.content_revision or 0,
-            'content': '' if entry.is_binary else (entry.content or ''),
-            'realtime_state': '' if entry.is_binary else (entry.realtime_state or ''),
+            'content': '' if effective_is_binary else (entry.content or ''),
+            'realtime_state': '' if effective_is_binary else (entry.realtime_state or ''),
             'updated_at': entry.updated_at,
         },
         'user': serialize_user(current_user),
@@ -1637,14 +1720,19 @@ def copy_project(
 
     source_entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     for source_entry in source_entries:
+        copied_is_binary = is_binary_entry(source_entry)
+        copied_content = source_entry.content
+        if copied_is_binary:
+            copied_content = encode_binary_content(read_entry_content_bytes(db, project_id, source_entry))
+
         db.add(
             models.File(
                 project_id=copied_project.id,
                 name=source_entry.name,
                 path=source_entry.path,
                 kind=source_entry.kind,
-                is_binary=source_entry.is_binary,
-                content=source_entry.content,
+                is_binary=copied_is_binary,
+                content=copied_content,
             )
         )
     db.commit()
@@ -1834,12 +1922,15 @@ def upload_files(
         ensure_parent_folders(db, project_id, get_parent_path(relative_path), entries_by_path)
 
         binary_content = uploaded_file.file.read()
-        try:
-            text_content = binary_content.decode('utf-8')
-            is_binary = False
-        except UnicodeDecodeError:
+        is_binary = should_treat_file_as_binary(relative_path, uploaded_file.content_type)
+        if is_binary:
             text_content = ''
-            is_binary = True
+        else:
+            try:
+                text_content = binary_content.decode('utf-8')
+            except UnicodeDecodeError:
+                text_content = ''
+                is_binary = True
 
         stored_content = encode_binary_content(binary_content) if is_binary else text_content
         cache_binary_file(project_id, relative_path, binary_content)
@@ -1875,14 +1966,15 @@ def get_file_content(
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have editable content')
 
+    effective_is_binary = is_binary_entry(entry)
     return {
         'id': entry.id,
         'name': entry.name,
         'path': entry.path,
         'kind': entry.kind,
-        'is_binary': entry.is_binary,
+        'is_binary': effective_is_binary,
         'content_revision': entry.content_revision or 0,
-        'content': '' if entry.is_binary else (entry.content or ''),
+        'content': '' if effective_is_binary else (entry.content or ''),
     }
 
 
@@ -1951,7 +2043,7 @@ def get_file_realtime_session(
     entry = get_entry_or_404(db, file_id)
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have realtime sessions')
-    if entry.is_binary:
+    if is_binary_entry(entry):
         raise HTTPException(status_code=400, detail='Binary files do not have realtime sessions')
 
     return serialize_realtime_session(db, entry, current_user)
@@ -1967,7 +2059,7 @@ def force_flush_file_realtime_state(
     ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have editable content')
-    if entry.is_binary:
+    if is_binary_entry(entry):
         raise HTTPException(status_code=400, detail='Binary files do not have realtime state')
 
     flush_payload = flush_realtime_room(entry.id)
@@ -1996,7 +2088,7 @@ def update_file_content(
     ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have editable content')
-    if entry.is_binary:
+    if is_binary_entry(entry):
         raise HTTPException(status_code=400, detail='Binary files cannot be edited inline')
 
     current_revision = entry.content_revision or 0
@@ -2169,7 +2261,7 @@ def resolve_realtime_file_room(
     entry = get_entry_or_404(db, payload.file_id)
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have realtime rooms')
-    if entry.is_binary:
+    if is_binary_entry(entry):
         raise HTTPException(status_code=400, detail='Binary files do not have realtime rooms')
 
     return serialize_realtime_session(db, entry, current_user)
@@ -2184,7 +2276,7 @@ def flush_realtime_file(
     entry = get_entry_or_404(db, payload.file_id)
     if entry.kind == FOLDER_ENTRY_KIND:
         raise HTTPException(status_code=400, detail='Folders do not have editable content')
-    if entry.is_binary:
+    if is_binary_entry(entry):
         raise HTTPException(status_code=400, detail='Binary files cannot be flushed as text')
 
     current_revision = entry.content_revision or 0

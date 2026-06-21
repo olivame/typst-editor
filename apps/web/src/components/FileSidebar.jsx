@@ -284,7 +284,8 @@ export default function FileSidebar({
   const [createMode, setCreateMode] = useState('')
   const [draftName, setDraftName] = useState('')
   const [actionError, setActionError] = useState('')
-  const [menuPath, setMenuPath] = useState('')
+  const [menuState, setMenuState] = useState({ projectId, path: '' })
+  const menuPath = menuState.projectId === projectId ? menuState.path : ''
 
   const tree = useMemo(() => buildTree(entries), [entries])
   const defaultCollapsedFolders = useMemo(() => collectInitialCollapsedFolders(tree), [tree])
@@ -356,10 +357,6 @@ export default function FileSidebar({
     })
   }, [onCollapsedFoldersChange, selectedEntry])
 
-  useEffect(() => {
-    setMenuPath('')
-  }, [projectId])
-
   const openCreateForm = (mode) => {
     setCreateMode(mode)
     setDraftName('')
@@ -373,13 +370,19 @@ export default function FileSidebar({
   }
 
   const openMenu = (path) => {
-    setMenuPath(path)
+    setMenuState({ projectId, path })
+  }
+
+  const closeMenu = () => {
+    setMenuState((current) => (
+      current.path ? { ...current, path: '' } : current
+    ))
   }
 
   useEffect(() => {
     const handlePointerDown = (event) => {
       if (!sidebarRef.current?.contains(event.target)) {
-        setMenuPath('')
+        closeMenu()
       }
     }
 

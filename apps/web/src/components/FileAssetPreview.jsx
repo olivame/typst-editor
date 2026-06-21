@@ -1,4 +1,6 @@
+import { useEffect, useState } from 'react'
 import PdfPreview from './PdfPreview'
+import { getAuthToken } from '../services/projects'
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif'])
 const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv'])
@@ -21,6 +23,78 @@ function getPreviewKind(path) {
 
 export default function FileAssetPreview({ path, src, zoom = 1 }) {
   const previewKind = getPreviewKind(path)
+  const [assetUrl, setAssetUrl] = useState('')
+  const [assetState, setAssetState] = useState('idle')
+  const [assetError, setAssetError] = useState('')
+
+  useEffect(() => {
+    if (!src || previewKind === 'unknown') {
+      setAssetUrl('')
+      setAssetState('idle')
+      setAssetError('')
+      return undefined
+    }
+
+    let cancelled = false
+    let objectUrl = ''
+    const controller = new AbortController()
+
+    async function loadAsset() {
+      setAssetUrl('')
+      setAssetState('loading')
+      setAssetError('')
+
+      try {
+        const token = getAuthToken()
+        const response = await fetch(src, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          throw new Error(`Failed to load file preview (${response.status})`)
+        }
+
+        const blob = await response.blob()
+        if (cancelled) return
+
+        objectUrl = window.URL.createObjectURL(blob)
+        setAssetUrl(objectUrl)
+        setAssetState('ready')
+      } catch (error) {
+        if (cancelled || error.name === 'AbortError') return
+        setAssetUrl('')
+        setAssetState('error')
+        setAssetError(error?.message || 'Preview unavailable')
+      }
+    }
+
+    void loadAsset()
+
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (objectUrl) {
+        window.URL.revokeObjectURL(objectUrl)
+      }
+    }
+  }, [src, previewKind])
+
+  if (previewKind !== 'unknown' && assetState !== 'ready') {
+    return (
+      <div style={styles.assetViewport}>
+        <div style={styles.unsupportedCard}>
+          <div style={styles.unsupportedTitle}>
+            {assetState === 'error' ? 'Preview unavailable' : 'Loading preview'}
+          </div>
+          {assetState === 'error' ? (
+            <div style={styles.unsupportedText}>{assetError}</div>
+          ) : null}
+          <div style={styles.unsupportedMeta}>{path}</div>
+        </div>
+      </div>
+    )
+  }
 
   if (previewKind === 'image') {
     return (
@@ -32,7 +106,7 @@ export default function FileAssetPreview({ path, src, zoom = 1 }) {
               transform: `scale(${zoom})`,
             }}
           >
-            <img alt={path} src={src} style={styles.imagePreview} />
+            <img alt={path} src={assetUrl} style={styles.imagePreview} />
           </div>
         </div>
       </div>
@@ -49,7 +123,7 @@ export default function FileAssetPreview({ path, src, zoom = 1 }) {
               transform: `scale(${zoom})`,
             }}
           >
-            <video controls src={src} style={styles.mediaPreview} />
+            <video controls src={assetUrl} style={styles.mediaPreview} />
           </div>
         </div>
       </div>
@@ -61,14 +135,14 @@ export default function FileAssetPreview({ path, src, zoom = 1 }) {
       <div style={styles.assetViewport}>
         <div style={styles.audioShell}>
           <div style={styles.audioLabel}>Audio Preview</div>
-          <audio controls src={src} style={styles.audioPreview} />
+          <audio controls src={assetUrl} style={styles.audioPreview} />
         </div>
       </div>
     )
   }
 
   if (previewKind === 'pdf') {
-    return <PdfPreview src={src} zoom={zoom} />
+    return <PdfPreview src={assetUrl} zoom={zoom} />
   }
 
   return (
