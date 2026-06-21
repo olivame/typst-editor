@@ -36,6 +36,15 @@
     - `updated_by_id`
   - 用于把共享文档最新内容落回数据库和工作目录
 
+### realtime 内部房间重置
+
+- `POST /internal/realtime/reset-room`
+  - Header:
+    - `X-Realtime-Secret: <secret>`
+  - Body:
+    - `file_id`
+  - 用于版本恢复后关闭并销毁指定文件的内存房间，客户端会重新连接并从数据库内容初始化
+
 ## 当前状态
 
 当前 `server.js` 已经实现：
@@ -45,6 +54,7 @@
 - 握手阶段通过 API 解析 `file_id + Bearer token`
 - 文档变更后的 debounce flush
 - 房间无人时的 disconnect flush 和空闲清理
+- 版本恢复后的房间 reset，避免旧 Yjs 状态覆盖恢复内容
 
 当前还没有实现：
 

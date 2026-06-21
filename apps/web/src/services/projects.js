@@ -247,19 +247,24 @@ export async function getFileRealtimeSession(fileId) {
   return apiFetch(`/files/${fileId}/realtime-session`)
 }
 
-export async function flushRealtimeFile(fileId) {
+export async function flushRealtimeFile(fileId, options = {}) {
   return apiFetch(`/files/${fileId}/realtime-flush`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      create_revision: options.createRevision !== false,
+    }),
   })
 }
 
-export async function updateFileContent(fileId, content, contentRevision = null) {
+export async function updateFileContent(fileId, content, contentRevision = null, options = {}) {
   return apiFetch(`/files/${fileId}/content`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       content,
       content_revision: contentRevision,
+      create_revision: options.createRevision !== false,
     }),
   })
 }
@@ -275,6 +280,25 @@ export async function renameProjectEntry(fileId, path) {
 export async function deleteProjectEntry(fileId) {
   return apiFetch(`/files/${fileId}`, {
     method: 'DELETE',
+  })
+}
+
+export async function listProjectRevisions(projectId) {
+  return apiFetch(`/projects/${projectId}/revisions`)
+}
+
+export async function getProjectRevision(projectId, revisionId) {
+  return apiFetch(`/projects/${projectId}/revisions/${revisionId}`)
+}
+
+export async function restoreProjectRevision(projectId, revisionId, payload = {}) {
+  return apiFetch(`/projects/${projectId}/revisions/${revisionId}/restore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      label: payload.label || '',
+      description: payload.description || '',
+    }),
   })
 }
 

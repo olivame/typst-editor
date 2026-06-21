@@ -4,7 +4,9 @@ import DiagnosticsSidebar from './components/DiagnosticsSidebar'
 import EditorToolbar from './components/EditorToolbar'
 import FileAssetPreview from './components/FileAssetPreview'
 import FileSidebar from './components/FileSidebar'
+import HistorySidebar from './components/HistorySidebar'
 import OutlineSidebar from './components/OutlineSidebar'
+import RevisionDiffView from './components/RevisionDiffView'
 import SearchSidebar from './components/SearchSidebar'
 import TinymistPreview from './components/TinymistPreview'
 import { REALTIME_URL } from './config/realtime'
@@ -24,6 +26,7 @@ import {
   listAvailableFonts,
   listProjectFiles,
   renameProjectEntry,
+  restoreProjectRevision,
   searchProjectFiles,
   updateFileContent,
   uploadProjectFiles,
@@ -75,6 +78,7 @@ function resolveRealtimeUrl(session) {
 const RAIL_ITEMS = [
   { id: 'files', label: '≡', title: 'Files' },
   { id: 'search', label: '⌕', title: 'Search' },
+  { id: 'history', label: '↺', title: 'History' },
   { id: 'outline', label: '☷', title: 'Outline' },
   { id: 'errors', label: <DiagnosticsRailGlyph />, title: 'Diagnostics' },
   { id: 'settings', label: '⚙', title: 'Settings' },
@@ -155,6 +159,16 @@ function formatRealtimeConnectionLabel(status) {
     default:
       return 'Realtime idle'
   }
+}
+
+function getRevisionTitle(revision) {
+  const label = `${revision?.label || ''}`.trim()
+  return label || `Revision ${revision?.id || ''}`.trim()
+}
+
+function getHistoryPanePath(entry, side) {
+  const state = entry?.diff?.[side] || null
+  return state?.path || entry?.path || ''
 }
 
 function areFolderStatesEqual(left, right) {
@@ -964,6 +978,7 @@ export default function Editor({
   const referenceButtonRef = useRef(null)
   const referenceMenuRef = useRef(null)
   const accessFailureHandledRef = useRef(false)
+  const historyDiffScrollSyncRef = useRef({ before: null, after: null, isSyncing: false })
   const [files, setFiles] = useState([])
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [currentFile, setCurrentFile] = useState(null)
@@ -972,6 +987,7 @@ export default function Editor({
   const [content, setContent] = useState('')
   const [statusMessage, setStatusMessage] = useState('')
   const [sidebarMode, setSidebarMode] = useState('files')
+  const [historySelection, setHistorySelection] = useState(null)
   const [fileTreeCollapsedStateByProject, setFileTreeCollapsedStateByProject] = useState({})
   const [selectedEntryPathByProject, setSelectedEntryPathByProject] = useState({})
   const [editorZoom, setEditorZoom] = useState(1)
@@ -1296,17 +1312,21 @@ export default function Editor({
     }
   }, [activePreviewPath, files, projectId])
 
-  async function persistCurrentFileContent(nextContent) {
+  async function persistCurrentFileContent(nextContent, options = {}) {
     if (!currentFile) return null
 
     if (realtimeSession && realtimeConnectionStatus === 'connected') {
-      return flushRealtimeFile(currentFile.id)
+      return flushRealtimeFile(currentFile.id, options)
     }
 
-    return updateFileContent(currentFile.id, nextContent, currentFile.content_revision ?? null)
+    return updateFileContent(currentFile.id, nextContent, currentFile.content_revision ?? null, options)
   }
 
   async function saveAndPreview() {
+    if (sidebarMode === 'history') {
+      showStatus('Exit history view before saving', 2000)
+      return
+    }
     if (!currentFile) return
     try {
       const nextContent = getCurrentEditorContent()
@@ -1371,6 +1391,89 @@ export default function Editor({
     await deleteProjectEntry(entry.id)
     await refreshFiles(getParentPath(entry.path))
     showStatus(`Deleted ${entry.path}`, 2500)
+  }
+
+  async function handleRestoreRevision(revision) {
+    const sourceLabel = `${revision?.label || `revision ${revision?.id || ''}`}`.trim()
+    const preferredPath = selectedEntry?.path || activePreviewPath || rememberedSelectedEntryPath || ''
+
+    try {
+      showStatus(`Restoring ${sourceLabel}...`)
+      const result = await restoreProjectRevision(projectId, revision.id, {
+        label: `Restored ${sourceLabel}`,
+        description: `Restored project to revision ${revision.id}.`,
+      })
+      const nextFiles = Array.isArray(result?.files) ? result.files : await listProjectFiles(projectId)
+      setFiles(nextFiles)
+      setPreviewSession(null)
+      setPreviewStatus({ kind: 'Idle' })
+      setPreviewOutline([])
+      setPreviewInstanceId((current) => current + 1)
+
+      const nextSelectedEntry = nextFiles.find((entry) => entry.path === preferredPath)
+        || findPreferredTypEntry(nextFiles)
+
+      if (!nextSelectedEntry) {
+        setSelectedEntry(null)
+        setCurrentFile(null)
+        setRealtimeSession(null)
+        setRealtimeConnectionStatus('idle')
+        setContent('')
+        setActivePreviewPath('')
+        setSelectedEntryPathByProject((current) => (
+          current[projectId] ? { ...current, [projectId]: '' } : current
+        ))
+        showStatus('Project restored', 3000)
+        return result
+      }
+
+      const nextPreviewEntry = findPreferredTypEntry(
+        nextFiles,
+        activePreviewPath || nextSelectedEntry.path,
+      )
+      setActivePreviewPath(nextPreviewEntry?.path || '')
+      await selectEntry(nextSelectedEntry)
+      showStatus(
+        result?.status === 'unchanged' ? 'Project already matched revision' : 'Project restored',
+        3000,
+      )
+      return result
+    } catch (error) {
+      if (handleAccessFailure(error, '恢复版本失败，请检查项目权限。')) {
+        throw error
+      }
+      showStatus(error.message || 'Failed to restore revision', 3000)
+      throw error
+    }
+  }
+
+  function handleHistorySelectionChange(selection) {
+    setHistorySelection({
+      ...(selection || {}),
+      projectId,
+    })
+  }
+
+  function registerHistoryDiffScroller(side, scroller) {
+    historyDiffScrollSyncRef.current[side] = scroller
+  }
+
+  function syncHistoryDiffScroll(side, source) {
+    const syncState = historyDiffScrollSyncRef.current
+    if (syncState.isSyncing) return
+
+    const target = syncState[side === 'before' ? 'after' : 'before']
+    if (!target || target === source) return
+
+    const sourceMaxScrollTop = Math.max(source.scrollHeight - source.clientHeight, 0)
+    const targetMaxScrollTop = Math.max(target.scrollHeight - target.clientHeight, 0)
+    const progress = sourceMaxScrollTop > 0 ? source.scrollTop / sourceMaxScrollTop : 0
+
+    syncState.isSyncing = true
+    target.scrollTop = progress * targetMaxScrollTop
+    window.requestAnimationFrame(() => {
+      historyDiffScrollSyncRef.current.isSyncing = false
+    })
   }
 
   function handleDownloadEntry(entry) {
@@ -1585,6 +1688,11 @@ export default function Editor({
   }, [content, currentFile, editorLineHeight, jumpNonce])
 
   async function handleDownload() {
+    if (sidebarMode === 'history') {
+      showStatus('Exit history view before exporting PDF', 2000)
+      return
+    }
+
     if (!activePreviewEntry?.path) {
       showStatus('No .typ file selected for export', 2500)
       return
@@ -1593,7 +1701,7 @@ export default function Editor({
     try {
       if (currentFile?.path === activePreviewEntry.path && !selectedEntry?.is_binary) {
         const nextContent = getCurrentEditorContent()
-        await persistCurrentFileContent(nextContent)
+        await persistCurrentFileContent(nextContent, { createRevision: false })
         setContent(nextContent)
         setCurrentFile((current) => (current ? { ...current, content: nextContent } : current))
       }
@@ -2096,7 +2204,16 @@ export default function Editor({
   const selectedFilePreviewUrl = selectedEntry?.kind === 'file'
     ? getProjectFileUrl(selectedEntry.id)
     : ''
-  const currentPathLabel = currentFile?.path || selectedEntry?.path || 'Typst Playground'
+  const isHistoryReviewMode = sidebarMode === 'history'
+  const activeHistorySelection = historySelection?.projectId === projectId ? historySelection : null
+  const selectedHistoryRevision = activeHistorySelection?.revision || null
+  const selectedHistoryEntry = activeHistorySelection?.entry || null
+  const historyBeforePath = getHistoryPanePath(selectedHistoryEntry, 'before')
+  const historyAfterPath = getHistoryPanePath(selectedHistoryEntry, 'after')
+  const historyRevisionTitle = selectedHistoryRevision ? getRevisionTitle(selectedHistoryRevision) : 'History'
+  const currentPathLabel = isHistoryReviewMode
+    ? `History · ${historyRevisionTitle}`
+    : currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
   const isEditorLoading = Boolean(
@@ -2113,7 +2230,7 @@ export default function Editor({
   const previewEntryName = activePreviewEntry?.name || 'No preview'
   const editorZoomLabel = `${Math.round(editorZoom * 100)}%`
   const previewZoomLabel = `${Math.round(previewZoom * 100)}%`
-  const shouldShowTypPreview = isPreviewVisible && Boolean(selectedEntry && isTypEntry(selectedEntry))
+  const shouldShowTypPreview = !isHistoryReviewMode && isPreviewVisible && Boolean(selectedEntry && isTypEntry(selectedEntry))
   const diagnostics = useMemo(
     () => normalizeDiagnostics(previewStatus, projectId),
     [previewStatus, projectId],
@@ -2275,6 +2392,15 @@ export default function Editor({
     }
   }
 
+  const renderHistoryZoomTools = (resetZoom, changeZoom, zoomLabel, titlePrefix) => (
+    <div style={styles.panelTools}>
+      <button onClick={resetZoom} style={styles.previewChip} title={`Reset ${titlePrefix} zoom`} type="button">⟲</button>
+      <button onClick={() => changeZoom(-1)} style={styles.previewChip} title={`Zoom out ${titlePrefix}`} type="button">−</button>
+      <button style={styles.previewChipLabel} title={`${titlePrefix} zoom`} type="button">{zoomLabel}</button>
+      <button onClick={() => changeZoom(1)} style={styles.previewChip} title={`Zoom in ${titlePrefix}`} type="button">+</button>
+    </div>
+  )
+
   const renderPreviewTools = () => (
     <div style={styles.panelTools}>
       <button onClick={resetPreviewZoom} style={styles.previewChip}>⟲</button>
@@ -2318,10 +2444,19 @@ export default function Editor({
     </div>
   )
 
-  const handleRailClick = (itemId) => {
-    if (!['files', 'search', 'outline', 'errors'].includes(itemId)) return
+  function switchSidebarMode(nextMode) {
+    const isEnteringHistory = nextMode === 'history' && sidebarMode !== 'history'
+    const isLeavingHistory = nextMode !== 'history' && sidebarMode === 'history'
+    if (isEnteringHistory || isLeavingHistory) {
+      setHistorySelection(null)
+    }
+    setSidebarMode(nextMode)
+  }
 
-    setSidebarMode((current) => (current === itemId ? '' : itemId))
+  const handleRailClick = (itemId) => {
+    if (!['files', 'search', 'history', 'outline', 'errors'].includes(itemId)) return
+
+    switchSidebarMode(sidebarMode === itemId ? '' : itemId)
   }
 
   const toggleFontMenu = () => {
@@ -2356,7 +2491,7 @@ export default function Editor({
         { label: 'New Project', disabled: typeof onRequestNewProject !== 'function', onSelect: onRequestNewProject },
         { label: 'Project List', onSelect: onBack },
         { type: 'separator' },
-        { label: 'Export PDF', onSelect: () => void handleDownload() },
+        { label: 'Export PDF', disabled: isHistoryReviewMode, onSelect: () => void handleDownload() },
         { label: 'Fonts', onSelect: toggleFontMenu },
       ],
     },
@@ -2370,13 +2505,13 @@ export default function Editor({
         { label: 'Rename', disabled: !selectedEntry, onSelect: () => void promptRenameSelectedEntry() },
         { label: 'Delete', disabled: !selectedEntry, onSelect: () => void promptDeleteSelectedEntry() },
         { type: 'separator' },
-        { label: 'Save', shortcut: 'Ctrl+S', disabled: !currentFile, onSelect: () => void saveAndPreview() },
+        { label: 'Save', shortcut: 'Ctrl+S', disabled: !currentFile || isHistoryReviewMode, onSelect: () => void saveAndPreview() },
         {
           label: 'Download File',
           disabled: !(selectedEntry?.kind === 'file'),
           onSelect: () => selectedEntry && handleDownloadEntry(selectedEntry),
         },
-        { label: 'Download PDF', disabled: !activePreviewEntry, onSelect: () => void handleDownload() },
+        { label: 'Download PDF', disabled: !activePreviewEntry || isHistoryReviewMode, onSelect: () => void handleDownload() },
       ],
     },
     {
@@ -2398,10 +2533,11 @@ export default function Editor({
     {
       label: 'View',
       items: [
-        { label: 'Files', onSelect: () => setSidebarMode('files') },
-        { label: 'Search', onSelect: () => setSidebarMode('search') },
-        { label: 'Outline', onSelect: () => setSidebarMode('outline') },
-        { label: 'Diagnostics', onSelect: () => setSidebarMode('errors') },
+        { label: 'Files', onSelect: () => switchSidebarMode('files') },
+        { label: 'Search', onSelect: () => switchSidebarMode('search') },
+        { label: 'History', onSelect: () => switchSidebarMode('history') },
+        { label: 'Outline', onSelect: () => switchSidebarMode('outline') },
+        { label: 'Diagnostics', onSelect: () => switchSidebarMode('errors') },
         { type: 'separator' },
         {
           label: isPreviewVisible ? 'Hide Preview' : 'Show Preview',
@@ -2473,7 +2609,7 @@ export default function Editor({
             collapsedFolders={fileTreeCollapsedFolders}
             entries={files}
             onCollapsedFoldersChange={updateFileTreeCollapsedFolders}
-            onClose={() => setSidebarMode('')}
+            onClose={() => switchSidebarMode('')}
             onCreateFile={handleCreateFile}
             onCreateFolder={handleCreateFolder}
             onDeleteEntry={handleDeleteEntry}
@@ -2488,16 +2624,25 @@ export default function Editor({
 
         {sidebarMode === 'search' ? (
           <SearchSidebar
-            onClose={() => setSidebarMode('')}
+            onClose={() => switchSidebarMode('')}
             onOpenResult={handleOpenSearchResult}
             onSearch={handleSearch}
+          />
+        ) : null}
+
+        {sidebarMode === 'history' ? (
+          <HistorySidebar
+            onClose={() => switchSidebarMode('')}
+            onRestoreRevision={handleRestoreRevision}
+            onSelectRevisionEntry={handleHistorySelectionChange}
+            projectId={projectId}
           />
         ) : null}
 
         {sidebarMode === 'outline' ? (
           <OutlineSidebar
             items={outlineItems}
-            onClose={() => setSidebarMode('')}
+            onClose={() => switchSidebarMode('')}
             onSelectItem={(item) => void handleOutlineItemSelect(item)}
           />
         ) : null}
@@ -2505,7 +2650,7 @@ export default function Editor({
         {sidebarMode === 'errors' ? (
           <DiagnosticsSidebar
             diagnostics={diagnostics}
-            onClose={() => setSidebarMode('')}
+            onClose={() => switchSidebarMode('')}
             onSelectDiagnostic={(diagnostic) => void handleSidebarLocationJump(
               diagnostic.location,
               diagnostic.snippet,
@@ -2519,10 +2664,12 @@ export default function Editor({
           <EditorToolbar
             compileResult={statusMessage}
             currentPath={currentPathLabel}
+            downloadDisabled={isHistoryReviewMode || !activePreviewEntry}
             menuSections={menuSections}
             onBack={onBack}
             onDownload={handleDownload}
             onSavePreview={saveAndPreview}
+            saveDisabled={isHistoryReviewMode || !currentFile}
           />
           <input
             ref={uploadInputRef}
@@ -2535,6 +2682,52 @@ export default function Editor({
           />
 
           <div style={styles.contentRow}>
+            {isHistoryReviewMode ? (
+              <>
+                <section style={styles.editorColumn}>
+                  <div style={styles.panelToolbar}>
+                    {renderHistoryZoomTools(resetEditorZoom, changeEditorZoom, editorZoomLabel, 'original')}
+                    <div style={styles.panelMeta}>
+                      {historyBeforePath ? `Original · ${historyBeforePath}` : 'Original state'}
+                    </div>
+                  </div>
+
+                  <div style={styles.editorSurface}>
+                    <RevisionDiffView
+                      emptyText={activeHistorySelection?.isLoading ? 'Loading revision diff...' : 'No original file'}
+                      entry={selectedHistoryEntry}
+                      onRegisterScroller={registerHistoryDiffScroller}
+                      onScrollSync={syncHistoryDiffScroll}
+                      side="before"
+                      title="Original"
+                      zoom={editorZoom}
+                    />
+                  </div>
+                </section>
+
+                <section style={styles.previewColumn}>
+                  <div style={styles.panelToolbar}>
+                    {renderHistoryZoomTools(resetPreviewZoom, changePreviewZoom, previewZoomLabel, 'changed')}
+                    <div style={styles.panelMeta}>
+                      {historyAfterPath ? `Changed · ${historyAfterPath}` : 'Changed state'}
+                    </div>
+                  </div>
+
+                  <div style={styles.editorSurface}>
+                    <RevisionDiffView
+                      emptyText={activeHistorySelection?.isLoading ? 'Loading revision diff...' : 'No changed file'}
+                      entry={selectedHistoryEntry}
+                      onRegisterScroller={registerHistoryDiffScroller}
+                      onScrollSync={syncHistoryDiffScroll}
+                      side="after"
+                      title="Changed"
+                      zoom={previewZoom}
+                    />
+                  </div>
+                </section>
+              </>
+            ) : (
+              <>
             <section
               style={{
                 ...styles.editorColumn,
@@ -2763,6 +2956,8 @@ export default function Editor({
                 {renderPreviewViewport()}
               </section>
             ) : null}
+              </>
+            )}
           </div>
         </div>
 

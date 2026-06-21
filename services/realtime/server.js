@@ -169,12 +169,37 @@ function broadcast(room, payload, exceptSocket = null) {
   })
 }
 
+function destroyRoom(room, closeCode = 1012, reason = 'Realtime room reset') {
+  if (room.closed) return
+  room.closed = true
+
+  if (room.flushTimer) {
+    clearTimeout(room.flushTimer)
+    room.flushTimer = null
+  }
+  if (room.idleTimer) {
+    clearTimeout(room.idleTimer)
+    room.idleTimer = null
+  }
+
+  Array.from(room.connections).forEach((connection) => {
+    removeConnectionAwareness(room, connection)
+    if (connection.socket.readyState === connection.socket.OPEN) {
+      connection.socket.close(closeCode, reason)
+    }
+  })
+  room.connections.clear()
+  room.dirty = false
+  room.doc.destroy()
+  rooms.delete(room.roomKey)
+}
+
 function cleanupRoomIfUnused(room) {
+  if (room.closed) return
   if (room.connections.size > 0 || room.dirty || room.flushInFlight) return
   if (room.idleTimer) return
 
-  room.doc.destroy()
-  rooms.delete(room.roomKey)
+  destroyRoom(room, 1001, 'Realtime room idle')
 }
 
 function scheduleRoomCleanup(room) {
@@ -192,7 +217,15 @@ function scheduleRoomCleanup(room) {
 
 async function flushRoom(room, reason = 'debounce') {
   const shouldForce = reason === 'manual'
-  if ((!room.dirty && !shouldForce) || room.flushInFlight) return false
+  if (room.closed) {
+    return { flushed: false, statusCode: 410, message: 'Realtime room is closed' }
+  }
+  if (room.flushInFlight) {
+    return room.flushPromise || { flushed: false, statusCode: 202, message: 'Flush already in progress' }
+  }
+  if (!room.dirty && !shouldForce) {
+    return { flushed: false, statusCode: 200, contentRevision: room.contentRevision }
+  }
 
   room.flushInFlight = true
   if (room.flushTimer) {
@@ -200,52 +233,59 @@ async function flushRoom(room, reason = 'debounce') {
     room.flushTimer = null
   }
 
-  try {
-    const content = room.ytext.toString()
-    console.log(
-      `[realtime] flush room=${room.roomKey} reason=${reason} len=${content.length} preview=${JSON.stringify(summarizeContent(content))}`,
-    )
-    const response = await fetch(`${apiInternalUrl}/internal/realtime/flush-file`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Realtime-Secret': realtimeSecret,
-      },
-      body: JSON.stringify({
-        file_id: room.fileId,
-        content,
-        state_base64: encodeStateBase64(room.doc),
-        content_revision: room.contentRevision,
-        updated_by_id: room.lastUpdatedById,
-        reason,
-      }),
-    })
+  room.flushPromise = (async () => {
+    try {
+      const content = room.ytext.toString()
+      console.log(
+        `[realtime] flush room=${room.roomKey} reason=${reason} len=${content.length} preview=${JSON.stringify(summarizeContent(content))}`,
+      )
+      const response = await fetch(`${apiInternalUrl}/internal/realtime/flush-file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Realtime-Secret': realtimeSecret,
+        },
+        body: JSON.stringify({
+          file_id: room.fileId,
+          content,
+          state_base64: encodeStateBase64(room.doc),
+          content_revision: room.contentRevision,
+          updated_by_id: room.lastUpdatedById,
+          reason,
+        }),
+      })
 
-    if (!response.ok) {
-      const message = await response.text()
-      return {
-        flushed: false,
-        statusCode: response.status,
-        message: message || `Flush failed with status ${response.status}`,
+      if (!response.ok) {
+        const message = await response.text()
+        return {
+          flushed: false,
+          statusCode: response.status,
+          message: message || `Flush failed with status ${response.status}`,
+        }
       }
-    }
 
-    const payload = await response.json().catch(() => ({}))
-    if (Number.isInteger(payload.content_revision)) {
-      room.contentRevision = payload.content_revision
+      const payload = await response.json().catch(() => ({}))
+      if (Number.isInteger(payload.content_revision)) {
+        room.contentRevision = payload.content_revision
+      }
+      room.dirty = false
+      return { flushed: true, statusCode: 200, contentRevision: room.contentRevision }
+    } catch (error) {
+      console.error(`[realtime] flush failed for ${room.roomKey}:`, error)
+      return { flushed: false, statusCode: 502, message: error.message || 'Flush failed' }
+    } finally {
+      room.flushInFlight = false
+      room.flushPromise = null
+      cleanupRoomIfUnused(room)
     }
-    room.dirty = false
-    return { flushed: true, statusCode: 200, contentRevision: room.contentRevision }
-  } catch (error) {
-    console.error(`[realtime] flush failed for ${room.roomKey}:`, error)
-    return { flushed: false, statusCode: 502, message: error.message || 'Flush failed' }
-  } finally {
-    room.flushInFlight = false
-    cleanupRoomIfUnused(room)
-  }
+  })()
+
+  return room.flushPromise
 }
 
 function scheduleFlush(room, reason = 'debounce') {
+  if (room.closed) return
+
   room.dirty = true
   if (room.flushTimer) {
     clearTimeout(room.flushTimer)
@@ -304,7 +344,9 @@ function getOrCreateRoom(session) {
     dirty: false,
     flushInFlight: false,
     flushTimer: null,
+    flushPromise: null,
     idleTimer: null,
+    closed: false,
     lastUpdatedById: null,
   }
 
@@ -379,6 +421,8 @@ function handleSyncMessage(room, connection, decoder) {
 }
 
 function handleConnectionClose(room, connection) {
+  if (room.closed) return
+
   removeConnectionAwareness(room, connection)
   room.connections.delete(connection)
 
@@ -543,6 +587,51 @@ const server = http.createServer(async (request, response) => {
     } catch (error) {
       console.error('[realtime] manual flush failed:', error)
       writeJson(response, 500, { detail: error.message || 'Manual flush failed' })
+      return
+    }
+  }
+
+  if (request.method === 'POST' && requestUrl.pathname === '/internal/realtime/reset-room') {
+    if (request.headers['x-realtime-secret'] !== realtimeSecret) {
+      writeJson(response, 401, { detail: 'Invalid realtime secret' })
+      return
+    }
+
+    try {
+      const payload = await readJsonBody(request)
+      const fileId = Number.parseInt(`${payload?.file_id || ''}`, 10)
+      if (!Number.isInteger(fileId) || fileId <= 0) {
+        writeJson(response, 400, { detail: 'Invalid file_id' })
+        return
+      }
+
+      const room = findRoomByFileId(fileId)
+      if (!room) {
+        writeJson(response, 200, {
+          status: 'idle',
+          file_id: fileId,
+        })
+        return
+      }
+
+      const roomKey = room.roomKey
+      const connectionCount = room.connections.size
+      const contentLength = room.ytext.toString().length
+      if (room.flushInFlight && room.flushPromise) {
+        await room.flushPromise
+      }
+      destroyRoom(room)
+      writeJson(response, 200, {
+        status: 'reset',
+        file_id: fileId,
+        room_key: roomKey,
+        connection_count: connectionCount,
+        content_length: contentLength,
+      })
+      return
+    } catch (error) {
+      console.error('[realtime] room reset failed:', error)
+      writeJson(response, 500, { detail: error.message || 'Room reset failed' })
       return
     }
   }

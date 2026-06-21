@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI, File as FastAPIFile, Form, Header, HTTPExc
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, text
 from sqlalchemy.orm import Session
 
 import models
@@ -42,6 +42,8 @@ TEXT_ENTRY_KIND = 'file'
 FOLDER_ENTRY_KIND = 'folder'
 ALLOWED_PROJECT_STATUSES = {'active', 'archived', 'trashed'}
 SESSION_TTL_DAYS = 30
+REVISION_CHANGE_TYPES = {'baseline', 'created', 'modified', 'deleted', 'renamed'}
+BASELINE_REVISION_LABEL = '__baseline__'
 BINARY_FILE_EXTENSIONS = {
     '.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.tif', '.tiff', '.webp',
     '.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav',
@@ -139,6 +141,24 @@ with engine.begin() as connection:
     if 'realtime_state' in refreshed_file_columns:
         connection.execute(text("UPDATE files SET realtime_state = '' WHERE realtime_state IS NULL"))
 
+    table_names = inspect(connection).get_table_names()
+    if 'revisions' in table_names:
+        revision_columns = {column['name'] for column in inspector.get_columns('revisions')}
+        if 'is_baseline' not in revision_columns:
+            connection.execute(
+                text("ALTER TABLE revisions ADD COLUMN is_baseline BOOLEAN NOT NULL DEFAULT FALSE")
+            )
+    if 'revision_entries' in table_names:
+        revision_entry_columns = {column['name'] for column in inspector.get_columns('revision_entries')}
+        if 'previous_path' not in revision_entry_columns:
+            connection.execute(
+                text("ALTER TABLE revision_entries ADD COLUMN previous_path VARCHAR(1024) NOT NULL DEFAULT ''")
+            )
+        if 'change_type' not in revision_entry_columns:
+            connection.execute(
+                text("ALTER TABLE revision_entries ADD COLUMN change_type VARCHAR(32) NOT NULL DEFAULT 'modified'")
+            )
+
 app = FastAPI()
 
 app.add_middleware(
@@ -188,6 +208,11 @@ class FolderCreate(BaseModel):
 class FileUpdate(BaseModel):
     content: str
     content_revision: int | None = None
+    create_revision: bool = True
+
+
+class RealtimeFlushRequest(BaseModel):
+    create_revision: bool = True
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -208,6 +233,11 @@ class ProjectTagsUpdate(BaseModel):
 
 class ProjectCompileRequest(BaseModel):
     entrypoint: str = ''
+
+
+class RevisionRestoreRequest(BaseModel):
+    label: str = ''
+    description: str = ''
 
 
 class PreviewSnapshotRequest(BaseModel):
@@ -403,6 +433,47 @@ def serialize_entry(entry: models.File):
         'content_revision': entry.content_revision or 0,
         'project_id': entry.project_id,
     }
+
+
+def serialize_revision(
+    revision: models.Revision,
+    include_entries: bool = False,
+    change_count: int | None = None,
+    entry_diffs: dict[int, dict] | None = None,
+):
+    payload = {
+        'id': revision.id,
+        'project_id': revision.project_id,
+        'created_by_id': revision.created_by_id,
+        'created_by': serialize_user(revision.created_by) if revision.created_by else None,
+        'kind': revision.kind,
+        'label': revision.label,
+        'description': revision.description,
+        'created_at': revision.created_at,
+        'change_count': change_count if change_count is not None else len(revision.entries or []),
+    }
+
+    if include_entries:
+        payload['entries'] = [
+            {
+                'id': entry.id,
+                'revision_id': entry.revision_id,
+                'path': entry.path,
+                'previous_path': entry.previous_path or '',
+                'change_type': entry.change_type,
+                'name': entry.name,
+                'kind': entry.kind,
+                'is_binary': entry.is_binary,
+                'created_at': entry.created_at,
+                'diff': entry_diffs.get(entry.id) if entry_diffs else None,
+            }
+            for entry in sorted(
+                revision.entries or [],
+                key=lambda current: (current.path.count('/'), current.path, current.id),
+            )
+        ]
+
+    return payload
 
 
 def search_project_entries(entries: list[models.File], query: str):
@@ -776,6 +847,369 @@ def read_entry_content_bytes(
     return (entry.content or '').encode('utf-8')
 
 
+def build_entry_state_from_entry(db: Session, project_id: int, entry: models.File):
+    effective_is_binary = is_binary_entry(entry)
+    content = ''
+    if entry.kind != FOLDER_ENTRY_KIND:
+        content = (
+            encode_binary_content(read_entry_content_bytes(db, project_id, entry))
+            if effective_is_binary
+            else (entry.content or '')
+        )
+
+    return {
+        'path': entry.path,
+        'name': entry.name,
+        'kind': entry.kind,
+        'is_binary': effective_is_binary,
+        'content': content,
+    }
+
+
+def build_project_state_from_entries(db: Session, project_id: int, entries: list[models.File]):
+    return {
+        entry.path: build_entry_state_from_entry(db, project_id, entry)
+        for entry in sorted(entries, key=lambda current: (current.path.count('/'), current.path))
+    }
+
+
+def build_revision_change_from_entry(
+    db: Session,
+    project_id: int,
+    entry: models.File,
+    change_type: str,
+    previous_path: str = '',
+):
+    if change_type not in REVISION_CHANGE_TYPES:
+        raise HTTPException(status_code=500, detail=f'Invalid revision change type: {change_type}')
+
+    payload = build_entry_state_from_entry(db, project_id, entry)
+    payload['change_type'] = change_type
+    payload['previous_path'] = previous_path or ''
+    return payload
+
+
+def normalize_revision_label(value: str, fallback: str):
+    normalized = (value or '').strip()
+    if not normalized:
+        normalized = fallback
+    return normalized[:255]
+
+
+def normalize_revision_description(value: str):
+    return (value or '').strip()
+
+
+def create_project_revision(
+    db: Session,
+    project_id: int,
+    current_user: models.User | None,
+    *,
+    kind: str = 'manual',
+    label: str = '',
+    description: str = '',
+    changes: list[dict],
+    is_baseline: bool = False,
+    ensure_baseline: bool = True,
+):
+    if not is_baseline and not changes:
+        return None
+
+    if not is_baseline and ensure_baseline:
+        ensure_project_baseline_revision(db, project_id)
+
+    revision = models.Revision(
+        project_id=project_id,
+        created_by_id=current_user.id if current_user else None,
+        kind=kind,
+        is_baseline=is_baseline,
+        label=normalize_revision_label(
+            BASELINE_REVISION_LABEL if is_baseline else label,
+            'Baseline' if is_baseline else 'Saved changes',
+        ),
+        description=normalize_revision_description(description),
+    )
+    db.add(revision)
+    db.flush()
+
+    for change in changes:
+        change_type = change.get('change_type') or 'modified'
+        if change_type not in REVISION_CHANGE_TYPES:
+            raise HTTPException(status_code=500, detail=f'Invalid revision change type: {change_type}')
+
+        db.add(
+            models.RevisionEntry(
+                revision_id=revision.id,
+                path=change['path'],
+                previous_path=change.get('previous_path') or '',
+                change_type=change_type,
+                name=change.get('name') or PurePosixPath(change['path']).name,
+                kind=change.get('kind') or TEXT_ENTRY_KIND,
+                is_binary=bool(change.get('is_binary')),
+                content=change.get('content') or '',
+            )
+        )
+
+    db.commit()
+    db.refresh(revision)
+    return revision
+
+
+def ensure_project_baseline_revision(db: Session, project_id: int):
+    existing_baseline = (
+        db.query(models.Revision)
+        .filter(
+            models.Revision.project_id == project_id,
+            models.Revision.is_baseline.is_(True),
+        )
+        .first()
+    )
+    if existing_baseline:
+        return existing_baseline
+
+    entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    changes = [
+        {
+            **build_entry_state_from_entry(db, project_id, entry),
+            'change_type': 'baseline',
+            'previous_path': '',
+        }
+        for entry in entries
+    ]
+
+    return create_project_revision(
+        db,
+        project_id,
+        None,
+        kind='autosave',
+        label=BASELINE_REVISION_LABEL,
+        description='Initial project baseline for version history.',
+        changes=changes,
+        is_baseline=True,
+        ensure_baseline=False,
+    )
+
+
+def get_latest_project_revision(db: Session, project_id: int):
+    return (
+        db.query(models.Revision)
+        .filter(models.Revision.project_id == project_id)
+        .order_by(models.Revision.created_at.desc(), models.Revision.id.desc())
+        .first()
+    )
+
+
+def build_entry_change_from_latest_revision(
+    db: Session,
+    project_id: int,
+    entry: models.File,
+    change_type: str = 'modified',
+):
+    latest_revision = get_latest_project_revision(db, project_id)
+    if not latest_revision:
+        latest_revision = ensure_project_baseline_revision(db, project_id)
+
+    latest_state = reconstruct_project_state_at_revision(db, project_id, latest_revision.id)
+    current_state = build_entry_state_from_entry(db, project_id, entry)
+    if latest_state.get(entry.path) == current_state:
+        return None
+
+    return {
+        **current_state,
+        'change_type': change_type,
+        'previous_path': '',
+    }
+
+
+def revision_entry_to_state(entry: models.RevisionEntry):
+    return {
+        'path': entry.path,
+        'name': entry.name,
+        'kind': entry.kind,
+        'is_binary': entry.is_binary,
+        'content': entry.content or '',
+    }
+
+
+def remove_state_path(state: dict[str, dict], path: str, include_descendants: bool = False):
+    state.pop(path, None)
+    if include_descendants:
+        prefix = f'{path}/'
+        for current_path in list(state.keys()):
+            if current_path.startswith(prefix):
+                state.pop(current_path, None)
+
+
+def apply_revision_to_state(state: dict[str, dict], revision: models.Revision):
+    for entry in sorted(revision.entries or [], key=lambda current: (current.path.count('/'), current.path, current.id)):
+        change_type = entry.change_type or 'modified'
+
+        if change_type == 'deleted':
+            remove_state_path(state, entry.path, entry.kind == FOLDER_ENTRY_KIND)
+            continue
+
+        if change_type == 'renamed' and entry.previous_path:
+            remove_state_path(state, entry.previous_path, False)
+
+        state[entry.path] = revision_entry_to_state(entry)
+
+
+def serialize_revision_state_for_diff(payload: dict | None):
+    if not payload:
+        return {
+            'exists': False,
+            'path': '',
+            'name': '',
+            'kind': '',
+            'is_binary': False,
+            'content': '',
+            'content_available': False,
+        }
+
+    is_binary = bool(payload.get('is_binary'))
+    kind = payload.get('kind') or TEXT_ENTRY_KIND
+    return {
+        'exists': True,
+        'path': payload.get('path') or '',
+        'name': payload.get('name') or '',
+        'kind': kind,
+        'is_binary': is_binary,
+        'content': '' if is_binary or kind == FOLDER_ENTRY_KIND else (payload.get('content') or ''),
+        'content_available': not is_binary and kind != FOLDER_ENTRY_KIND,
+    }
+
+
+def build_revision_entry_diffs(db: Session, project_id: int, target_revision: models.Revision):
+    revisions = (
+        db.query(models.Revision)
+        .filter(models.Revision.project_id == project_id)
+        .order_by(models.Revision.created_at.asc(), models.Revision.id.asc())
+        .all()
+    )
+
+    state: dict[str, dict] = {}
+    before_state: dict[str, dict] | None = None
+    after_state: dict[str, dict] | None = None
+
+    for revision in revisions:
+        if revision.id == target_revision.id:
+            before_state = dict(state)
+            apply_revision_to_state(state, revision)
+            after_state = dict(state)
+            break
+        apply_revision_to_state(state, revision)
+
+    if before_state is None or after_state is None:
+        raise HTTPException(status_code=404, detail='Revision not found')
+
+    diffs = {}
+    for entry in target_revision.entries or []:
+        before_path = entry.previous_path if (entry.change_type == 'renamed' and entry.previous_path) else entry.path
+        after_path = entry.path
+        before_payload = before_state.get(before_path)
+        after_payload = None if entry.change_type == 'deleted' else after_state.get(after_path)
+        diffs[entry.id] = {
+            'before': serialize_revision_state_for_diff(before_payload),
+            'after': serialize_revision_state_for_diff(after_payload),
+        }
+
+    return diffs
+
+
+def reconstruct_project_state_at_revision(db: Session, project_id: int, revision_id: int):
+    revisions = (
+        db.query(models.Revision)
+        .filter(models.Revision.project_id == project_id)
+        .order_by(models.Revision.created_at.asc(), models.Revision.id.asc())
+        .all()
+    )
+
+    state: dict[str, dict] = {}
+    found_target = False
+    for revision in revisions:
+        apply_revision_to_state(state, revision)
+        if revision.id == revision_id:
+            found_target = True
+            break
+
+    if not found_target:
+        raise HTTPException(status_code=404, detail='Revision not found')
+
+    return state
+
+
+def build_project_state_delta(before_state: dict[str, dict], after_state: dict[str, dict]):
+    changes = []
+    all_paths = sorted(set(before_state.keys()) | set(after_state.keys()), key=lambda path: (path.count('/'), path))
+
+    for path in all_paths:
+        before = before_state.get(path)
+        after = after_state.get(path)
+
+        if before is None and after is not None:
+            changes.append({**after, 'change_type': 'created', 'previous_path': ''})
+            continue
+
+        if before is not None and after is None:
+            changes.append({**before, 'change_type': 'deleted', 'previous_path': ''})
+            continue
+
+        if before != after:
+            changes.append({**after, 'change_type': 'modified', 'previous_path': ''})
+
+    return changes
+
+
+def apply_project_state(db: Session, project_id: int, target_state: dict[str, dict]):
+    current_entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    entries_by_path = {entry.path: entry for entry in current_entries}
+
+    for path, entry in list(entries_by_path.items()):
+        if path not in target_state:
+            db.delete(entry)
+
+    for path, payload in sorted(target_state.items(), key=lambda item: (item[0].count('/'), item[0])):
+        existing_entry = entries_by_path.get(path)
+        next_kind = payload.get('kind') or TEXT_ENTRY_KIND
+        next_is_binary = bool(payload.get('is_binary'))
+        next_content = payload.get('content') or ''
+        next_name = payload.get('name') or PurePosixPath(path).name
+
+        if existing_entry is None:
+            db.add(
+                models.File(
+                    project_id=project_id,
+                    name=next_name,
+                    path=path,
+                    kind=next_kind,
+                    is_binary=next_is_binary,
+                    content=next_content,
+                    content_revision=0,
+                    realtime_state='',
+                )
+            )
+            continue
+
+        content_changed = (
+            existing_entry.kind != next_kind
+            or existing_entry.is_binary != next_is_binary
+            or (existing_entry.content or '') != next_content
+        )
+        existing_entry.name = next_name
+        existing_entry.kind = next_kind
+        existing_entry.is_binary = next_is_binary
+        existing_entry.content = next_content
+        if content_changed:
+            existing_entry.content_revision = (existing_entry.content_revision or 0) + 1
+            existing_entry.realtime_state = ''
+
+    db.commit()
+    cache_project_workspace(
+        project_id,
+        db.query(models.File).filter(models.File.project_id == project_id).all(),
+    )
+
+
 def build_content_disposition(filename: str, download: bool):
     disposition_type = 'attachment' if download else 'inline'
     safe_filename = (filename or 'download').replace('\\', '_').replace('"', '_')
@@ -1108,8 +1542,9 @@ def ensure_parent_folders(
     parent_path: str,
     entries_by_path: dict[str, models.File],
 ):
+    created_entries: list[models.File] = []
     if not parent_path:
-        return
+        return created_entries
 
     parts = PurePosixPath(parent_path).parts
     for index in range(len(parts)):
@@ -1134,6 +1569,9 @@ def ensure_parent_folders(
         db.add(folder_entry)
         db.flush()
         entries_by_path[folder_path] = folder_entry
+        created_entries.append(folder_entry)
+
+    return created_entries
 
 
 def ensure_entry_path_available(
@@ -1355,6 +1793,29 @@ def flush_realtime_room(file_id: int):
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail='Realtime service returned an invalid flush payload')
+
+    return payload
+
+
+def reset_realtime_room(file_id: int):
+    try:
+        response = requests.post(
+            build_realtime_internal_url('/internal/realtime/reset-room', file_id),
+            json={'file_id': file_id},
+            headers={'X-Realtime-Secret': REALTIME_SECRET},
+            timeout=5,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail='Realtime service returned invalid JSON') from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail='Realtime service returned an invalid reset payload')
 
     return payload
 
@@ -1833,6 +2294,148 @@ def search_project_files(
     return search_project_entries(entries, q)
 
 
+@app.get('/projects/{project_id}/revisions')
+def list_project_revisions(
+    project_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
+    revisions = (
+        db.query(models.Revision)
+        .filter(
+            models.Revision.project_id == project_id,
+            models.Revision.is_baseline.is_(False),
+        )
+        .order_by(models.Revision.created_at.desc(), models.Revision.id.desc())
+        .all()
+    )
+    revision_ids = [revision.id for revision in revisions]
+    revision_entry_counts = {
+        revision_id: count
+        for revision_id, count in (
+            db.query(models.RevisionEntry.revision_id, func.count(models.RevisionEntry.id))
+            .filter(models.RevisionEntry.revision_id.in_(revision_ids))
+            .group_by(models.RevisionEntry.revision_id)
+            .all()
+            if revision_ids
+            else []
+        )
+    }
+    return [
+        serialize_revision(revision, change_count=revision_entry_counts.get(revision.id, 0))
+        for revision in revisions
+    ]
+
+
+@app.get('/projects/{project_id}/revisions/{revision_id}')
+def get_project_revision(
+    project_id: int,
+    revision_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
+    revision = (
+        db.query(models.Revision)
+        .filter(
+            models.Revision.project_id == project_id,
+            models.Revision.id == revision_id,
+            models.Revision.is_baseline.is_(False),
+        )
+        .first()
+    )
+    if not revision:
+        raise HTTPException(status_code=404, detail='Revision not found')
+    return serialize_revision(
+        revision,
+        include_entries=True,
+        entry_diffs=build_revision_entry_diffs(db, project_id, revision),
+    )
+
+
+@app.post('/projects/{project_id}/revisions/{revision_id}/restore')
+def restore_project_revision(
+    project_id: int,
+    revision_id: int,
+    payload: RevisionRestoreRequest | None = None,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
+    revision = (
+        db.query(models.Revision)
+        .filter(
+            models.Revision.project_id == project_id,
+            models.Revision.id == revision_id,
+            models.Revision.is_baseline.is_(False),
+        )
+        .first()
+    )
+    if not revision:
+        raise HTTPException(status_code=404, detail='Revision not found')
+
+    current_entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    current_text_file_ids = [
+        entry.id
+        for entry in current_entries
+        if entry.kind == TEXT_ENTRY_KIND and not is_binary_entry(entry)
+    ]
+    for entry in current_entries:
+        if entry.kind == TEXT_ENTRY_KIND and not is_binary_entry(entry):
+            with contextlib.suppress(HTTPException):
+                flush_realtime_room(entry.id)
+
+    current_entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+    current_state = build_project_state_from_entries(db, project_id, current_entries)
+    target_state = reconstruct_project_state_at_revision(db, project_id, revision_id)
+    rollback_changes = build_project_state_delta(current_state, target_state)
+
+    rollback_revision = None
+    if rollback_changes:
+        apply_project_state(db, project_id, target_state)
+        rollback_revision = create_project_revision(
+            db,
+            project_id,
+            current_user,
+            kind='rollback',
+            label=normalize_revision_label(
+                payload.label if payload else '',
+                f'Restored revision {revision_id}',
+            ),
+            description=normalize_revision_description(
+                payload.description if payload else f'Restored project to revision {revision_id}.',
+            ),
+            changes=rollback_changes,
+            ensure_baseline=False,
+        )
+        restored_entries = db.query(models.File).filter(models.File.project_id == project_id).all()
+        restored_text_file_ids = [
+            entry.id
+            for entry in restored_entries
+            if entry.kind == TEXT_ENTRY_KIND and not is_binary_entry(entry)
+        ]
+        for file_id in sorted(set(current_text_file_ids) | set(restored_text_file_ids)):
+            with contextlib.suppress(HTTPException):
+                reset_realtime_room(file_id)
+
+    return {
+        'status': 'restored' if rollback_revision else 'unchanged',
+        'target_revision': serialize_revision(revision),
+        'revision': serialize_revision(rollback_revision) if rollback_revision else None,
+        'files': [
+            serialize_entry(entry)
+            for entry in db.query(models.File)
+            .filter(models.File.project_id == project_id)
+            .order_by(models.File.path.asc())
+            .all()
+        ],
+    }
+
+
 @app.post('/projects/{project_id}/files')
 def create_file(
     project_id: int,
@@ -1843,7 +2446,39 @@ def create_file(
     project = get_project_or_404(db, project_id)
     ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
     relative_path = normalize_relative_path(payload.path)
-    entry = create_text_file_entry(db, project_id, relative_path, '')
+
+    ensure_project_baseline_revision(db, project_id)
+    entries_by_path = get_project_entries_map(db, project_id)
+    ensure_entry_path_available(relative_path, entries_by_path)
+    created_parent_entries = ensure_parent_folders(db, project_id, get_parent_path(relative_path), entries_by_path)
+
+    entry = models.File(
+        project_id=project_id,
+        name=PurePosixPath(relative_path).name,
+        path=relative_path,
+        kind=TEXT_ENTRY_KIND,
+        is_binary=False,
+        content='',
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    cache_text_file(project_id, relative_path, '')
+    revision_changes = [
+        build_revision_change_from_entry(db, project_id, parent_entry, 'created')
+        for parent_entry in created_parent_entries
+    ]
+    revision_changes.append(build_revision_change_from_entry(db, project_id, entry, 'created'))
+    create_project_revision(
+        db,
+        project_id,
+        current_user,
+        kind='manual',
+        label=f'Created {entry.path}',
+        changes=revision_changes,
+        ensure_baseline=False,
+    )
     return serialize_entry(entry)
 
 
@@ -1858,9 +2493,10 @@ def create_folder(
     ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
     relative_path = normalize_relative_path(payload.path)
 
+    ensure_project_baseline_revision(db, project_id)
     entries_by_path = get_project_entries_map(db, project_id)
     ensure_entry_path_available(relative_path, entries_by_path)
-    ensure_parent_folders(db, project_id, get_parent_path(relative_path), entries_by_path)
+    created_parent_entries = ensure_parent_folders(db, project_id, get_parent_path(relative_path), entries_by_path)
 
     folder_entry = models.File(
         project_id=project_id,
@@ -1877,6 +2513,21 @@ def create_folder(
     with contextlib.suppress(OSError):
         get_entry_disk_path(project_id, relative_path).mkdir(parents=True, exist_ok=True)
 
+    revision_changes = [
+        build_revision_change_from_entry(db, project_id, parent_entry, 'created')
+        for parent_entry in created_parent_entries
+    ]
+    revision_changes.append(build_revision_change_from_entry(db, project_id, folder_entry, 'created'))
+    create_project_revision(
+        db,
+        project_id,
+        current_user,
+        kind='manual',
+        label=f'Created folder {folder_entry.path}',
+        changes=revision_changes,
+        ensure_baseline=False,
+    )
+
     return serialize_entry(folder_entry)
 
 
@@ -1892,6 +2543,7 @@ def upload_files(
     project = get_project_or_404(db, project_id)
     ensure_project_access(db, project, current_user, {'maintainer', 'editor'})
 
+    ensure_project_baseline_revision(db, project_id)
     normalized_parent = normalize_parent_path(parent_path)
     provided_relative_paths = []
     if relative_paths:
@@ -1910,6 +2562,7 @@ def upload_files(
 
     entries_by_path = get_project_entries_map(db, project_id)
     created_entries: list[models.File] = []
+    created_parent_entries: list[models.File] = []
 
     for index, uploaded_file in enumerate(files):
         source_relative_path = (
@@ -1919,7 +2572,9 @@ def upload_files(
         )
         relative_path = join_relative_path(normalized_parent, source_relative_path)
         ensure_entry_path_available(relative_path, entries_by_path)
-        ensure_parent_folders(db, project_id, get_parent_path(relative_path), entries_by_path)
+        created_parent_entries.extend(
+            ensure_parent_folders(db, project_id, get_parent_path(relative_path), entries_by_path)
+        )
 
         binary_content = uploaded_file.file.read()
         is_binary = should_treat_file_as_binary(relative_path, uploaded_file.content_type)
@@ -1951,6 +2606,24 @@ def upload_files(
     db.commit()
     for entry in created_entries:
         db.refresh(entry)
+
+    revision_changes = [
+        build_revision_change_from_entry(db, project_id, parent_entry, 'created')
+        for parent_entry in created_parent_entries
+    ]
+    revision_changes.extend(
+        build_revision_change_from_entry(db, project_id, entry, 'created')
+        for entry in created_entries
+    )
+    create_project_revision(
+        db,
+        project_id,
+        current_user,
+        kind='manual',
+        label=f'Uploaded {len(created_entries)} file{"s" if len(created_entries) != 1 else ""}',
+        changes=revision_changes,
+        ensure_baseline=False,
+    )
 
     return [serialize_entry(entry) for entry in created_entries]
 
@@ -2052,6 +2725,7 @@ def get_file_realtime_session(
 @app.post('/files/{file_id}/realtime-flush')
 def force_flush_file_realtime_state(
     file_id: int,
+    payload: RealtimeFlushRequest | None = None,
     current_user: models.User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2062,11 +2736,31 @@ def force_flush_file_realtime_state(
     if is_binary_entry(entry):
         raise HTTPException(status_code=400, detail='Binary files do not have realtime state')
 
+    ensure_project_baseline_revision(db, entry.project_id)
     flush_payload = flush_realtime_room(entry.id)
     db.refresh(entry)
 
+    revision = None
+    revision_change = (
+        build_entry_change_from_latest_revision(db, entry.project_id, entry, 'modified')
+        if (payload is None or payload.create_revision)
+        else None
+    )
+    if revision_change:
+        revision = create_project_revision(
+            db,
+            entry.project_id,
+            current_user,
+            kind='manual',
+            label=f'Saved {entry.path}',
+            changes=[revision_change],
+            ensure_baseline=False,
+        )
+        db.refresh(entry)
+
     return {
         'status': flush_payload.get('status', 'idle'),
+        'revision': serialize_revision(revision) if revision else None,
         'file': {
             'id': entry.id,
             'path': entry.path,
@@ -2095,18 +2789,44 @@ def update_file_content(
     if file_update.content_revision is not None and file_update.content_revision != current_revision:
         raise HTTPException(status_code=409, detail='File content changed; reload before saving')
 
+    ensure_project_baseline_revision(db, entry.project_id)
+    next_content = file_update.content or ''
+    content_changed = (entry.content or '') != next_content or bool(entry.realtime_state or '')
+
     print(
-        f"[api] put-content file={entry.id} path={entry.path} len={len(file_update.content or '')} "
-        f"preview={summarize_content(file_update.content)}"
+        f"[api] put-content file={entry.id} path={entry.path} len={len(next_content)} "
+        f"preview={summarize_content(next_content)}"
     )
-    entry.content = file_update.content
-    entry.content_revision = current_revision + 1
-    entry.realtime_state = ''
-    db.commit()
+    if content_changed:
+        entry.content = next_content
+        entry.content_revision = current_revision + 1
+        entry.realtime_state = ''
+        db.commit()
+        db.refresh(entry)
+        cache_text_file(entry.project_id, entry.path, entry.content)
 
-    cache_text_file(entry.project_id, entry.path, entry.content)
+    revision = None
+    revision_change = (
+        build_entry_change_from_latest_revision(db, entry.project_id, entry, 'modified')
+        if file_update.create_revision
+        else None
+    )
+    if revision_change:
+        revision = create_project_revision(
+            db,
+            entry.project_id,
+            current_user,
+            kind='manual',
+            label=f'Saved {entry.path}',
+            changes=[revision_change],
+            ensure_baseline=False,
+        )
+        db.refresh(entry)
 
-    return serialize_entry(entry)
+    return {
+        **serialize_entry(entry),
+        'revision': serialize_revision(revision) if revision else None,
+    }
 
 
 @app.patch('/files/{file_id}')
@@ -2131,17 +2851,19 @@ def rename_file_entry(
     ):
         raise HTTPException(status_code=400, detail='Folder cannot be moved into itself')
 
+    ensure_project_baseline_revision(db, project_id)
     affected_entries = [entry]
     if entry.kind == FOLDER_ENTRY_KIND:
         affected_entries.extend(list_descendant_entries(db, entry.project_id, old_path))
 
+    previous_paths = {current_entry.id: current_entry.path for current_entry in affected_entries}
     affected_paths = {current.path for current in affected_entries}
     entries_by_path = get_project_entries_map(db, entry.project_id)
 
     for current_entry in affected_entries:
         entries_by_path.pop(current_entry.path, None)
 
-    ensure_parent_folders(db, entry.project_id, get_parent_path(next_path), entries_by_path)
+    created_parent_entries = ensure_parent_folders(db, entry.project_id, get_parent_path(next_path), entries_by_path)
 
     remapped_paths = {}
     for current_entry in affected_entries:
@@ -2170,6 +2892,30 @@ def rename_file_entry(
     )
     db.refresh(entry)
 
+    revision_changes = [
+        build_revision_change_from_entry(db, project_id, parent_entry, 'created')
+        for parent_entry in created_parent_entries
+    ]
+    revision_changes.extend(
+        build_revision_change_from_entry(
+            db,
+            project_id,
+            current_entry,
+            'renamed',
+            previous_paths[current_entry.id],
+        )
+        for current_entry in affected_entries
+    )
+    create_project_revision(
+        db,
+        project_id,
+        current_user,
+        kind='manual',
+        label=f'Renamed {old_path} to {next_path}',
+        changes=revision_changes,
+        ensure_baseline=False,
+    )
+
     return serialize_entry(entry)
 
 
@@ -2182,14 +2928,21 @@ def delete_file_entry(
     entry = get_entry_or_404(db, file_id)
     ensure_project_access(db, entry.project, current_user, {'maintainer', 'editor'})
     project_id = entry.project_id
+    deleted_path = entry.path
     disk_path = get_entry_disk_path(project_id, entry.path)
 
+    ensure_project_baseline_revision(db, project_id)
+    affected_entries = [entry]
     if entry.kind == FOLDER_ENTRY_KIND:
-        affected_entries = [entry, *list_descendant_entries(db, project_id, entry.path)]
-        for current_entry in affected_entries:
-            db.delete(current_entry)
-    else:
-        db.delete(entry)
+        affected_entries.extend(list_descendant_entries(db, project_id, entry.path))
+
+    revision_changes = [
+        build_revision_change_from_entry(db, project_id, current_entry, 'deleted')
+        for current_entry in affected_entries
+    ]
+
+    for current_entry in affected_entries:
+        db.delete(current_entry)
 
     db.commit()
     cache_project_workspace(
@@ -2197,6 +2950,15 @@ def delete_file_entry(
         db.query(models.File).filter(models.File.project_id == project_id).all(),
     )
     delete_cache_path(disk_path)
+    create_project_revision(
+        db,
+        project_id,
+        current_user,
+        kind='manual',
+        label=f'Deleted {deleted_path}',
+        changes=revision_changes,
+        ensure_baseline=False,
+    )
 
     return {'status': 'success', 'id': file_id}
 

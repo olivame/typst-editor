@@ -7,6 +7,8 @@ export default function EditorToolbar({
   onBack,
   onDownload,
   onSavePreview,
+  downloadDisabled = false,
+  saveDisabled = false,
 }) {
   const shellRef = useRef(null)
   const [openMenuLabel, setOpenMenuLabel] = useState('')
@@ -93,10 +95,28 @@ export default function EditorToolbar({
 
       <div style={styles.right}>
         {compileResult ? <span style={styles.statusPill}>{compileResult}</span> : null}
-        <button onClick={onSavePreview} style={styles.iconButton} title="Save and preview" type="button">
+        <button
+          disabled={saveDisabled}
+          onClick={onSavePreview}
+          style={{
+            ...styles.iconButton,
+            ...(saveDisabled ? styles.iconButtonDisabled : null),
+          }}
+          title="Save and preview"
+          type="button"
+        >
           💾
         </button>
-        <button onClick={onDownload} style={styles.iconButton} title="Download PDF" type="button">
+        <button
+          disabled={downloadDisabled}
+          onClick={onDownload}
+          style={{
+            ...styles.iconButton,
+            ...(downloadDisabled ? styles.iconButtonDisabled : null),
+          }}
+          title="Download PDF"
+          type="button"
+        >
           ⬇
         </button>
       </div>
@@ -256,5 +276,9 @@ const styles = {
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  iconButtonDisabled: {
+    cursor: 'not-allowed',
+    opacity: 0.55,
   },
 }
