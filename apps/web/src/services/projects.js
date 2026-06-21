@@ -201,6 +201,35 @@ export async function searchProjectFiles(projectId, query) {
   return apiFetch(`/projects/${projectId}/search?q=${encodeURIComponent(query)}`)
 }
 
+export async function listProjectComments(projectId, options = {}) {
+  const status = options.status || 'open'
+  return apiFetch(`/projects/${projectId}/comments?status=${encodeURIComponent(status)}`)
+}
+
+export async function createProjectComment(projectId, payload) {
+  return apiFetch(`/projects/${projectId}/comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function createProjectCommentReply(projectId, threadId, payload) {
+  return apiFetch(`/projects/${projectId}/comments/${threadId}/replies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateProjectCommentStatus(projectId, threadId, status) {
+  return apiFetch(`/projects/${projectId}/comments/${threadId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  })
+}
+
 export async function createProjectFile(projectId, path) {
   return apiFetch(`/projects/${projectId}/files`, {
     method: 'POST',

@@ -3,9 +3,11 @@ import { markdown } from '@codemirror/lang-markdown'
 import { Compartment, EditorSelection, EditorState } from '@codemirror/state'
 import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo } from '@codemirror/commands'
 import {
+  Decoration,
   drawSelection,
   EditorView,
   highlightActiveLineGutter,
+  hoverTooltip,
   keymap,
   lineNumbers,
 } from '@codemirror/view'
@@ -16,6 +18,7 @@ import { yCollab } from 'y-codemirror.next'
 const readOnlyCompartment = new Compartment()
 const wrappingCompartment = new Compartment()
 const themeCompartment = new Compartment()
+const commentCompartment = new Compartment()
 
 function getEditorReadOnlyState(readOnly, collaborationState) {
   if (!collaborationState) return readOnly
@@ -78,9 +81,166 @@ function createEditorTheme({ fontSize, lineHeight }) {
   })
 }
 
+function normalizeCommentAnchors(commentAnchors, docLength = Infinity) {
+  const boundedDocLength = Number.isFinite(docLength) ? Math.max(docLength, 0) : Infinity
+
+  return (Array.isArray(commentAnchors) ? commentAnchors : [])
+    .map((anchor) => {
+      const start = Math.max(Number(anchor.start) || 0, 0)
+      const end = Math.max(Number(anchor.end) || 0, 0)
+      return {
+        ...anchor,
+        start: Math.min(start, boundedDocLength),
+        end: Math.min(end, boundedDocLength),
+      }
+    })
+    .filter((anchor) => anchor.end > anchor.start)
+    .sort((left, right) => (
+      left.start - right.start
+      || left.end - right.end
+      || `${left.id || ''}`.localeCompare(`${right.id || ''}`)
+    ))
+}
+
+function buildCommentTitle(anchor) {
+  const titleParts = [
+    anchor.summary || 'Comment',
+    anchor.locationNote || '',
+    anchor.body || '',
+  ].filter(Boolean)
+  return titleParts.join('\n')
+}
+
+function createCommentTooltip(anchors) {
+  return hoverTooltip((view, pos) => {
+    const matchingAnchors = anchors.filter((anchor) => pos >= anchor.start && pos <= anchor.end)
+    if (matchingAnchors.length === 0) return null
+
+    const firstAnchor = matchingAnchors[0]
+    return {
+      pos: firstAnchor.start,
+      end: Math.max(...matchingAnchors.map((anchor) => anchor.end)),
+      above: true,
+      create() {
+        const root = document.createElement('div')
+        root.className = 'cm-commentTooltip'
+
+        matchingAnchors.slice(0, 4).forEach((anchor) => {
+          const item = document.createElement('div')
+          item.className = 'cm-commentTooltipItem'
+
+          const title = document.createElement('div')
+          title.className = 'cm-commentTooltipTitle'
+          title.textContent = anchor.summary || 'Comment'
+          item.appendChild(title)
+
+          if (anchor.locationNote) {
+            const note = document.createElement('div')
+            note.className = 'cm-commentTooltipNote'
+            note.textContent = anchor.locationNote
+            item.appendChild(note)
+          }
+
+          if (anchor.body) {
+            const body = document.createElement('div')
+            body.className = 'cm-commentTooltipBody'
+            body.textContent = anchor.body
+            item.appendChild(body)
+          }
+
+          root.appendChild(item)
+        })
+
+        if (matchingAnchors.length > 4) {
+          const overflow = document.createElement('div')
+          overflow.className = 'cm-commentTooltipNote'
+          overflow.textContent = `+${matchingAnchors.length - 4} more comments`
+          root.appendChild(overflow)
+        }
+
+        return { dom: root }
+      },
+    }
+  })
+}
+
+function createCommentExtensions(commentAnchors, docLength = Infinity) {
+  const anchors = normalizeCommentAnchors(commentAnchors, docLength)
+  const decorations = Decoration.set(
+    anchors.map((anchor) => Decoration.mark({
+      class: [
+        'cm-commentAnchor',
+        anchor.stale ? 'cm-commentAnchor-stale' : '',
+        anchor.relocated ? 'cm-commentAnchor-relocated' : '',
+      ].filter(Boolean).join(' '),
+      attributes: {
+        title: buildCommentTitle(anchor),
+      },
+    }).range(anchor.start, anchor.end)),
+  )
+
+  return [
+    EditorView.decorations.of(decorations),
+    createCommentTooltip(anchors),
+  ]
+}
+
+const commentTheme = EditorView.theme({
+  '.cm-commentAnchor': {
+    backgroundColor: 'rgba(250, 204, 21, 0.26)',
+    borderBottom: '2px solid rgba(217, 119, 6, 0.9)',
+    borderRadius: '3px',
+    cursor: 'help',
+  },
+  '.cm-commentAnchor-relocated': {
+    backgroundColor: 'rgba(253, 186, 116, 0.28)',
+    borderBottomColor: 'rgba(234, 88, 12, 0.9)',
+  },
+  '.cm-commentAnchor-stale': {
+    backgroundColor: 'rgba(251, 146, 60, 0.24)',
+    borderBottomStyle: 'dashed',
+  },
+  '.cm-commentTooltip': {
+    maxWidth: '320px',
+    padding: '10px',
+    borderRadius: '12px',
+    border: '1px solid #d8b4fe',
+    background: '#fffdf7',
+    boxShadow: '0 18px 40px rgba(15, 23, 42, 0.18)',
+    color: '#334155',
+    fontFamily: '"IBM Plex Sans", "Segoe UI", sans-serif',
+  },
+  '.cm-commentTooltipItem + .cm-commentTooltipItem': {
+    marginTop: '9px',
+    paddingTop: '9px',
+    borderTop: '1px solid #fde68a',
+  },
+  '.cm-commentTooltipTitle': {
+    color: '#92400e',
+    fontSize: '12px',
+    fontWeight: '800',
+    lineHeight: '1.35',
+  },
+  '.cm-commentTooltipNote': {
+    marginTop: '4px',
+    color: '#b45309',
+    fontSize: '11px',
+    fontWeight: '700',
+    lineHeight: '1.4',
+  },
+  '.cm-commentTooltipBody': {
+    marginTop: '6px',
+    color: '#334155',
+    fontSize: '13px',
+    lineHeight: '1.45',
+    whiteSpace: 'pre-wrap',
+  },
+})
+
 const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   authToken = '',
   collaborationSession = null,
+  commentAnchors = [],
   fontSize = 15,
   lineHeight = 24,
   onChange,
@@ -88,6 +248,7 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   onDoubleClick,
   onMount,
   onScroll,
+  onSelectionChange,
   readOnly = false,
   value = '',
   wordWrap = true,
@@ -99,12 +260,15 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   const onDoubleClickRef = useRef(onDoubleClick)
   const onMountRef = useRef(onMount)
   const onScrollRef = useRef(onScroll)
+  const onSelectionChangeRef = useRef(onSelectionChange)
+  const commentAnchorsRef = useRef(commentAnchors)
   const collaborationRef = useRef(null)
   const lastPublishedValueRef = useRef(value)
   const suppressedChangeCountRef = useRef(0)
   const initialConfigRef = useRef({
     authToken,
     collaborationSession,
+    commentAnchors,
     fontSize,
     lineHeight,
     readOnly,
@@ -131,6 +295,14 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
   useEffect(() => {
     onScrollRef.current = onScroll
   }, [onScroll])
+
+  useEffect(() => {
+    onSelectionChangeRef.current = onSelectionChange
+  }, [onSelectionChange])
+
+  useEffect(() => {
+    commentAnchorsRef.current = commentAnchors
+  }, [commentAnchors])
 
   useEffect(() => {
     if (!containerRef.current || viewRef.current) return undefined
@@ -163,15 +335,28 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
         fontSize: initialConfig.fontSize,
         lineHeight: initialConfig.lineHeight,
       })),
+      commentTheme,
+      commentCompartment.of(createCommentExtensions(
+        initialConfig.commentAnchors,
+        shouldUseRealtime ? 0 : initialConfig.value.length,
+      )),
       EditorView.updateListener.of((update) => {
-        if (!update.docChanged) return
-        const nextValue = update.state.doc.toString()
-        lastPublishedValueRef.current = nextValue
-        if (suppressedChangeCountRef.current > 0) {
-          suppressedChangeCountRef.current -= 1
-          return
+        if (update.selectionSet) {
+          onSelectionChangeRef.current?.({
+            start: update.state.selection.main.from,
+            end: update.state.selection.main.to,
+          })
         }
-        onChangeRef.current?.(nextValue)
+
+        if (update.docChanged) {
+          const nextValue = update.state.doc.toString()
+          lastPublishedValueRef.current = nextValue
+          if (suppressedChangeCountRef.current > 0) {
+            suppressedChangeCountRef.current -= 1
+            return
+          }
+          onChangeRef.current?.(nextValue)
+        }
       }),
       EditorView.domEventHandlers({
         dblclick: () => {
@@ -228,6 +413,12 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
         })
 
         if (isSynced) {
+          activeView.dispatch({
+            effects: commentCompartment.reconfigure(createCommentExtensions(
+              commentAnchorsRef.current,
+              activeView.state.doc.length,
+            )),
+          })
           onConnectionStateChangeRef.current?.('connected')
         }
       })
@@ -294,6 +485,7 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
         to: currentValue.length,
         insert: value,
       },
+      effects: commentCompartment.reconfigure(createCommentExtensions(commentAnchorsRef.current, value.length)),
     })
   }, [collaborationSession, value])
 
@@ -327,6 +519,15 @@ const CollaborativeEditor = forwardRef(function CollaborativeEditor({
       effects: themeCompartment.reconfigure(createEditorTheme({ fontSize, lineHeight })),
     })
   }, [fontSize, lineHeight])
+
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view) return
+
+    view.dispatch({
+      effects: commentCompartment.reconfigure(createCommentExtensions(commentAnchors, view.state.doc.length)),
+    })
+  }, [commentAnchors])
 
   useImperativeHandle(ref, () => ({
     focus() {

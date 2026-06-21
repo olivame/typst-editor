@@ -13,6 +13,8 @@ import { REALTIME_URL } from './config/realtime'
 import {
   createProjectFile,
   createProjectFolder,
+  createProjectComment,
+  createProjectCommentReply,
   deleteProjectEntry,
   downloadProjectFile,
   downloadProjectPdf,
@@ -23,12 +25,14 @@ import {
   getProjectFileUrl,
   getProjectPreviewSession,
   getProjectPreviewUrl,
+  listProjectComments,
   listAvailableFonts,
   listProjectFiles,
   renameProjectEntry,
   restoreProjectRevision,
   searchProjectFiles,
   updateFileContent,
+  updateProjectCommentStatus,
   uploadProjectFiles,
 } from './services/projects'
 
@@ -188,6 +192,152 @@ function getSelectionOffset(content, line, character) {
     .reduce((total, currentLine) => total + currentLine.length + 1, 0)
   const boundedCharacter = Math.max(0, Math.min(character, lines[boundedLine]?.length ?? 0))
   return offsetBeforeLine + boundedCharacter
+}
+
+function getLineColumnFromOffset(source, offset) {
+  const boundedOffset = Math.max(0, Math.min(offset, source.length))
+  const beforeOffset = source.slice(0, boundedOffset)
+  const line = beforeOffset.split('\n').length - 1
+  const lineStart = beforeOffset.lastIndexOf('\n') + 1
+  return {
+    line,
+    column: boundedOffset - lineStart,
+  }
+}
+
+function buildCommentAnchorPayload(source, selectionStart, selectionEnd) {
+  const anchorStart = Math.max(0, Math.min(selectionStart, selectionEnd, source.length))
+  const anchorEnd = Math.max(0, Math.min(Math.max(selectionStart, selectionEnd), source.length))
+  if (anchorStart === anchorEnd) return null
+
+  const selectedText = source.slice(anchorStart, anchorEnd)
+  const startPosition = getLineColumnFromOffset(source, anchorStart)
+  const endPosition = getLineColumnFromOffset(source, anchorEnd)
+
+  return {
+    anchor_start: anchorStart,
+    anchor_end: anchorEnd,
+    selected_text: selectedText,
+    quote_text: selectedText.slice(0, 4000),
+    context_before: source.slice(Math.max(0, anchorStart - 500), anchorStart),
+    context_after: source.slice(anchorEnd, Math.min(source.length, anchorEnd + 500)),
+    start_line: startPosition.line,
+    start_column: startPosition.column,
+    end_line: endPosition.line,
+    end_column: endPosition.column,
+  }
+}
+
+function getCommentQuoteText(thread) {
+  return `${thread?.quote_text || thread?.selected_text || ''}`
+}
+
+function findNearbyText(source, query, anchorStart, anchorEnd) {
+  if (!query) return -1
+  const searchStart = Math.max(0, anchorStart - 600)
+  const searchEnd = Math.min(source.length, anchorEnd + 600)
+  const nearbyIndex = source.slice(searchStart, searchEnd).indexOf(query)
+  if (nearbyIndex >= 0) return searchStart + nearbyIndex
+  return source.indexOf(query)
+}
+
+function resolveCommentAnchor(thread, source) {
+  const sourceLength = source.length
+  const rawStart = Number(thread?.anchor_start) || 0
+  const rawEnd = Number(thread?.anchor_end) || rawStart
+  const anchorStart = Math.max(0, Math.min(rawStart, sourceLength))
+  const anchorEnd = Math.max(anchorStart, Math.min(rawEnd, sourceLength))
+  const quoteText = getCommentQuoteText(thread)
+  const originalText = source.slice(anchorStart, anchorEnd)
+
+  if (quoteText && originalText === quoteText) {
+    return {
+      end: anchorEnd,
+      relocated: false,
+      stale: false,
+      start: anchorStart,
+    }
+  }
+
+  const matchedIndex = findNearbyText(source, quoteText, anchorStart, anchorEnd)
+  if (matchedIndex >= 0) {
+    return {
+      end: matchedIndex + quoteText.length,
+      relocated: matchedIndex !== anchorStart,
+      stale: false,
+      start: matchedIndex,
+    }
+  }
+
+  if (Number.isInteger(thread?.start_line) && Number.isInteger(thread?.start_column)) {
+    const lineStart = getSelectionOffset(source, thread.start_line, thread.start_column)
+    const lineEnd = Number.isInteger(thread?.end_line) && Number.isInteger(thread?.end_column)
+      ? getSelectionOffset(source, thread.end_line, thread.end_column)
+      : Math.min(lineStart + Math.max(quoteText.length, 1), sourceLength)
+    if (lineEnd > lineStart) {
+      return {
+        end: lineEnd,
+        relocated: true,
+        stale: true,
+        start: lineStart,
+      }
+    }
+  }
+
+  return {
+    end: Math.max(anchorEnd, Math.min(anchorStart + Math.max(quoteText.length, 1), sourceLength)),
+    relocated: false,
+    stale: true,
+    start: anchorStart,
+  }
+}
+
+function getCommentBodyPreview(thread) {
+  const lastComment = Array.isArray(thread?.comments) && thread.comments.length > 0
+    ? thread.comments[thread.comments.length - 1]
+    : null
+  const body = `${lastComment?.body || thread?.comments?.[0]?.body || ''}`.trim()
+  if (!body) return ''
+  return body.length > 220 ? `${body.slice(0, 220)}...` : body
+}
+
+function getCommentAuthorLabel(thread) {
+  const lastComment = Array.isArray(thread?.comments) && thread.comments.length > 0
+    ? thread.comments[thread.comments.length - 1]
+    : null
+  const author = lastComment?.author || thread?.created_by
+  return author?.display_name || author?.email || 'Comment'
+}
+
+function buildEditorCommentAnchors(threads, currentFile, source) {
+  if (!currentFile) return []
+
+  return (Array.isArray(threads) ? threads : [])
+    .filter((thread) => (
+      thread.status !== 'resolved'
+      && (thread.file_id === currentFile.id || thread.path === currentFile.path)
+    ))
+    .flatMap((thread) => {
+      const anchor = resolveCommentAnchor(thread, source)
+      if (anchor.end <= anchor.start) return []
+      const replyCount = Math.max((thread.comment_count || thread.comments?.length || 1) - 1, 0)
+      const summary = `${getCommentAuthorLabel(thread)}${replyCount > 0 ? ` +${replyCount} repl${replyCount === 1 ? 'y' : 'ies'}` : ''}`
+      const locationNote = anchor.stale
+        ? 'Original text changed; showing best available anchor.'
+        : anchor.relocated
+          ? 'Anchor moved after edits.'
+          : ''
+      return [{
+        body: getCommentBodyPreview(thread),
+        end: anchor.end,
+        id: thread.id,
+        locationNote,
+        relocated: anchor.relocated,
+        stale: anchor.stale,
+        start: anchor.start,
+        summary,
+      }]
+    })
 }
 
 function getParentPath(path) {
@@ -988,6 +1138,11 @@ export default function Editor({
   const [statusMessage, setStatusMessage] = useState('')
   const [sidebarMode, setSidebarMode] = useState('files')
   const [historySelection, setHistorySelection] = useState(null)
+  const [commentThreads, setCommentThreads] = useState([])
+  const [commentStatusFilter, setCommentStatusFilter] = useState('open')
+  const [commentsLoading, setCommentsLoading] = useState(false)
+  const [commentsError, setCommentsError] = useState('')
+  const [editorSelection, setEditorSelection] = useState({ start: 0, end: 0 })
   const [fileTreeCollapsedStateByProject, setFileTreeCollapsedStateByProject] = useState({})
   const [selectedEntryPathByProject, setSelectedEntryPathByProject] = useState({})
   const [editorZoom, setEditorZoom] = useState(1)
@@ -1085,6 +1240,7 @@ export default function Editor({
 
   async function selectEntry(entry) {
     try {
+      setEditorSelection({ start: 0, end: 0 })
       setSelectedEntry(entry)
       setSelectedEntryPathByProject((current) => (
         current[projectId] === entry.path
@@ -1158,6 +1314,22 @@ export default function Editor({
     }
   }
 
+  async function refreshCommentThreads(status = commentStatusFilter) {
+    setCommentsLoading(true)
+    setCommentsError('')
+
+    try {
+      const payload = await listProjectComments(projectId, { status })
+      setCommentThreads(Array.isArray(payload) ? payload : [])
+    } catch (error) {
+      if (handleAccessFailure(error, '无法读取评论。')) return
+      setCommentsError(error.message || 'Failed to load comments')
+      setCommentThreads([])
+    } finally {
+      setCommentsLoading(false)
+    }
+  }
+
   useEffect(() => {
     let isCancelled = false
 
@@ -1227,6 +1399,36 @@ export default function Editor({
       }
     }
   }, [projectId])
+
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadComments() {
+      setCommentsLoading(true)
+      setCommentsError('')
+
+      try {
+        const payload = await listProjectComments(projectId, { status: commentStatusFilter })
+        if (isCancelled) return
+        setCommentThreads(Array.isArray(payload) ? payload : [])
+      } catch (error) {
+        if (isCancelled) return
+        if (handleAccessFailure(error, '无法读取评论。')) return
+        setCommentsError(error.message || 'Failed to load comments')
+        setCommentThreads([])
+      } finally {
+        if (!isCancelled) {
+          setCommentsLoading(false)
+        }
+      }
+    }
+
+    void loadComments()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [commentStatusFilter, projectId])
 
   useEffect(() => {
     if (sidebarMode !== 'files') return
@@ -1495,6 +1697,121 @@ export default function Editor({
       end: result.end,
       lineNumber: result.line_number,
     }
+    await selectEntry(matchingEntry)
+  }
+
+  async function handleCreateComment(body) {
+    if (!currentFile || !selectedEntry || selectedEntry.kind !== 'file' || selectedEntry.is_binary) {
+      showStatus('Select editable text before adding a comment', 2500)
+      return null
+    }
+
+    const editor = editorRef.current
+    if (!editor) {
+      showStatus('Editor is not ready', 2000)
+      return null
+    }
+
+    const { start, end } = editor.getSelectionRange()
+    const nextContent = getCurrentEditorContent()
+    const anchorPayload = buildCommentAnchorPayload(nextContent, start, end)
+    if (!anchorPayload) {
+      showStatus('Select text before adding a comment', 2500)
+      return null
+    }
+
+    try {
+      const persisted = await persistCurrentFileContent(nextContent, { createRevision: false })
+      const nextRevision = persisted?.file?.content_revision ?? persisted?.content_revision
+      setContent(nextContent)
+      setCurrentFile((current) => (current ? {
+        ...current,
+        content: nextContent,
+        content_revision: nextRevision ?? current.content_revision,
+      } : current))
+
+      const thread = await createProjectComment(projectId, {
+        file_id: currentFile.id,
+        ...anchorPayload,
+        body,
+      })
+      if (commentStatusFilter === 'resolved') {
+        setCommentStatusFilter('open')
+      } else {
+        await refreshCommentThreads(commentStatusFilter)
+      }
+      showStatus('Comment added', 2000)
+      return thread
+    } catch (error) {
+      if (handleAccessFailure(error, '添加评论失败，请检查项目权限。')) return null
+      showStatus(error.message || 'Failed to add comment', 3000)
+      return null
+    }
+  }
+
+  async function handleReplyToComment(thread, body) {
+    if (!thread?.id) return null
+
+    try {
+      const updatedThread = await createProjectCommentReply(projectId, thread.id, { body })
+      await refreshCommentThreads(commentStatusFilter)
+      showStatus('Reply added', 1800)
+      return updatedThread
+    } catch (error) {
+      if (handleAccessFailure(error, '回复评论失败，请检查项目权限。')) return null
+      showStatus(error.message || 'Failed to reply', 3000)
+      return null
+    }
+  }
+
+  async function handleUpdateCommentStatus(thread, status) {
+    if (!thread?.id) return null
+
+    try {
+      const updatedThread = await updateProjectCommentStatus(projectId, thread.id, status)
+      await refreshCommentThreads(commentStatusFilter)
+      showStatus(status === 'resolved' ? 'Comment resolved' : 'Comment reopened', 1800)
+      return updatedThread
+    } catch (error) {
+      if (handleAccessFailure(error, '更新评论状态失败，请检查项目权限。')) return null
+      showStatus(error.message || 'Failed to update comment', 3000)
+      return null
+    }
+  }
+
+  async function handleSelectCommentThread(thread) {
+    if (!thread) return
+    const matchingEntry = files.find((entry) => (
+      entry.id === thread.file_id || entry.path === thread.path
+    ))
+    if (!matchingEntry || matchingEntry.kind !== 'file' || matchingEntry.is_binary) {
+      showStatus('Commented file is not available', 2500)
+      return
+    }
+
+    let resolvedAnchor = {
+      start: Math.max(Number(thread.anchor_start) || 0, 0),
+      end: Math.max(Number(thread.anchor_end) || Number(thread.anchor_start) || 0, 0),
+    }
+    if (currentFile?.id === matchingEntry.id) {
+      resolvedAnchor = resolveCommentAnchor(thread, content)
+    } else {
+      try {
+        const fileData = await getFileContent(matchingEntry.id)
+        resolvedAnchor = resolveCommentAnchor(thread, fileData.content || '')
+      } catch {
+        // Fall back to the stored offsets; selectEntry will still open the commented file.
+      }
+    }
+    const start = resolvedAnchor.start
+    const end = Math.max(resolvedAnchor.end, start)
+
+    if (currentFile?.id === matchingEntry.id && editorRef.current) {
+      editorRef.current.setSelectionRange(start, end, { reveal: true, center: true })
+      return
+    }
+
+    pendingEditorSelectionRef.current = { start, end }
     await selectEntry(matchingEntry)
   }
 
@@ -2216,6 +2533,11 @@ export default function Editor({
     : currentFile?.path || selectedEntry?.path || 'Typst Playground'
   const currentEntryName = selectedEntry?.name || 'Welcome'
   const isEditableDocument = Boolean(currentFile && selectedEntry?.kind === 'file' && !selectedEntry?.is_binary)
+  const hasEditorTextSelection = isEditableDocument && editorSelection.end > editorSelection.start
+  const editorCommentAnchors = useMemo(
+    () => buildEditorCommentAnchors(commentThreads, currentFile, content),
+    [commentThreads, currentFile, content],
+  )
   const isEditorLoading = Boolean(
     selectedEntry
     && selectedEntry.kind === 'file'
@@ -2649,13 +2971,25 @@ export default function Editor({
 
         {sidebarMode === 'errors' ? (
           <DiagnosticsSidebar
+            commentStatusFilter={commentStatusFilter}
+            commentsError={commentsError}
+            commentThreads={commentThreads}
+            commentsLoading={commentsLoading}
             diagnostics={diagnostics}
+            hasTextSelection={hasEditorTextSelection}
             onClose={() => switchSidebarMode('')}
+            onCommentStatusFilterChange={setCommentStatusFilter}
+            onCreateComment={(body) => handleCreateComment(body)}
+            onRefreshComments={() => refreshCommentThreads(commentStatusFilter)}
+            onReplyToComment={(thread, body) => handleReplyToComment(thread, body)}
             onSelectDiagnostic={(diagnostic) => void handleSidebarLocationJump(
               diagnostic.location,
               diagnostic.snippet,
             )}
+            onSelectComment={(thread) => void handleSelectCommentThread(thread)}
+            onUpdateCommentStatus={(thread, status) => handleUpdateCommentStatus(thread, status)}
             rawStatus={previewStatus}
+            selectedEntry={selectedEntry}
             statusKind={previewStatus?.kind}
           />
         ) : null}
@@ -2929,6 +3263,7 @@ export default function Editor({
                       ref={editorRef}
                       authToken={getAuthToken()}
                       collaborationSession={realtimeSession}
+                      commentAnchors={editorCommentAnchors}
                       fontSize={editorFontSize}
                       lineHeight={editorLineHeight}
                       onChange={setContent}
@@ -2937,6 +3272,7 @@ export default function Editor({
                       onMount={({ scrollElement }) => {
                         setEditorWheelElement(scrollElement)
                       }}
+                      onSelectionChange={setEditorSelection}
                       readOnly={!isEditableDocument}
                       value={content}
                       wordWrap={isWordWrapEnabled}

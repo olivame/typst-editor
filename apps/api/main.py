@@ -257,6 +257,29 @@ class RealtimeFlushFileRequest(BaseModel):
     updated_by_id: int | None = None
 
 
+class CommentThreadCreateRequest(BaseModel):
+    file_id: int
+    anchor_start: int
+    anchor_end: int
+    selected_text: str = ''
+    quote_text: str = ''
+    context_before: str = ''
+    context_after: str = ''
+    start_line: int | None = None
+    start_column: int | None = None
+    end_line: int | None = None
+    end_column: int | None = None
+    body: str
+
+
+class CommentCreateRequest(BaseModel):
+    body: str
+
+
+class CommentThreadStatusUpdateRequest(BaseModel):
+    status: str
+
+
 def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -435,6 +458,50 @@ def serialize_entry(entry: models.File):
     }
 
 
+def serialize_comment(comment: models.Comment):
+    return {
+        'id': comment.id,
+        'thread_id': comment.thread_id,
+        'author_id': comment.author_id,
+        'author': serialize_user(comment.author) if comment.author else None,
+        'body': comment.body,
+        'created_at': comment.created_at,
+        'updated_at': comment.updated_at,
+    }
+
+
+def serialize_comment_thread(thread: models.CommentThread):
+    comments = sorted(thread.comments or [], key=lambda comment: (comment.created_at, comment.id))
+    last_activity_at = comments[-1].created_at if comments else thread.updated_at
+    return {
+        'id': thread.id,
+        'project_id': thread.project_id,
+        'file_id': thread.file_id,
+        'created_by_id': thread.created_by_id,
+        'created_by': serialize_user(thread.created_by) if thread.created_by else None,
+        'resolved_by_id': thread.resolved_by_id,
+        'resolved_by': serialize_user(thread.resolved_by) if thread.resolved_by else None,
+        'status': thread.status,
+        'path': thread.path,
+        'anchor_start': thread.anchor_start,
+        'anchor_end': thread.anchor_end,
+        'selected_text': thread.selected_text,
+        'quote_text': thread.quote_text,
+        'context_before': thread.context_before,
+        'context_after': thread.context_after,
+        'start_line': thread.start_line,
+        'start_column': thread.start_column,
+        'end_line': thread.end_line,
+        'end_column': thread.end_column,
+        'created_at': thread.created_at,
+        'updated_at': thread.updated_at,
+        'resolved_at': thread.resolved_at,
+        'last_activity_at': last_activity_at,
+        'comment_count': len(comments),
+        'comments': [serialize_comment(comment) for comment in comments],
+    }
+
+
 def serialize_revision(
     revision: models.Revision,
     include_entries: bool = False,
@@ -603,6 +670,32 @@ def normalize_entrypoint_path(raw_path: str):
     if not normalized.endswith('.typ'):
         raise HTTPException(status_code=400, detail='Entrypoint must be a .typ file')
     return normalized
+
+
+def normalize_comment_body(raw_body: str):
+    normalized = (raw_body or '').strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail='Comment body is required')
+    if len(normalized) > 4000:
+        raise HTTPException(status_code=400, detail='Comment body is too long')
+    return normalized
+
+
+def normalize_comment_thread_status(raw_status: str):
+    normalized = (raw_status or '').strip().lower()
+    if normalized not in models.COMMENT_THREAD_STATUSES:
+        raise HTTPException(status_code=400, detail='Invalid comment status')
+    return normalized
+
+
+def normalize_comment_anchor(start: int, end: int, content_length: int):
+    anchor_start = max(0, min(int(start or 0), content_length))
+    anchor_end = max(0, min(int(end or 0), content_length))
+    if anchor_start > anchor_end:
+        anchor_start, anchor_end = anchor_end, anchor_start
+    if anchor_start == anchor_end:
+        raise HTTPException(status_code=400, detail='Select text before adding a comment')
+    return anchor_start, anchor_end
 
 
 def is_template_typ_path(path: str):
@@ -2292,6 +2385,158 @@ def search_project_files(
     ensure_project_access(db, project, current_user)
     entries = db.query(models.File).filter(models.File.project_id == project_id).all()
     return search_project_entries(entries, q)
+
+
+@app.get('/projects/{project_id}/comments')
+def list_project_comment_threads(
+    project_id: int,
+    status: str = Query('open'),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user)
+
+    normalized_status = (status or 'open').strip().lower()
+    if normalized_status not in {'all', *models.COMMENT_THREAD_STATUSES}:
+        raise HTTPException(status_code=400, detail='Invalid comment status filter')
+
+    query = db.query(models.CommentThread).filter(models.CommentThread.project_id == project_id)
+    if normalized_status != 'all':
+        query = query.filter(models.CommentThread.status == normalized_status)
+
+    threads = (
+        query
+        .order_by(models.CommentThread.updated_at.desc(), models.CommentThread.id.desc())
+        .all()
+    )
+    return [serialize_comment_thread(thread) for thread in threads]
+
+
+@app.post('/projects/{project_id}/comments')
+def create_project_comment_thread(
+    project_id: int,
+    payload: CommentThreadCreateRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor', 'commenter'})
+    entry = get_entry_or_404(db, payload.file_id)
+    if entry.project_id != project_id:
+        raise HTTPException(status_code=404, detail='File not found')
+    if entry.kind == FOLDER_ENTRY_KIND or is_binary_entry(entry):
+        raise HTTPException(status_code=400, detail='Comments can only be anchored to editable text files')
+
+    body = normalize_comment_body(payload.body)
+    anchor_start, anchor_end = normalize_comment_anchor(
+        payload.anchor_start,
+        payload.anchor_end,
+        len(entry.content or ''),
+    )
+    selected_text = (payload.selected_text or (entry.content or '')[anchor_start:anchor_end])[:4000]
+    quote_text = (payload.quote_text or selected_text)[:4000]
+
+    thread = models.CommentThread(
+        project_id=project_id,
+        file_id=entry.id,
+        created_by_id=current_user.id,
+        status='open',
+        path=entry.path,
+        anchor_start=anchor_start,
+        anchor_end=anchor_end,
+        selected_text=selected_text,
+        quote_text=quote_text,
+        context_before=(payload.context_before or '')[-2000:],
+        context_after=(payload.context_after or '')[:2000],
+        start_line=payload.start_line,
+        start_column=payload.start_column,
+        end_line=payload.end_line,
+        end_column=payload.end_column,
+    )
+    db.add(thread)
+    db.flush()
+    db.add(
+        models.Comment(
+            thread_id=thread.id,
+            author_id=current_user.id,
+            body=body,
+        )
+    )
+    thread.updated_at = utcnow()
+    db.commit()
+    db.refresh(thread)
+    return serialize_comment_thread(thread)
+
+
+@app.post('/projects/{project_id}/comments/{thread_id}/replies')
+def create_project_comment_reply(
+    project_id: int,
+    thread_id: int,
+    payload: CommentCreateRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor', 'commenter'})
+    thread = (
+        db.query(models.CommentThread)
+        .filter(
+            models.CommentThread.project_id == project_id,
+            models.CommentThread.id == thread_id,
+        )
+        .first()
+    )
+    if not thread:
+        raise HTTPException(status_code=404, detail='Comment thread not found')
+
+    body = normalize_comment_body(payload.body)
+    db.add(
+        models.Comment(
+            thread_id=thread.id,
+            author_id=current_user.id,
+            body=body,
+        )
+    )
+    thread.updated_at = utcnow()
+    db.commit()
+    db.refresh(thread)
+    return serialize_comment_thread(thread)
+
+
+@app.patch('/projects/{project_id}/comments/{thread_id}/status')
+def update_project_comment_thread_status(
+    project_id: int,
+    thread_id: int,
+    payload: CommentThreadStatusUpdateRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = get_project_or_404(db, project_id)
+    ensure_project_access(db, project, current_user, {'maintainer', 'editor', 'commenter'})
+    thread = (
+        db.query(models.CommentThread)
+        .filter(
+            models.CommentThread.project_id == project_id,
+            models.CommentThread.id == thread_id,
+        )
+        .first()
+    )
+    if not thread:
+        raise HTTPException(status_code=404, detail='Comment thread not found')
+
+    next_status = normalize_comment_thread_status(payload.status)
+    thread.status = next_status
+    thread.updated_at = utcnow()
+    if next_status == 'resolved':
+        thread.resolved_by_id = current_user.id
+        thread.resolved_at = utcnow()
+    else:
+        thread.resolved_by_id = None
+        thread.resolved_at = None
+    db.commit()
+    db.refresh(thread)
+    return serialize_comment_thread(thread)
 
 
 @app.get('/projects/{project_id}/revisions')
