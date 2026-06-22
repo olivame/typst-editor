@@ -1,5 +1,5 @@
 # Typst Editor
-
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/olivame/typst-editor)
 一个基于 Docker Compose 的 Typst 在线编辑器。当前结构已经按模块拆开，目标是让新机器在 `clone` 后直接构建运行，并为后续分布式部署保留清晰边界。
 
 ## 快速启动
