@@ -52,6 +52,12 @@ BINARY_FILE_EXTENSIONS = {
     '.pdf',
     '.7z', '.gz', '.rar', '.tar', '.tgz', '.zip',
 }
+TEXT_FILE_EXTENSIONS = {
+    '.typ', '.bib', '.txt', '.md', '.tex', '.cls', '.sty',
+    '.json', '.toml', '.yaml', '.yml', '.xml', '.html', '.css',
+    '.js', '.jsx', '.ts', '.tsx', '.py', '.rs', '.go', '.java',
+    '.c', '.cc', '.cpp', '.h', '.hpp', '.sh', '.csv',
+}
 BINARY_MEDIA_TYPES = {
     'application/gzip',
     'application/octet-stream',
@@ -291,6 +297,8 @@ def normalize_media_type(value: str | None):
 
 def should_treat_file_as_binary(relative_path: str, media_type: str | None = None):
     suffix = PurePosixPath(relative_path or '').suffix.lower()
+    if suffix in TEXT_FILE_EXTENSIONS:
+        return False
     if suffix in BINARY_FILE_EXTENSIONS:
         return True
 
